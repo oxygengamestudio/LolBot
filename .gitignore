@@ -6,8 +6,17 @@ dist/
 
 # Environment variables
 .env
+.env.*
 .env.local
 .env.*.local
+!.env.example
+.envrc
+
+# Secrets / certificates
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Data and cache
 data/
