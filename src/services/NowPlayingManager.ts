@@ -118,32 +118,46 @@ class NowPlayingManager {
         const track = queue.currentTrack!;
         const currentTime = queueManager.getCurrentTime(queue.guildId);
         const progress = this.createProgressBar(currentTime, track.duration);
-        const timeString = `${this.formatTime(currentTime)} / ${this.formatTime(track.duration)}`;
+        const currentTimeString = this.formatTime(currentTime);
+        const totalTimeString = this.formatTime(track.duration);
 
         const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
-        const statusIcon = queue.isPaused ? '⏸️' : '▶️';
+        const statusLabel = queue.isPaused ? '⏸️ En pause' : '▶️ Lecture en cours';
+        const squareCover = this.getSquareThumbnail(track.thumbnail);
+        const largeCover = this.getLargeCover(track.thumbnail);
 
         const embed = new EmbedBuilder()
             .setColor(color)
-            .setAuthor({ name: statusIcon })
+            .setAuthor({ name: statusLabel })
             .setTitle(track.title)
             .setURL(track.url)
-            .setThumbnail(this.getSquareThumbnail(track.thumbnail))
+            .setDescription(`\`${currentTimeString}\` ${progress} \`${totalTimeString}\``)
             .addFields(
                 {
-                    name: '⏱️',
-                    value: `\`${timeString}\``,
+                    name: 'Informations',
+                    value: [
+                        `👤 <@${track.requestedById}>`,
+                        `📋 ${queue.tracks.length} en attente`,
+                        `🔊 ${queue.volume}%`,
+                    ].join('\n'),
                     inline: true,
                 },
                 {
-                    name: '👤',
-                    value: `<@${track.requestedById}>`,
+                    name: 'Miniature',
+                    value: largeCover ? 'Voir image ci-dessous' : 'Indisponible',
                     inline: true,
-                },
+                }
             )
-            .setDescription(`${progress}`)
-            .setFooter({ text: `📋 ${queue.tracks.length}` })
-            .setTimestamp();
+            .setFooter({
+                text: queue.isPaused ? 'Lecture en pause' : 'Lecture active',
+            });
+
+        if (squareCover) {
+            embed.setThumbnail(squareCover);
+        }
+        if (largeCover) {
+            embed.setImage(largeCover);
+        }
 
         return embed;
     }
@@ -152,26 +166,31 @@ class NowPlayingManager {
         const playPauseButton = new ButtonBuilder()
             .setCustomId(queue.isPaused ? 'np_resume' : 'np_pause')
             .setEmoji(queue.isPaused ? '▶️' : '⏸️')
+            .setLabel(queue.isPaused ? 'Reprendre' : 'Pause')
             .setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Secondary);
 
         const skipButton = new ButtonBuilder()
             .setCustomId('np_skip')
             .setEmoji('⏭️')
+            .setLabel('Passer')
             .setStyle(ButtonStyle.Primary);
 
         const queueButton = new ButtonBuilder()
             .setCustomId('np_queue')
             .setEmoji('📋')
+            .setLabel('File')
             .setStyle(ButtonStyle.Secondary);
 
         const lyricsButton = new ButtonBuilder()
             .setCustomId('np_lyrics')
             .setEmoji('🎤')
+            .setLabel('Paroles')
             .setStyle(ButtonStyle.Secondary);
 
         const stopButton = new ButtonBuilder()
             .setCustomId('np_stop')
             .setEmoji('⏹️')
+            .setLabel('Stop')
             .setStyle(ButtonStyle.Danger);
 
         return new ActionRowBuilder<ButtonBuilder>()
@@ -179,15 +198,19 @@ class NowPlayingManager {
     }
 
     private createProgressBar(current: number, total: number): string {
-        const barLength = 20;
+        const barLength = 18;
         const safeTotal = Math.max(total, 1);
         const progress = Math.min(current / safeTotal, 1);
-        const filledLength = Math.round(barLength * progress);
-
-        const filled = '▓'.repeat(filledLength);
-        const empty = '░'.repeat(barLength - filledLength);
-
-        return `\`${filled}${empty}\``;
+        const filled = Math.round(progress * barLength);
+        let bar = '';
+        for (let i = 0; i < barLength; i += 1) {
+            if (i < filled) {
+                bar += '▰';
+            } else {
+                bar += '▱';
+            }
+        }
+        return `\`${bar}\``;
     }
 
     private formatTime(seconds: number): string {
@@ -202,6 +225,66 @@ class NowPlayingManager {
     }
 
     private getSquareThumbnail(url: string): string {
+        if (!url) {
+            return url;
+        }
+
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'https:') {
+                return '';
+            }
+            const host = parsed.hostname.toLowerCase();
+
+            // Crop centré carré pour les miniatures YouTube
+            // afin d'obtenir un rendu type "pochette d'album".
+            if (host.endsWith('ytimg.com') || host.endsWith('youtube.com') || host.endsWith('youtu.be')) {
+                const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
+                const params = new URLSearchParams({
+                    url: source,
+                    w: '512',
+                    h: '512',
+                    fit: 'cover',
+                    a: 'center',
+                    output: 'jpg',
+                });
+                return `https://wsrv.nl/?${params.toString()}`;
+            }
+        } catch {
+            return url;
+        }
+
+        return url;
+    }
+
+    private getLargeCover(url: string): string {
+        if (!url) {
+            return url;
+        }
+
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'https:') {
+                return '';
+            }
+            const host = parsed.hostname.toLowerCase();
+
+            if (host.endsWith('ytimg.com') || host.endsWith('youtube.com') || host.endsWith('youtu.be')) {
+                const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
+                const params = new URLSearchParams({
+                    url: source,
+                    w: '1280',
+                    h: '720',
+                    fit: 'cover',
+                    a: 'center',
+                    output: 'jpg',
+                });
+                return `https://wsrv.nl/?${params.toString()}`;
+            }
+        } catch {
+            return url;
+        }
+
         return url;
     }
 

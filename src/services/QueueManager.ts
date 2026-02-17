@@ -4,7 +4,6 @@
     AudioPlayerStatus,
     VoiceConnectionStatus,
     entersState,
-    getVoiceConnection,
     VoiceConnection,
     AudioPlayer,
     NoSubscriberBehavior,
@@ -12,6 +11,7 @@
     AudioPlayerState,
     AudioPlayerPlayingState,
     AudioPlayerPausedState,
+    AudioResource,
 } from '@discordjs/voice';
 import type { VoiceChannel, StageChannel, TextChannel, Guild, GuildMember } from 'discord.js';
 import { EventEmitter } from 'events';
@@ -26,7 +26,16 @@ const log = logger.createModuleLogger('QueueManager');
 class QueueManager extends EventEmitter {
     private queues: Map<string, GuildQueue> = new Map();
     private voiceChannelMonitors: Map<string, NodeJS.Timeout> = new Map();
+    private crossfadeMonitors: Map<string, NodeJS.Timeout> = new Map();
     private intentionalConnectionDestroy: Map<string, VoiceConnection> = new Map();
+    private activeResources: Map<string, AudioResource> = new Map();
+    private transitionNonces: Map<string, number> = new Map();
+    private warmedTrackByGuild: Map<string, string> = new Map();
+    private lastTrackEndEvent: Map<string, { trackId: string | null; at: number }> = new Map();
+    private transitionLocks: Map<string, Promise<void>> = new Map();
+    private crossfadeAttemptsInFlight: Set<string> = new Set();
+    private readonly crossfadeSeconds = 3;
+    private readonly pipelineTeardownWaitMs = 120;
 
     constructor() {
         super();
@@ -37,9 +46,7 @@ class QueueManager extends EventEmitter {
      * Obtient ou crée une file d'attente pour un serveur
      */
     getQueue(guildId: string): GuildQueue | undefined {
-        const queue = this.queues.get(guildId);
-        log.trace(`getQueue(${guildId}) -> ${queue ? 'trouvée' : 'non trouvée'}`);
-        return queue;
+        return this.queues.get(guildId);
     }
 
     /**
@@ -78,6 +85,9 @@ class QueueManager extends EventEmitter {
             startedAt: null,
             pausedAt: null,
             totalPausedTime: 0,
+            autoPausedByEmptyChannel: false,
+            crossfadeInProgress: false,
+            crossfadeTargetTrackId: null,
         };
 
         this.queues.set(guildId, queue);
@@ -92,7 +102,11 @@ class QueueManager extends EventEmitter {
         log.debug(`Suppression de queue pour guild: ${guildId}`);
         const queue = this.queues.get(guildId);
         this.stopVoiceChannelMonitor(guildId);
+        this.stopCrossfadeMonitor(guildId);
         if (queue) {
+            this.teardownActiveResource(guildId);
+            this.clearGuildWarmup(guildId);
+
             // Nettoyer les ressources
             if (queue.player) {
                 log.trace('Arrêt du player');
@@ -117,6 +131,11 @@ class QueueManager extends EventEmitter {
             this.emit('queueDeleted', guildId);
             log.info(`Queue supprimée pour guild: ${guildId}`);
             this.intentionalConnectionDestroy.delete(guildId);
+            this.transitionNonces.delete(guildId);
+            this.lastTrackEndEvent.delete(guildId);
+            this.crossfadeAttemptsInFlight.delete(guildId);
+            this.transitionLocks.delete(guildId);
+            void audioWrapper.cleanupGuildTemp(guildId);
         } else {
             log.warn(`Tentative de suppression d'une queue inexistante: ${guildId}`);
         }
@@ -267,6 +286,7 @@ class QueueManager extends EventEmitter {
 
             // Surveiller les membres du canal vocal
             this.startVoiceChannelMonitor(queue);
+            this.startCrossfadeMonitor(queue);
 
             log.info('Configuration du canal vocal terminée avec succès');
             return connection;
@@ -291,22 +311,50 @@ class QueueManager extends EventEmitter {
                 return;
             }
 
-            // Récupérer le canal vocal mis à jour
             const voiceChannel = currentQueue.voiceChannel;
             const members = voiceChannel.members.filter(m => !m.user.bot);
-
-            log.trace(`Membres dans le canal: ${members.size}`);
+            const settings = await guildSettingsManager.getSettings(queue.guildId);
 
             if (members.size === 0) {
-                const settings = await guildSettingsManager.getSettings(queue.guildId);
                 if (settings.stayConnectedAlways) {
-                    log.debug('Canal vide mais stayConnectedAlways activé, maintien de la connexion');
+                    if (
+                        settings.pauseOnEmptyChannelWhenAlwaysConnected &&
+                        currentQueue.isPlaying &&
+                        !currentQueue.isPaused
+                    ) {
+                        const paused = this.pause(queue.guildId);
+                        if (paused) {
+                            currentQueue.autoPausedByEmptyChannel = true;
+                            log.info(`Canal vide, pause automatique activée pour guild: ${queue.guildId}`);
+                        }
+                    } else {
+                        log.debug('Canal vide mais stayConnectedAlways activé, maintien de la connexion');
+                    }
                     return;
                 }
 
                 log.info(`Canal vocal vide, déconnexion de ${queue.guildId}`);
                 this.stopVoiceChannelMonitor(queue.guildId);
                 this.deleteQueue(queue.guildId);
+                return;
+            }
+
+            if (
+                settings.stayConnectedAlways &&
+                settings.pauseOnEmptyChannelWhenAlwaysConnected &&
+                currentQueue.autoPausedByEmptyChannel &&
+                currentQueue.isPaused
+            ) {
+                const resumed = this.resume(queue.guildId);
+                if (resumed) {
+                    currentQueue.autoPausedByEmptyChannel = false;
+                    log.info(`Membre revenu, reprise automatique pour guild: ${queue.guildId}`);
+                }
+                return;
+            }
+
+            if (!settings.pauseOnEmptyChannelWhenAlwaysConnected) {
+                currentQueue.autoPausedByEmptyChannel = false;
             }
         }, 30_000);
 
@@ -335,8 +383,7 @@ class QueueManager extends EventEmitter {
         log.info(`Piste ajoutée à la queue (total: ${queue.tracks.length})`);
         log.trace('Détails de la piste:', track);
 
-        // Pré-charger les prochaines pistes
-        audioWrapper.preloadTracks(queue.tracks.slice(0, config.audio.cacheAhead));
+        this.refreshWarmup(queue);
 
         return 1;
     }
@@ -364,8 +411,7 @@ class QueueManager extends EventEmitter {
 
         log.info(`${tracksToAdd.length} pistes ajoutées à la queue (total: ${queue.tracks.length})`);
 
-        // Pré-charger les prochaines pistes
-        audioWrapper.preloadTracks(queue.tracks.slice(0, config.audio.cacheAhead));
+        this.refreshWarmup(queue);
 
         return tracksToAdd.length;
     }
@@ -374,18 +420,30 @@ class QueueManager extends EventEmitter {
      * Joue la prochaine piste de la file d'attente
      */
     async playNext(guildId: string): Promise<boolean> {
+        return this.runWithTransitionLock(guildId, async () => this.playNextInternal(guildId));
+    }
+
+    private async playNextInternal(guildId: string): Promise<boolean> {
+        const requestStartedAt = Date.now();
         log.debug(`playNext appele pour guild: ${guildId}`);
         const queue = this.queues.get(guildId);
         if (!queue) {
             log.warn('Queue non trouvee');
             return false;
         }
+        const transitionNonce = this.bumpTransitionNonce(guildId);
+        const isSessionStart = !queue.currentTrack;
 
         if (queue.tracks.length === 0) {
             log.info('File d\'attente vide');
             queue.currentTrack = null;
             queue.isPlaying = false;
+            queue.autoPausedByEmptyChannel = false;
+            queue.crossfadeInProgress = false;
+            queue.crossfadeTargetTrackId = null;
             this.clearLyrics(queue);
+            this.clearGuildWarmup(guildId);
+            void audioWrapper.cleanupGuildTemp(guildId);
             this.emit('queueEmpty', queue);
 
             const settings = await guildSettingsManager.getSettings(guildId);
@@ -405,26 +463,47 @@ class QueueManager extends EventEmitter {
         queue.currentTrack = track;
         queue.totalPausedTime = 0;
         queue.isStopping = false;
+        queue.crossfadeInProgress = false;
+        queue.crossfadeTargetTrackId = null;
+        queue.autoPausedByEmptyChannel = false;
 
         log.info(`Prochaine piste: ${track.title}`);
         log.trace('Details:', track);
 
-        if (!queue.connection) {
-            log.debug('Pas de connexion existante, creation...');
-            const connection = await this.joinChannel(queue);
-            if (!connection) {
-                log.error('Impossible de rejoindre le canal vocal');
-                return false;
-            }
-        } else {
-            log.trace(`Connexion existante, etat: ${queue.connection.state.status}`);
+        if (isSessionStart) {
+            await audioWrapper.cleanupGuildTemp(guildId);
         }
 
-        log.debug('Creation de la ressource audio...');
-        const resource = await audioWrapper.createResource(track);
+        const warmHit = audioWrapper.isTrackWarm(guildId, track.id);
+        log.debug(`warmup_${warmHit ? 'hit' : 'miss'}: ${track.title}`);
+
+        const resourceStartedAt = Date.now();
+        const connectionPromise = !queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed
+            ? this.joinChannel(queue)
+            : Promise.resolve(queue.connection);
+        const resourcePromise = audioWrapper.createResource(guildId, track);
+        const [connection, resource] = await Promise.all([connectionPromise, resourcePromise]);
+        log.debug(`resource_create_ms=${Date.now() - resourceStartedAt} (track: ${track.title})`);
+
+        if (!this.isTransitionCurrent(guildId, transitionNonce)) {
+            log.debug(`Transition obsolete ignoree pour ${guildId}`);
+            if (resource) {
+                audioWrapper.teardownResource(resource);
+            }
+            return false;
+        }
+
+        if (!connection) {
+            log.error('Impossible de rejoindre le canal vocal');
+            if (resource) {
+                audioWrapper.teardownResource(resource);
+            }
+            return false;
+        }
+
         if (!resource) {
             log.error(`Impossible de creer la ressource pour: ${track.title}`);
-            return this.playNext(guildId);
+            return this.playNextInternal(guildId);
         }
 
         const settings = await guildSettingsManager.getSettings(guildId);
@@ -442,15 +521,20 @@ class QueueManager extends EventEmitter {
         });
 
         if (queue.player) {
+            this.teardownActiveResource(guildId);
+            await this.waitForPipelineSettle();
+            this.activeResources.set(guildId, resource);
             log.debug('Lancement de la lecture...');
             queue.player.play(resource);
             log.trace(`Etat du player apres play(): ${queue.player.state.status}`);
         } else {
             log.error('Player non disponible!');
+            audioWrapper.teardownResource(resource);
             return false;
         }
 
-        audioWrapper.preloadTracks(queue.tracks.slice(0, config.audio.cacheAhead));
+        this.refreshWarmup(queue);
+        log.debug(`request_to_play_ms=${Date.now() - requestStartedAt} (guild: ${guildId})`);
 
         return true;
     }
@@ -520,14 +604,41 @@ class QueueManager extends EventEmitter {
      * Gere la fin d'une piste
      */
     private handleTrackEnd(queue: GuildQueue): void {
+        const currentTrackId = queue.currentTrack?.id ?? null;
+        const now = Date.now();
+        const lastEvent = this.lastTrackEndEvent.get(queue.guildId);
+        if (
+            lastEvent &&
+            lastEvent.trackId === currentTrackId &&
+            now - lastEvent.at < 1_500
+        ) {
+            log.trace('Fin de piste dupliquee ignoree');
+            return;
+        }
+
+        if (queue.crossfadeInProgress) {
+            log.debug('Fin de piste ignorée (crossfade en cours)');
+            return;
+        }
+
+        this.lastTrackEndEvent.set(queue.guildId, {
+            trackId: currentTrackId,
+            at: now,
+        });
+
         log.debug('Fin de piste detectee');
         if (queue.isStopping) {
             log.debug('Fin de piste ignoree (stop en cours)');
             queue.isStopping = false;
+            this.teardownActiveResource(queue.guildId);
             return;
         }
+
+        this.teardownActiveResource(queue.guildId);
         queue.isPlaying = false;
         queue.isPaused = false;
+        queue.autoPausedByEmptyChannel = false;
+        queue.crossfadeTargetTrackId = null;
         queue.startedAt = null;
         queue.pausedAt = null;
         queue.totalPausedTime = 0;
@@ -535,14 +646,14 @@ class QueueManager extends EventEmitter {
 
         if (previousTrack) {
             log.info(`Piste terminee: ${previousTrack.title}`);
-            audioWrapper.clearFromCache(previousTrack.id);
+            audioWrapper.clearFromCache(queue.guildId, previousTrack.id);
             this.clearLyrics(queue, previousTrack.id);
         }
 
         this.emit('trackEnd', queue, previousTrack);
 
         log.debug('Passage a la piste suivante...');
-        this.playNext(queue.guildId);
+        void this.playNext(queue.guildId);
     }
 
     /**
@@ -557,6 +668,7 @@ class QueueManager extends EventEmitter {
         }
 
         queue.player.pause();
+        queue.autoPausedByEmptyChannel = false;
         log.info('Lecture mise en pause');
         return true;
     }
@@ -579,6 +691,7 @@ class QueueManager extends EventEmitter {
 
         queue.player.unpause();
         queue.isPaused = false;
+        queue.autoPausedByEmptyChannel = false;
         log.info('Lecture reprise');
         return true;
     }
@@ -587,37 +700,43 @@ class QueueManager extends EventEmitter {
      * Avance ou recule la lecture vers un temps cible
      */
     async seekTo(guildId: string, targetSeconds: number): Promise<boolean> {
-        const queue = this.queues.get(guildId);
-        if (!queue || !queue.player || !queue.currentTrack) {
-            log.warn(`Seek impossible pour guild: ${guildId}`);
-            return false;
-        }
+        return this.runWithTransitionLock(guildId, async () => {
+            const queue = this.queues.get(guildId);
+            if (!queue || !queue.player || !queue.currentTrack) {
+                log.warn(`Seek impossible pour guild: ${guildId}`);
+                return false;
+            }
 
-        const duration = queue.currentTrack.duration;
-        const clamped = duration > 0
-            ? Math.max(0, Math.min(Math.floor(targetSeconds), duration - 1))
-            : Math.max(0, Math.floor(targetSeconds));
+            const duration = queue.currentTrack.duration;
+            const clamped = duration > 0
+                ? Math.max(0, Math.min(Math.floor(targetSeconds), duration - 1))
+                : Math.max(0, Math.floor(targetSeconds));
 
-        log.info(`Seek vers ${clamped}s (piste: ${queue.currentTrack.title})`);
+            log.info(`Seek vers ${clamped}s (piste: ${queue.currentTrack.title})`);
 
-        const resource = await audioWrapper.createResource(queue.currentTrack, clamped);
-        if (!resource) {
-            log.error('Seek: impossible de créer la ressource audio');
-            return false;
-        }
+            const resource = await audioWrapper.createResource(guildId, queue.currentTrack, clamped);
+            if (!resource) {
+                log.error('Seek: impossible de créer la ressource audio');
+                return false;
+            }
 
-        if (resource.volume) {
-            resource.volume.setVolume(queue.volume / 100);
-        }
+            if (resource.volume) {
+                resource.volume.setVolume(queue.volume / 100);
+            }
 
-        queue.totalPausedTime = 0;
-        queue.pausedAt = null;
-        queue.startedAt = Date.now() - clamped * 1000;
-        queue.isPaused = false;
-        queue.isStopping = false;
+            queue.totalPausedTime = 0;
+            queue.pausedAt = null;
+            queue.startedAt = Date.now() - clamped * 1000;
+            queue.isPaused = false;
+            queue.isStopping = false;
 
-        queue.player.play(resource);
-        return true;
+            this.bumpTransitionNonce(guildId);
+            this.teardownActiveResource(guildId);
+            await this.waitForPipelineSettle();
+            this.activeResources.set(guildId, resource);
+            queue.player.play(resource);
+            return true;
+        });
     }
 
     /**
@@ -637,9 +756,16 @@ class QueueManager extends EventEmitter {
         queue.currentTrack = null;
         queue.isPlaying = false;
         queue.isPaused = false;
+        queue.autoPausedByEmptyChannel = false;
+        queue.crossfadeInProgress = false;
+        queue.crossfadeTargetTrackId = null;
         queue.startedAt = null;
         queue.pausedAt = null;
         queue.totalPausedTime = 0;
+        this.bumpTransitionNonce(guildId);
+        this.teardownActiveResource(guildId);
+        this.clearGuildWarmup(guildId);
+        void audioWrapper.cleanupGuildTemp(guildId);
 
         if (queue.player) {
             queue.player.stop(true);
@@ -668,7 +794,12 @@ class QueueManager extends EventEmitter {
         }
 
         log.info(`Skip de: ${queue.currentTrack?.title}`);
-        queue.player.stop();
+        queue.crossfadeInProgress = false;
+        queue.crossfadeTargetTrackId = null;
+        queue.autoPausedByEmptyChannel = false;
+        this.bumpTransitionNonce(guildId);
+        this.teardownActiveResource(guildId);
+        queue.player.stop(true);
         return true;
     }
 
@@ -690,6 +821,7 @@ class QueueManager extends EventEmitter {
         if (removed) {
             log.info(`Piste supprimee: ${removed.title}`);
         }
+        this.refreshWarmup(queue);
         return removed;
     }
 
@@ -709,6 +841,7 @@ class QueueManager extends EventEmitter {
 
         queue.tracks.splice(safeStart, count);
         log.info(`Suppression de ${count} piste(s) de la queue`);
+        this.refreshWarmup(queue);
         return count;
     }
 
@@ -724,6 +857,7 @@ class QueueManager extends EventEmitter {
         const count = queue.tracks.length;
         queue.tracks = [];
         log.info(`File d'attente videe (${count} piste(s) supprimee(s))`);
+        this.refreshWarmup(queue);
         return count;
     }
 
@@ -752,6 +886,7 @@ class QueueManager extends EventEmitter {
         const insertAt = clampedTo >= queue.tracks.length ? queue.tracks.length : clampedTo;
         queue.tracks.splice(insertAt, 0, track);
         log.info(`Piste deplacee: ${track.title} (${fromIndex} -> ${insertAt})`);
+        this.refreshWarmup(queue);
         return true;
     }
     /**
@@ -801,6 +936,200 @@ class QueueManager extends EventEmitter {
         return this.queues.has(guildId);
     }
 
+    private bumpTransitionNonce(guildId: string): number {
+        const next = (this.transitionNonces.get(guildId) ?? 0) + 1;
+        this.transitionNonces.set(guildId, next);
+        return next;
+    }
+
+    private isTransitionCurrent(guildId: string, nonce: number): boolean {
+        return this.transitionNonces.get(guildId) === nonce;
+    }
+
+    private teardownActiveResource(guildId: string): void {
+        const resource = this.activeResources.get(guildId);
+        if (!resource) {
+            return;
+        }
+
+        audioWrapper.teardownResource(resource);
+        this.activeResources.delete(guildId);
+    }
+
+    private clearGuildWarmup(guildId: string): void {
+        const warmedTrackId = this.warmedTrackByGuild.get(guildId);
+        if (!warmedTrackId) {
+            return;
+        }
+
+        audioWrapper.clearWarmResource(guildId, warmedTrackId);
+        this.warmedTrackByGuild.delete(guildId);
+    }
+
+    private refreshWarmup(queue: GuildQueue): void {
+        const nextTrack = queue.tracks[0] ?? null;
+        const previousWarmTrackId = this.warmedTrackByGuild.get(queue.guildId);
+
+        if (!nextTrack) {
+            if (previousWarmTrackId) {
+                audioWrapper.clearWarmResource(queue.guildId, previousWarmTrackId);
+                this.warmedTrackByGuild.delete(queue.guildId);
+            }
+            void audioWrapper.preloadTracks(queue.guildId, []);
+            return;
+        }
+
+        if (previousWarmTrackId && previousWarmTrackId !== nextTrack.id) {
+            audioWrapper.clearWarmResource(queue.guildId, previousWarmTrackId);
+        }
+
+        this.warmedTrackByGuild.set(queue.guildId, nextTrack.id);
+        void audioWrapper.preloadTracks(queue.guildId, [nextTrack]);
+        void audioWrapper.warmTrack(queue.guildId, nextTrack);
+    }
+
+    private startCrossfadeMonitor(queue: GuildQueue): void {
+        this.stopCrossfadeMonitor(queue.guildId);
+
+        const interval = setInterval(() => {
+            void this.maybeTriggerCrossfade(queue.guildId);
+        }, 1_000);
+
+        this.crossfadeMonitors.set(queue.guildId, interval);
+    }
+
+    private stopCrossfadeMonitor(guildId: string): void {
+        const monitor = this.crossfadeMonitors.get(guildId);
+        if (!monitor) {
+            return;
+        }
+
+        clearInterval(monitor);
+        this.crossfadeMonitors.delete(guildId);
+    }
+
+    private async maybeTriggerCrossfade(guildId: string): Promise<void> {
+        const queue = this.queues.get(guildId);
+        if (!queue || !queue.currentTrack || queue.tracks.length === 0 || queue.isPaused || !queue.isPlaying) {
+            return;
+        }
+        if (!queue.player || queue.player.state.status !== AudioPlayerStatus.Playing) {
+            return;
+        }
+        if (queue.crossfadeInProgress || this.crossfadeAttemptsInFlight.has(guildId)) {
+            return;
+        }
+        if (!Number.isFinite(queue.currentTrack.duration) || queue.currentTrack.duration <= 0) {
+            return;
+        }
+
+        const settings = await guildSettingsManager.getSettings(guildId);
+        if (!settings.crossfadeEnabled) {
+            return;
+        }
+
+        const currentTime = this.getCurrentTime(guildId);
+        const remaining = queue.currentTrack.duration - currentTime;
+        if (remaining > this.crossfadeSeconds + 0.25 || remaining <= 0) {
+            return;
+        }
+
+        this.crossfadeAttemptsInFlight.add(guildId);
+        try {
+            await this.runWithTransitionLock(guildId, async () => this.triggerCrossfadeInternal(guildId));
+        } finally {
+            this.crossfadeAttemptsInFlight.delete(guildId);
+        }
+    }
+
+    private async triggerCrossfadeInternal(guildId: string): Promise<boolean> {
+        const queue = this.queues.get(guildId);
+        if (!queue || !queue.player || !queue.currentTrack || queue.tracks.length === 0) {
+            return false;
+        }
+        if (queue.crossfadeInProgress) {
+            return false;
+        }
+
+        const currentTrack = queue.currentTrack;
+        const previousStartedAt = queue.startedAt;
+        const previousPausedAt = queue.pausedAt;
+        const previousTotalPausedTime = queue.totalPausedTime;
+        const nextTrack = queue.tracks.shift();
+        if (!nextTrack) {
+            return false;
+        }
+
+        queue.crossfadeInProgress = true;
+        queue.crossfadeTargetTrackId = nextTrack.id;
+
+        try {
+            const currentOffsetSeconds = this.getCurrentTime(guildId);
+            const resource = await audioWrapper.createCrossfadeResource(
+                guildId,
+                currentTrack,
+                nextTrack,
+                currentOffsetSeconds,
+                this.crossfadeSeconds
+            );
+
+            if (!resource) {
+                queue.tracks.unshift(nextTrack);
+                queue.crossfadeInProgress = false;
+                queue.crossfadeTargetTrackId = null;
+                return false;
+            }
+
+            if (resource.volume) {
+                resource.volume.setVolume(queue.volume / 100);
+            }
+
+            this.bumpTransitionNonce(guildId);
+            this.teardownActiveResource(guildId);
+            await this.waitForPipelineSettle();
+            this.activeResources.set(guildId, resource);
+
+            queue.currentTrack = nextTrack;
+            queue.startedAt = Date.now();
+            queue.pausedAt = null;
+            queue.totalPausedTime = 0;
+            queue.isPaused = false;
+            queue.isPlaying = true;
+            queue.autoPausedByEmptyChannel = false;
+
+            audioWrapper.clearFromCache(guildId, currentTrack.id);
+            this.clearLyrics(queue, currentTrack.id);
+            this.emit('trackEnd', queue, currentTrack);
+
+            queue.player.play(resource);
+            setTimeout(() => {
+                const latestQueue = this.queues.get(guildId);
+                if (!latestQueue) {
+                    return;
+                }
+                if (latestQueue.crossfadeTargetTrackId === nextTrack.id) {
+                    latestQueue.crossfadeInProgress = false;
+                    latestQueue.crossfadeTargetTrackId = null;
+                }
+            }, 500);
+            this.refreshWarmup(queue);
+            log.info(`Crossfade lancé: ${currentTrack.title} -> ${nextTrack.title}`);
+            return true;
+        } catch (error) {
+            queue.currentTrack = currentTrack;
+            queue.startedAt = previousStartedAt;
+            queue.pausedAt = previousPausedAt;
+            queue.totalPausedTime = previousTotalPausedTime;
+            queue.isPlaying = true;
+            queue.isPaused = !!previousPausedAt;
+            queue.tracks.unshift(nextTrack);
+            queue.crossfadeInProgress = false;
+            queue.crossfadeTargetTrackId = null;
+            log.warn('Crossfade indisponible, fallback en transition standard', error);
+            return false;
+        }
+    }
+
     private stopVoiceChannelMonitor(guildId: string): void {
         const monitor = this.voiceChannelMonitors.get(guildId);
         if (!monitor) {
@@ -809,6 +1138,39 @@ class QueueManager extends EventEmitter {
 
         clearInterval(monitor);
         this.voiceChannelMonitors.delete(guildId);
+    }
+
+    private async runWithTransitionLock<T>(guildId: string, callback: () => Promise<T>): Promise<T> {
+        const previous = this.transitionLocks.get(guildId) ?? Promise.resolve();
+
+        let release: (() => void) | undefined;
+        const current = new Promise<void>((resolve) => {
+            release = () => resolve();
+        });
+        const pending = previous
+            .catch(() => undefined)
+            .then(() => current);
+
+        this.transitionLocks.set(guildId, pending);
+        await previous.catch(() => undefined);
+
+        try {
+            return await callback();
+        } finally {
+            if (release) {
+                release();
+            }
+            const lock = this.transitionLocks.get(guildId);
+            if (lock === pending) {
+                this.transitionLocks.delete(guildId);
+            }
+        }
+    }
+
+    private async waitForPipelineSettle(): Promise<void> {
+        await new Promise<void>((resolve) => {
+            setTimeout(resolve, this.pipelineTeardownWaitMs);
+        });
     }
 
     private markIntentionalConnectionDestroy(guildId: string, connection: VoiceConnection): void {
@@ -827,6 +1189,3 @@ class QueueManager extends EventEmitter {
 }
 
 export const queueManager = new QueueManager();
-
-
-

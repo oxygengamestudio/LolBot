@@ -18,6 +18,7 @@ Use `.env.example` as template for local and preprod runs.
 | `DISCORD_TOKEN` | Yes | Discord bot token (prod or preprod). |
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID. |
 | `DISCORD_GUILD_ID` | No | Test guild ID for instant slash command sync. |
+| `DISCORD_COMMAND_SCOPE` | No | Slash registration scope: `auto` (default), `guild`, or `global`. |
 | `GOOGLE_API_KEY` | Yes | Google/YouTube API key. |
 | `RIOT_API_KEY` | No | Riot API key. |
 | `GENIUS_ACCESS_TOKEN` | No | Genius access token. |
@@ -32,6 +33,12 @@ Legacy compatibility is kept temporarily:
 - `CLIENT_ID` still works as fallback for `DISCORD_CLIENT_ID`
 - `GUILD_ID` still works as fallback for `DISCORD_GUILD_ID`
 - `YOUTUBE_API_KEY` still works as fallback for `GOOGLE_API_KEY`
+
+Scope behavior:
+
+- `DISCORD_COMMAND_SCOPE=auto`: if `DISCORD_GUILD_ID` is set, register guild commands and clear global commands; otherwise register global commands.
+- `DISCORD_COMMAND_SCOPE=guild`: register guild commands only and clear global commands (requires `DISCORD_GUILD_ID`).
+- `DISCORD_COMMAND_SCOPE=global`: register global commands and clear guild commands if `DISCORD_GUILD_ID` is set.
 
 When a fallback is used, the app logs a deprecation warning.
 
@@ -115,6 +122,35 @@ If your panel runs install/build automatically, use an install step such as:
 ```bash
 npm ci && npm run build
 ```
+
+## Stress Test (Single Instance, Multi Guild)
+
+Use this to estimate how many concurrent guild voice sessions one bot process can sustain.
+
+1. Copy `scripts/stress-single-instance.example.env` and fill values.
+2. Export env vars in your shell.
+3. Run:
+
+```bash
+npm run stress:single
+```
+
+Main inputs:
+
+- `STRESS_TARGETS=guildId:voiceChannelId:textChannelId,...`
+- `STRESS_URLS=url1,url2,...`
+- `STRESS_DURATION_SEC`
+- `STRESS_RAMP_STEP_SEC`
+
+Outputs:
+
+- CSV metrics in `data/stress/`:
+  - active targets/queues
+  - CPU%
+  - RSS/heap
+  - event loop delay
+  - p95 track start latency
+- Summary text file with max active targets reached and error count.
 
 ## Security Reminder
 

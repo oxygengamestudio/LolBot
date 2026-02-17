@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import type { SearchResult, Track, PlaylistInfo, YouTubeVideoInfo } from '../types/index.js';
 import https from 'https';
-import http from 'http';
+import { assertHttpsUrlAllowed, sanitizeUrlForLogs } from '../utils/networkSafety.js';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 
@@ -9,6 +9,7 @@ export class YouTubeService {
     private apiKey: string;
     private readonly requestTimeoutMs = 15_000;
     private readonly maxRedirects = 5;
+    private readonly allowedDomains = ['googleapis.com', 'youtube.com', 'youtube-nocookie.com', 'youtu.be'] as const;
 
     constructor() {
         this.apiKey = config.youtube.apiKey;
@@ -528,7 +529,7 @@ export class YouTubeService {
         try {
             return JSON.parse(data);
         } catch {
-            throw new Error(`Invalid JSON response from ${url}`);
+            throw new Error(`Invalid JSON response from ${sanitizeUrlForLogs(url)}`);
         }
     }
 
@@ -540,13 +541,14 @@ export class YouTubeService {
         redirectCount: number = 0
     ): Promise<string> {
         return new Promise((resolve, reject) => {
+            const safeUrl = sanitizeUrlForLogs(url);
+
             if (redirectCount > this.maxRedirects) {
-                reject(new Error(`Too many redirects for ${url}`));
+                reject(new Error(`Too many redirects for ${safeUrl}`));
                 return;
             }
 
-            const urlObj = new URL(url);
-            const protocol = urlObj.protocol === 'https:' ? https : http;
+            const urlObj = assertHttpsUrlAllowed(url, this.allowedDomains);
             const options: https.RequestOptions = {
                 hostname: urlObj.hostname,
                 port: urlObj.port ? Number(urlObj.port) : undefined,
@@ -557,7 +559,7 @@ export class YouTubeService {
                 },
             };
 
-            const req = protocol.request(options, (res) => {
+            const req = https.request(options, (res) => {
                 const statusCode = res.statusCode ?? 0;
 
                 if (statusCode >= 300 && statusCode < 400 && res.headers.location) {
@@ -582,7 +584,7 @@ export class YouTubeService {
 
                 if (statusCode < 200 || statusCode >= 300) {
                     res.resume();
-                    reject(new Error(`HTTP ${statusCode} from ${url}`));
+                    reject(new Error(`HTTP ${statusCode} from ${safeUrl}`));
                     return;
                 }
 
@@ -595,7 +597,7 @@ export class YouTubeService {
             });
 
             req.setTimeout(this.requestTimeoutMs, () => {
-                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${url}`));
+                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${safeUrl}`));
             });
             req.on("error", reject);
 

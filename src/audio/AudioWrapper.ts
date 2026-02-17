@@ -2,8 +2,8 @@
 import { EventEmitter } from 'events';
 import { Readable, Transform } from 'stream';
 import type { ChildProcess } from 'child_process';
-import { createWriteStream, existsSync } from 'fs';
-import { mkdir, chmod, rename, unlink } from 'fs/promises';
+import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { mkdir, chmod, rename, unlink, readdir, rm, stat } from 'fs/promises';
 import { join } from 'path';
 import http from 'http';
 import https from 'https';
@@ -15,28 +15,45 @@ import { logger } from '../utils/Logger.js';
 const log = logger.createModuleLogger('AudioWrapper');
 
 interface CacheEntry {
+    guildId: string;
     trackId: string;
     resource: AudioResource | null;
     streamUrl: string | null;
     timestamp: number;
 }
 
+interface ResourceMetadata {
+    trackId: string;
+    teardown: () => void;
+    createdAt: number;
+}
+
+interface WarmResourceEntry {
+    warmedAt: number;
+    expiresAt: number;
+}
+
 export class AudioWrapper extends EventEmitter {
     private cache: Map<string, CacheEntry> = new Map();
-    private preloadQueue: Track[] = [];
-    private isPreloading: boolean = false;
+    private preloadingGuilds: Set<string> = new Set();
     private ffmpegPath: string = 'ffmpeg';
     private ytdlpPath: string = 'yt-dlp';
     private ffmpegAvailable: boolean = false;
     private ytdlpAvailable: boolean = false;
     private dependenciesReady: Promise<boolean> | null = null;
+    private warmTracks: Map<string, WarmResourceEntry> = new Map();
+    private warmupInFlight: Map<string, Promise<void>> = new Map();
     private readonly discordOpusBitrateKbps = 128;
+    private readonly streamReadyWaitMs = 750;
+    private readonly warmResourceTtlMs = 90_000;
 
     constructor() {
         super();
         log.info('AudioWrapper initialisé');
+        mkdirSync(config.paths.cache, { recursive: true });
         this.dependenciesReady = this.checkDependencies();
         this.startCacheCleanup();
+        void this.cleanupAllStaleTemp();
     }
 
     /**
@@ -96,7 +113,10 @@ export class AudioWrapper extends EventEmitter {
                 }
             };
 
-            const child = spawn(binaryPath, args, { windowsHide: true });
+            const child = spawn(binaryPath, args, {
+                windowsHide: true,
+                env: this.getSpawnEnv(),
+            });
 
             child.stdout?.on('data', (data) => {
                 output += data.toString();
@@ -139,6 +159,110 @@ export class AudioWrapper extends EventEmitter {
         const matches = rawArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
         if (!matches) return [];
         return matches.map((arg) => arg.replace(/^['"]|['"]$/g, ''));
+    }
+
+    private getScopedTrackKey(guildId: string, trackId: string): string {
+        return `${guildId}:${trackId}`;
+    }
+
+    private getGuildCacheDir(guildId: string): string {
+        return join(config.paths.cache, guildId);
+    }
+
+    private async ensureGuildCacheDir(guildId: string): Promise<string> {
+        const guildCacheDir = this.getGuildCacheDir(guildId);
+        await mkdir(guildCacheDir, { recursive: true });
+        return guildCacheDir;
+    }
+
+    private async createRunDirectory(guildId: string): Promise<string> {
+        const guildCacheDir = await this.ensureGuildCacheDir(guildId);
+        const runDir = join(
+            guildCacheDir,
+            `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        );
+        await mkdir(runDir, { recursive: true });
+        return runDir;
+    }
+
+    private getSpawnEnv(tempDir: string = config.paths.cache): NodeJS.ProcessEnv {
+        return {
+            ...process.env,
+            TMPDIR: tempDir,
+            TMP: tempDir,
+            TEMP: tempDir,
+            TEMPDIR: tempDir,
+        };
+    }
+
+    private async cleanupRunDirectory(runDir: string): Promise<void> {
+        try {
+            await rm(runDir, { recursive: true, force: true });
+        } catch {
+            // Ignore
+        }
+    }
+
+    async cleanupGuildTemp(guildId: string): Promise<void> {
+        const prefix = `${guildId}:`;
+        for (const key of this.cache.keys()) {
+            if (key.startsWith(prefix)) {
+                this.cache.delete(key);
+            }
+        }
+        for (const key of this.warmTracks.keys()) {
+            if (key.startsWith(prefix)) {
+                this.warmTracks.delete(key);
+            }
+        }
+        for (const key of this.warmupInFlight.keys()) {
+            if (key.startsWith(prefix)) {
+                this.warmupInFlight.delete(key);
+            }
+        }
+
+        const guildCacheDir = this.getGuildCacheDir(guildId);
+        await rm(guildCacheDir, { recursive: true, force: true }).catch(() => undefined);
+        await mkdir(guildCacheDir, { recursive: true }).catch(() => undefined);
+        log.debug(`Cache temporaire nettoyé pour guild: ${guildId}`);
+    }
+
+    async cleanupAllStaleTemp(maxAgeMs: number = 6 * 60 * 60 * 1000): Promise<void> {
+        try {
+            await this.cleanupTempDir(config.paths.cache, maxAgeMs);
+        } catch {
+            // Ignore
+        }
+    }
+
+    private async cleanupTempDir(dirPath: string, maxAgeMs: number): Promise<void> {
+        const entries = await readdir(dirPath, { withFileTypes: true });
+        const now = Date.now();
+
+        for (const entry of entries) {
+            const fullPath = join(dirPath, entry.name);
+
+            if (entry.isDirectory()) {
+                if (entry.name.startsWith('run-')) {
+                    try {
+                        const info = await stat(fullPath);
+                        if (now - info.mtimeMs > maxAgeMs) {
+                            await rm(fullPath, { recursive: true, force: true });
+                        }
+                    } catch {
+                        // Ignore
+                    }
+                    continue;
+                }
+
+                await this.cleanupTempDir(fullPath, maxAgeMs).catch(() => undefined);
+                continue;
+            }
+
+            if (/^--Frag\d+$/i.test(entry.name)) {
+                await unlink(fullPath).catch(() => undefined);
+            }
+        }
     }
 
     private hasCookieEnv(): boolean {
@@ -336,7 +460,7 @@ export class AudioWrapper extends EventEmitter {
      * Crée une ressource audio à partir d'une piste
      * Utilise yt-dlp pour obtenir le stream audio
      */
-    async createResource(track: Track, startSeconds: number = 0): Promise<AudioResource | null> {
+    async createResource(guildId: string, track: Track, startSeconds: number = 0): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
         log.trace('Track ID:', track.id);
 
@@ -347,33 +471,175 @@ export class AudioWrapper extends EventEmitter {
         }
 
         try {
+            const cacheKey = this.getScopedTrackKey(guildId, track.id);
+            const cached = this.cache.get(cacheKey);
+            if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
+                log.debug('Utilisation du stream audio pre-resolu en cache');
+                const directResource = await this.createResourceWithDirectUrl(
+                    guildId,
+                    track,
+                    cached.streamUrl,
+                    startSeconds
+                );
+                if (directResource) {
+                    return directResource;
+                }
+                log.debug('Fallback yt-dlp: stream direct invalide/expiré');
+            }
+
             // Utiliser yt-dlp pour streamer directement
             log.debug('Utilisation de yt-dlp pour le streaming audio...');
-            return await this.createResourceWithYtdlp(track.url, startSeconds);
+            return await this.createResourceWithYtdlp(guildId, track, startSeconds);
         } catch (error) {
             log.error(`Erreur lors de la création de la ressource:`, error);
             return null;
         }
     }
 
+    async createCrossfadeResource(
+        guildId: string,
+        currentTrack: Track,
+        nextTrack: Track,
+        currentOffsetSeconds: number,
+        fadeSeconds: number
+    ): Promise<AudioResource | null> {
+        const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
+        if (!dependenciesOk) {
+            return null;
+        }
+
+        const currentUrl = await this.resolveDirectStreamUrl(guildId, currentTrack);
+        const nextUrl = await this.resolveDirectStreamUrl(guildId, nextTrack);
+        if (!currentUrl || !nextUrl) {
+            log.warn('Crossfade impossible: URL directe manquante');
+            return null;
+        }
+
+        const runDir = await this.createRunDirectory(guildId);
+        const safeFade = Math.max(1, Math.min(Math.floor(fadeSeconds), 10));
+        const safeOffset = Math.max(0, Math.floor(currentOffsetSeconds));
+
+        const ffmpegArgs = [
+            '-loglevel', 'warning',
+            ...(safeOffset > 0 ? ['-ss', safeOffset.toString()] : []),
+            '-i', currentUrl,
+            '-i', nextUrl,
+            '-filter_complex',
+            `[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];` +
+            `[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];` +
+            `[a0][a1]acrossfade=d=${safeFade}:c1=tri:c2=tri[a]`,
+            '-map', '[a]',
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+            'pipe:1',
+        ];
+
+        const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            env: this.getSpawnEnv(runDir),
+            cwd: runDir,
+        });
+
+        let tornDown = false;
+        const teardown = (reason: string) => {
+            if (tornDown) return;
+            tornDown = true;
+            log.trace(`Teardown crossfade pipeline: ${reason}`);
+
+            try {
+                ffmpeg.stdout?.destroy();
+            } catch {
+                // Ignore
+            }
+
+            try {
+                ffmpeg.stderr?.destroy();
+            } catch {
+                // Ignore
+            }
+
+            if (!ffmpeg.killed) {
+                try {
+                    ffmpeg.kill();
+                } catch {
+                    // Ignore
+                }
+            }
+
+            void this.cleanupRunDirectory(runDir);
+        };
+
+        let ffmpegErrors = '';
+        ffmpeg.stderr?.on('data', (data) => {
+            ffmpegErrors += data.toString();
+        });
+
+        ffmpeg.on('error', () => teardown('crossfade ffmpeg error'));
+        ffmpeg.on('close', (code) => {
+            if (code !== 0 && code !== null) {
+                log.trace(`FFmpeg crossfade fermé avec code ${code}`);
+            }
+            teardown(`crossfade ffmpeg closed (${code ?? 'null'})`);
+        });
+
+        if (!ffmpeg.stdout) {
+            teardown('crossfade stdout unavailable');
+            return null;
+        }
+
+        const stdout = ffmpeg.stdout as Readable;
+        stdout.once('close', () => teardown('crossfade audio stream closed'));
+        stdout.once('end', () => teardown('crossfade audio stream ended'));
+        stdout.once('error', () => teardown('crossfade audio stream error'));
+
+        const resource = createAudioResource<ResourceMetadata>(stdout, {
+            inputType: StreamType.Raw,
+            inlineVolume: true,
+            metadata: {
+                trackId: nextTrack.id,
+                teardown: () => teardown('crossfade resource teardown requested'),
+                createdAt: Date.now(),
+            },
+        });
+
+        if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
+            resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
+        }
+
+        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, 1_500);
+        if (ready === 'close') {
+            if (ffmpegErrors) {
+                log.trace('FFmpeg crossfade errors:', ffmpegErrors.slice(-500));
+            }
+            return null;
+        }
+        if (ready === 'timeout') {
+            log.trace('FFmpeg crossfade readiness timeout, continuing');
+        }
+
+        return resource;
+    }
+
     getDiscordOutputBitrateKbps(): number {
         return this.discordOpusBitrateKbps;
     }
 
-    async getBestAudioBitrateKbps(url: string): Promise<number | null> {
+    async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
         if (!dependenciesOk) {
             return null;
         }
 
         const includeCookies = this.hasCookieEnv();
-        const primary = await this.fetchYtdlpInfo(url, includeCookies);
+        const primary = await this.fetchYtdlpInfo(guildId, url, includeCookies);
         if (primary.info) {
             return this.extractAudioBitrateKbps(primary.info);
         }
 
         if (includeCookies && this.isCookieCopyError(primary.ytdlpErrors)) {
-            const fallback = await this.fetchYtdlpInfo(url, false);
+            const fallback = await this.fetchYtdlpInfo(guildId, url, false);
             if (fallback.info) {
                 return this.extractAudioBitrateKbps(fallback.info);
             }
@@ -382,20 +648,231 @@ export class AudioWrapper extends EventEmitter {
         return null;
     }
 
+    private async resolveDirectStreamUrl(guildId: string, track: Track): Promise<string | null> {
+        const cacheKey = this.getScopedTrackKey(guildId, track.id);
+        const cached = this.cache.get(cacheKey);
+        if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
+            return cached.streamUrl;
+        }
+
+        await this.warmTrack(guildId, track).catch(() => undefined);
+        const afterWarm = this.cache.get(cacheKey);
+        if (afterWarm?.streamUrl && this.isLikelyDirectStreamUrl(afterWarm.streamUrl)) {
+            return afterWarm.streamUrl;
+        }
+
+        const includeCookies = this.hasCookieEnv();
+        let infoResult = await this.fetchYtdlpInfo(guildId, track.url, includeCookies).catch(() => ({ info: null, ytdlpErrors: '' }));
+        if (!infoResult.info && includeCookies && this.isCookieCopyError(infoResult.ytdlpErrors)) {
+            infoResult = await this.fetchYtdlpInfo(guildId, track.url, false).catch(() => ({ info: null, ytdlpErrors: '' }));
+        }
+
+        const directUrl = infoResult.info ? this.extractBestAudioUrl(infoResult.info) : null;
+        if (!directUrl) {
+            return null;
+        }
+
+        this.cache.set(cacheKey, {
+            guildId,
+            trackId: track.id,
+            resource: null,
+            streamUrl: directUrl,
+            timestamp: Date.now(),
+        });
+        return directUrl;
+    }
+
+    private isLikelyDirectStreamUrl(url: string): boolean {
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+                return false;
+            }
+
+            const host = parsed.hostname.toLowerCase();
+            if (host.includes('googlevideo.com')) {
+                return true;
+            }
+
+            return parsed.pathname.includes('.m4a') || parsed.pathname.includes('.webm');
+        } catch {
+            return false;
+        }
+    }
+
+    private async waitForProcessStreamReady(
+        stream: NodeJS.ReadableStream | null | undefined,
+        processRef: ChildProcess,
+        timeoutMs: number
+    ): Promise<'ready' | 'timeout' | 'close'> {
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer: NodeJS.Timeout;
+
+            const finish = (result: 'ready' | 'timeout' | 'close') => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            };
+
+            const onReady = () => {
+                clearTimeout(timer);
+                finish('ready');
+            };
+            const onClose = () => {
+                clearTimeout(timer);
+                finish('close');
+            };
+
+            timer = setTimeout(() => {
+                if (stream) {
+                    stream.removeListener('data', onReady);
+                }
+                processRef.removeListener('close', onClose);
+                finish('timeout');
+            }, timeoutMs);
+
+            if (stream) {
+                stream.once('data', onReady);
+            }
+            processRef.once('close', onClose);
+        });
+    }
+
+    private async createResourceWithDirectUrl(
+        guildId: string,
+        track: Track,
+        directUrl: string,
+        startSeconds: number
+    ): Promise<AudioResource | null> {
+        const runDir = await this.createRunDirectory(guildId);
+        const ffmpegArgs = [
+            '-loglevel', 'warning',
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32k',
+            '-analyzeduration', '0',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2',
+            ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
+            '-i', directUrl,
+            '-vn',
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+            'pipe:1',
+        ];
+
+        const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            env: this.getSpawnEnv(runDir),
+            cwd: runDir,
+        });
+
+        let tornDown = false;
+        const teardown = (reason: string) => {
+            if (tornDown) {
+                return;
+            }
+            tornDown = true;
+            log.trace(`Teardown direct pipeline: ${reason}`);
+
+            try {
+                ffmpeg.stdout?.destroy();
+            } catch {
+                // Ignore
+            }
+
+            try {
+                ffmpeg.stderr?.destroy();
+            } catch {
+                // Ignore
+            }
+
+            if (!ffmpeg.killed) {
+                try {
+                    ffmpeg.kill();
+                } catch {
+                    // Ignore
+                }
+            }
+            void this.cleanupRunDirectory(runDir);
+        };
+
+        let ffmpegErrors = '';
+        ffmpeg.stderr?.on('data', (data) => {
+            ffmpegErrors += data.toString();
+        });
+
+        ffmpeg.on('error', () => {
+            teardown('ffmpeg process error (direct)');
+        });
+
+        ffmpeg.on('close', (code) => {
+            if (code !== 0 && code !== null) {
+                log.trace(`FFmpeg direct fermé avec code ${code}`);
+            }
+            teardown(`ffmpeg direct closed (${code ?? 'null'})`);
+        });
+
+        if (!ffmpeg.stdout) {
+            teardown('ffmpeg direct stdout unavailable');
+            return null;
+        }
+
+        const stdout = ffmpeg.stdout as Readable;
+        stdout.once('close', () => teardown('direct audio stream closed'));
+        stdout.once('end', () => teardown('direct audio stream ended'));
+        stdout.once('error', () => teardown('direct audio stream error'));
+
+        const resource = createAudioResource<ResourceMetadata>(stdout, {
+            inputType: StreamType.Raw,
+            inlineVolume: true,
+            metadata: {
+                trackId: track.id,
+                teardown: () => teardown('direct resource teardown requested'),
+                createdAt: Date.now(),
+            },
+        });
+
+        if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
+            resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
+        }
+
+        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, 1_500);
+        if (ready === 'close') {
+            if (ffmpegErrors) {
+                log.trace('FFmpeg direct errors:', ffmpegErrors.slice(-500));
+            }
+            return null;
+        }
+        if (ready === 'timeout') {
+            log.trace('FFmpeg direct readiness timeout, fallback possible');
+        }
+
+        return resource;
+    }
+
     /**
      * Crée une ressource audio en utilisant yt-dlp + FFmpeg
      */
-    private async createResourceWithYtdlp(url: string, startSeconds: number = 0): Promise<AudioResource | null> {
+    private async createResourceWithYtdlp(
+        guildId: string,
+        track: Track,
+        startSeconds: number = 0
+    ): Promise<AudioResource | null> {
         try {
             const includeCookies = this.hasCookieEnv();
-            const primary = await this.createResourceWithYtdlpArgs(url, includeCookies, startSeconds);
+            const primary = await this.createResourceWithYtdlpArgs(guildId, track, includeCookies, startSeconds);
             if (primary.resource) {
                 return primary.resource;
             }
 
             if (includeCookies && this.isCookieCopyError(primary.ytdlpErrors)) {
                 log.warn('yt-dlp cookies from browser failed, retrying without cookies');
-                const fallback = await this.createResourceWithYtdlpArgs(url, false, startSeconds);
+                const fallback = await this.createResourceWithYtdlpArgs(guildId, track, false, startSeconds);
                 return fallback.resource;
             }
 
@@ -410,12 +887,15 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private async createResourceWithYtdlpArgs(
-        url: string,
+        guildId: string,
+        track: Track,
         includeCookies: boolean,
         startSeconds: number
     ): Promise<{ resource: AudioResource | null; ytdlpErrors: string }> {
         log.debug(`Creation du stream avec yt-dlp (${includeCookies ? 'cookies' : 'no-cookies'})...`);
-        log.trace('URL:', url);
+        log.trace('URL:', track.url);
+
+        const runDir = await this.createRunDirectory(guildId);
 
         const extraArgs = this.getYtdlpExtraArgs(includeCookies);
         // Arguments yt-dlp pour extraire l'audio et l'envoyer vers stdout
@@ -423,10 +903,11 @@ export class AudioWrapper extends EventEmitter {
             ...extraArgs,
             '--no-warnings',
             '--no-playlist',
+            '--paths', `temp:${runDir}`,
             '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
             '-o', '-', // Output vers stdout
             '--quiet',
-            url,
+            track.url,
         ];
 
         log.trace('yt-dlp args:', ytdlpArgs.join(' '));
@@ -434,6 +915,8 @@ export class AudioWrapper extends EventEmitter {
         const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            env: this.getSpawnEnv(runDir),
+            cwd: runDir,
         });
 
         // Arguments FFmpeg pour transcoder en PCM
@@ -456,6 +939,8 @@ export class AudioWrapper extends EventEmitter {
         const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            env: this.getSpawnEnv(runDir),
+            cwd: runDir,
         });
 
         let tornDown = false;
@@ -505,6 +990,7 @@ export class AudioWrapper extends EventEmitter {
                     // Ignore
                 }
             }
+            void this.cleanupRunDirectory(runDir);
         };
 
         let pipeClosed = false;
@@ -626,16 +1112,21 @@ export class AudioWrapper extends EventEmitter {
             stream.once('error', teardownOnStreamFinish);
         }
 
-        const resource = createAudioResource(stream, {
+        const resource = createAudioResource<ResourceMetadata>(stream, {
             inputType: StreamType.Raw, // PCM s16le
             inlineVolume: true,
+            metadata: {
+                trackId: track.id,
+                teardown: () => teardown('resource teardown requested'),
+                createdAt: Date.now(),
+            },
         });
 
         if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const readyState = await this.waitForStreamReady(ytdlp.stdout, ytdlp, ffmpeg, 5_000);
+        const readyState = await this.waitForStreamReady(ytdlp.stdout, ytdlp, ffmpeg, this.streamReadyWaitMs);
         if (readyState === 'ytdlp-close' || readyState === 'ffmpeg-close') {
             log.warn(`yt-dlp stream ended before start (${readyState})`);
             teardown(`stream ended before ready (${readyState})`);
@@ -678,15 +1169,114 @@ export class AudioWrapper extends EventEmitter {
         return dropper;
     }
 
+    async warmTrack(guildId: string, track: Track): Promise<void> {
+        const cacheKey = this.getScopedTrackKey(guildId, track.id);
+        const existing = this.warmTracks.get(cacheKey);
+        if (existing) {
+            if (this.isWarmEntryExpired(existing)) {
+                this.warmTracks.delete(cacheKey);
+            } else {
+                return;
+            }
+        }
+
+        const pending = this.warmupInFlight.get(cacheKey);
+        if (pending) {
+            await pending;
+            return;
+        }
+
+        const warmup = (async () => {
+            const startedAt = Date.now();
+            const includeCookies = this.hasCookieEnv();
+            let infoResult = await this.fetchYtdlpInfo(guildId, track.url, includeCookies).catch(() => ({ info: null, ytdlpErrors: '' }));
+            if (!infoResult.info && includeCookies && this.isCookieCopyError(infoResult.ytdlpErrors)) {
+                infoResult = await this.fetchYtdlpInfo(guildId, track.url, false).catch(() => ({ info: null, ytdlpErrors: '' }));
+            }
+
+            const directUrl = infoResult.info ? this.extractBestAudioUrl(infoResult.info) : null;
+            const existingCache = this.cache.get(cacheKey);
+            this.cache.set(cacheKey, {
+                guildId,
+                trackId: track.id,
+                resource: null,
+                streamUrl: directUrl ?? existingCache?.streamUrl ?? track.url,
+                timestamp: Date.now(),
+            });
+
+            this.warmTracks.set(cacheKey, {
+                warmedAt: Date.now(),
+                expiresAt: Date.now() + this.warmResourceTtlMs,
+            });
+            log.debug(
+                `Warmup metadata prêt pour ${track.title} (${Date.now() - startedAt}ms, directUrl=${directUrl ? 'yes' : 'no'})`
+            );
+        })()
+            .catch((error) => {
+                log.trace(`Warmup échoué pour ${track.title}`, error);
+            })
+            .finally(() => {
+                this.warmupInFlight.delete(cacheKey);
+            });
+
+        this.warmupInFlight.set(cacheKey, warmup);
+        await warmup;
+    }
+
+    isTrackWarm(guildId: string, trackId: string): boolean {
+        const cacheKey = this.getScopedTrackKey(guildId, trackId);
+        const entry = this.warmTracks.get(cacheKey);
+        if (!entry) {
+            return false;
+        }
+
+        if (this.isWarmEntryExpired(entry)) {
+            this.warmTracks.delete(cacheKey);
+            return false;
+        }
+
+        return true;
+    }
+
+    clearWarmResource(guildId: string, trackId: string): void {
+        const cacheKey = this.getScopedTrackKey(guildId, trackId);
+        if (!this.warmTracks.has(cacheKey)) {
+            return;
+        }
+        this.warmTracks.delete(cacheKey);
+    }
+
+    teardownResource(resource: AudioResource | null | undefined): void {
+        if (!resource) {
+            return;
+        }
+
+        const metadata = resource.metadata as Partial<ResourceMetadata> | undefined;
+        if (metadata && typeof metadata.teardown === 'function') {
+            try {
+                metadata.teardown();
+            } catch (error) {
+                log.trace('Erreur lors du teardown explicite de la ressource', error);
+            }
+        }
+    }
+
+    private isWarmEntryExpired(entry: WarmResourceEntry): boolean {
+        return Date.now() > entry.expiresAt;
+    }
+
     private async fetchYtdlpInfo(
+        guildId: string,
         url: string,
         includeCookies: boolean
     ): Promise<{ info: any | null; ytdlpErrors: string }> {
+        const runDir = await this.createRunDirectory(guildId);
         const extraArgs = this.getYtdlpExtraArgs(includeCookies);
         const ytdlpArgs = [
             ...extraArgs,
             '--no-warnings',
             '--no-playlist',
+            '--paths', `temp:${runDir}`,
             '--skip-download',
             '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
             '--dump-single-json',
@@ -700,6 +1290,8 @@ export class AudioWrapper extends EventEmitter {
             const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
                 stdio: ['ignore', 'pipe', 'pipe'],
                 windowsHide: true,
+                env: this.getSpawnEnv(runDir),
+                cwd: runDir,
             });
 
             ytdlp.stdout?.on('data', (data) => {
@@ -712,10 +1304,12 @@ export class AudioWrapper extends EventEmitter {
 
             ytdlp.on('error', (error) => {
                 log.error('yt-dlp info error:', error);
+                void this.cleanupRunDirectory(runDir);
                 resolve({ info: null, ytdlpErrors: stderr });
             });
 
             ytdlp.on('close', (code) => {
+                void this.cleanupRunDirectory(runDir);
                 if (code !== 0) {
                     if (stderr) {
                         log.trace('yt-dlp info errors:', stderr.trim());
@@ -766,6 +1360,38 @@ export class AudioWrapper extends EventEmitter {
         return best;
     }
 
+    private extractBestAudioUrl(info: any): string | null {
+        const topLevel = typeof info?.url === 'string' ? info.url : null;
+        if (topLevel && this.isLikelyDirectStreamUrl(topLevel)) {
+            return topLevel;
+        }
+
+        const requested = Array.isArray(info?.requested_downloads) ? info.requested_downloads : [];
+        for (const item of requested) {
+            if (typeof item?.url === 'string' && this.isLikelyDirectStreamUrl(item.url)) {
+                return item.url;
+            }
+        }
+
+        const formats = Array.isArray(info?.formats) ? info.formats : [];
+        const audioFormats = formats
+            .filter((format: any) =>
+                format &&
+                typeof format.url === 'string' &&
+                format.acodec &&
+                format.acodec !== 'none' &&
+                (format.vcodec === 'none' || !format.vcodec)
+            )
+            .sort((a: any, b: any) => {
+                const aBitrate = this.normalizeBitrate(a.abr ?? a.tbr ?? a.audio_bitrate) ?? 0;
+                const bBitrate = this.normalizeBitrate(b.abr ?? b.tbr ?? b.audio_bitrate) ?? 0;
+                return bBitrate - aBitrate;
+            });
+
+        const best = audioFormats.find((format: any) => this.isLikelyDirectStreamUrl(format.url));
+        return best?.url ?? null;
+    }
+
     private normalizeBitrate(value: unknown): number | null {
         if (typeof value === 'number' && Number.isFinite(value)) {
             return Math.round(value);
@@ -783,39 +1409,43 @@ export class AudioWrapper extends EventEmitter {
     /**
      * Pré-charge les prochaines pistes (avec yt-dlp, on vérifie juste que les URLs sont valides)
      */
-    async preloadTracks(tracks: Track[]): Promise<void> {
-        if (this.isPreloading) {
-            log.trace('Pré-chargement déjà en cours, ignoré');
+    async preloadTracks(guildId: string, tracks: Track[]): Promise<void> {
+        if (this.preloadingGuilds.has(guildId)) {
+            log.trace(`Pré-chargement déjà en cours (${guildId}), ignoré`);
             return;
         }
 
-        this.isPreloading = true;
-        const toPreload = tracks.slice(0, config.audio.cacheAhead);
-        log.debug(`Pré-vérification de ${toPreload.length} piste(s)...`);
+        this.preloadingGuilds.add(guildId);
+        try {
+            const toPreload = tracks.slice(0, config.audio.cacheAhead);
+            log.debug(`Pré-vérification de ${toPreload.length} piste(s)...`);
 
-        for (const track of toPreload) {
-            if (this.cache.has(track.id)) {
-                log.trace(`Déjà vérifié: ${track.title}`);
-                continue;
+            for (const track of toPreload) {
+                const cacheKey = this.getScopedTrackKey(guildId, track.id);
+                if (this.cache.has(cacheKey)) {
+                    log.trace(`Déjà vérifié: ${track.title}`);
+                    continue;
+                }
+
+                try {
+                    log.trace(`Pré-vérification: ${track.title}`);
+
+                    // Avec yt-dlp, on met juste en cache l'ID pour savoir qu'on l'a vérifié
+                    this.cache.set(cacheKey, {
+                        guildId,
+                        trackId: track.id,
+                        resource: null,
+                        streamUrl: track.url,
+                        timestamp: Date.now(),
+                    });
+                    log.info(`Pré-vérifié: ${track.title}`);
+                } catch (error) {
+                    log.error(`Erreur de pré-vérification pour ${track.title}:`, error);
+                }
             }
-
-            try {
-                log.trace(`Pré-vérification: ${track.title}`);
-
-                // Avec yt-dlp, on met juste en cache l'ID pour savoir qu'on l'a vérifié
-                this.cache.set(track.id, {
-                    trackId: track.id,
-                    resource: null,
-                    streamUrl: track.url,
-                    timestamp: Date.now(),
-                });
-                log.info(`Pré-vérifié: ${track.title}`);
-            } catch (error) {
-                log.error(`Erreur de pré-vérification pour ${track.title}:`, error);
-            }
+        } finally {
+            this.preloadingGuilds.delete(guildId);
         }
-
-        this.isPreloading = false;
         log.debug('Pré-vérification terminée');
     }
 
@@ -827,6 +1457,7 @@ export class AudioWrapper extends EventEmitter {
             const now = Date.now();
             const maxAge = 30 * 60 * 1000; // 30 minutes
             let cleaned = 0;
+            let warmCleaned = 0;
 
             for (const [trackId, entry] of this.cache.entries()) {
                 if (now - entry.timestamp > maxAge) {
@@ -835,19 +1466,32 @@ export class AudioWrapper extends EventEmitter {
                 }
             }
 
+            for (const [trackId, entry] of this.warmTracks.entries()) {
+                if (now > entry.expiresAt) {
+                    this.warmTracks.delete(trackId);
+                    warmCleaned++;
+                }
+            }
+
             if (cleaned > 0) {
                 log.debug(`Nettoyage du cache: ${cleaned} entrée(s) supprimée(s)`);
             }
+            if (warmCleaned > 0) {
+                log.debug(`Nettoyage warmup: ${warmCleaned} entrée(s) supprimée(s)`);
+            }
+            void this.cleanupAllStaleTemp();
         }, 5 * 60 * 1000); // Vérifier toutes les 5 minutes
     }
 
     /**
      * Supprime une entrée du cache
      */
-    clearFromCache(trackId: string): void {
-        if (this.cache.delete(trackId)) {
-            log.trace(`Supprimé du cache: ${trackId}`);
+    clearFromCache(guildId: string, trackId: string): void {
+        const cacheKey = this.getScopedTrackKey(guildId, trackId);
+        if (this.cache.delete(cacheKey)) {
+            log.trace(`Supprimé du cache: ${cacheKey}`);
         }
+        this.clearWarmResource(guildId, trackId);
     }
 
     /**
@@ -855,8 +1499,13 @@ export class AudioWrapper extends EventEmitter {
      */
     clearCache(): void {
         const size = this.cache.size;
+        const warmSize = this.warmTracks.size;
+        const inFlightSize = this.warmupInFlight.size;
         this.cache.clear();
-        log.info(`Cache vidé: ${size} entrée(s) supprimée(s)`);
+        this.warmTracks.clear();
+        this.warmupInFlight.clear();
+        this.preloadingGuilds.clear();
+        log.info(`Cache vidé: ${size} entrée(s) supprimée(s), warmup vidé: ${warmSize}, warmup in-flight: ${inFlightSize}`);
     }
 
     /**
@@ -868,6 +1517,3 @@ export class AudioWrapper extends EventEmitter {
 }
 
 export const audioWrapper = new AudioWrapper();
-
-
-

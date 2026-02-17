@@ -1,9 +1,10 @@
 import https from 'https';
-import http from 'http';
 import zlib from 'zlib';
 import { URLSearchParams } from 'url';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
+import { assertHttpsUrlAllowed, sanitizeUrlForLogs } from '../utils/networkSafety.js';
+import type { IncomingMessage } from 'http';
 
 const log = logger.createModuleLogger('GeniusService');
 
@@ -30,6 +31,7 @@ class GeniusService {
     private tokenPromise: Promise<string | null> | null = null;
     private readonly requestTimeoutMs = 15_000;
     private readonly maxRedirects = 5;
+    private readonly allowedDomains = ['genius.com'] as const;
 
     async getLyrics(query: string): Promise<LyricsResult | null> {
         if (!query || query.trim().length === 0) {
@@ -43,34 +45,62 @@ class GeniusService {
             return null;
         }
 
+        let fallbackTranslation: LyricsResult | null = null;
+
         for (const q of queries) {
-            const song = await this.searchSong(q);
-            if (!song) {
+            const songs = await this.searchSongs(q);
+            if (songs.length === 0) {
                 continue;
             }
 
-            const html = await this.fetchText(song.url);
-            const lyrics = this.extractLyrics(html);
-            if (!lyrics) {
-                continue;
+            const originalSongs = songs.filter((song) => !this.isTranslationCandidate(song)).slice(0, 5);
+            const translatedSongs = songs.filter((song) => this.isTranslationCandidate(song)).slice(0, 3);
+
+            const originalResult = await this.trySongsForLyrics(originalSongs, true);
+            if (originalResult) {
+                return originalResult;
             }
 
-            return {
-                title: song.title,
-                fullTitle: song.fullTitle,
-                artist: song.artist,
-                url: song.url,
-                lyrics,
-            };
+            if (!fallbackTranslation) {
+                fallbackTranslation = await this.trySongsForLyrics(translatedSongs, false);
+            }
+        }
+
+        return fallbackTranslation;
+    }
+
+    private async trySongsForLyrics(songs: GeniusSong[], strictQuality: boolean): Promise<LyricsResult | null> {
+        for (const song of songs) {
+            try {
+                const html = await this.fetchText(song.url);
+                const lyrics = this.extractLyrics(html);
+                if (!lyrics) {
+                    continue;
+                }
+
+                if (!this.isLyricsQualityAcceptable(song, lyrics, strictQuality)) {
+                    continue;
+                }
+
+                return {
+                    title: song.title,
+                    fullTitle: song.fullTitle,
+                    artist: song.artist,
+                    url: song.url,
+                    lyrics,
+                };
+            } catch (error) {
+                log.trace(`Impossible de recuperer les paroles pour ${song.fullTitle}`, error);
+            }
         }
 
         return null;
     }
 
-    private async searchSong(query: string): Promise<GeniusSong | null> {
+    private async searchSongs(query: string): Promise<GeniusSong[]> {
         if (!query || query.trim().length === 0) {
-            log.debug('searchSong: empty query, skipping');
-            return null;
+            log.debug('searchSongs: empty query, skipping');
+            return [];
         }
 
         const token = await this.getAccessToken();
@@ -84,9 +114,9 @@ class GeniusService {
                 const results = Array.isArray(hits)
                     ? hits.filter((item: any) => item.type === 'song').map((item: any) => item.result)
                     : [];
-                const best = this.pickBestResult(query, results);
-                if (best) {
-                    return best;
+                const ranked = this.rankCandidates(query, results);
+                if (ranked.length > 0) {
+                    return ranked;
                 }
             } catch (error) {
                 log.warn('Genius API search failed, trying public search.', error);
@@ -95,13 +125,13 @@ class GeniusService {
             log.warn('Genius token unavailable, trying public search.');
         }
 
-        return this.searchSongPublic(query);
+        return this.searchSongsPublic(query);
     }
 
-    private async searchSongPublic(query: string): Promise<GeniusSong | null> {
+    private async searchSongsPublic(query: string): Promise<GeniusSong[]> {
         if (!query || query.trim().length === 0) {
-            log.debug('searchSongPublic: empty query, skipping');
-            return null;
+            log.debug('searchSongsPublic: empty query, skipping');
+            return [];
         }
 
         const params = new URLSearchParams({ q: query });
@@ -132,42 +162,41 @@ class GeniusService {
             }
         }
 
-        return this.pickBestResult(query, results);
+        return this.rankCandidates(query, results);
     }
 
-    private pickBestResult(query: string, results: any[]): GeniusSong | null {
+    private rankCandidates(query: string, results: any[]): GeniusSong[] {
         const candidates = results
             .map((result) => this.coerceSong(result))
             .filter((candidate): candidate is GeniusSong => Boolean(candidate));
 
         if (candidates.length === 0) {
-            return null;
+            return [];
         }
 
         const normalizedQuery = this.normalizeSearchText(query);
         const tokens = this.tokenizeQuery(normalizedQuery);
 
-        const nonTranslated = candidates.filter((candidate) => !this.isTranslationCandidate(candidate));
-        const pool = nonTranslated.length > 0 ? nonTranslated : candidates;
+        const scored = candidates
+            .map((candidate) => ({
+                candidate,
+                score: this.scoreCandidate(candidate, normalizedQuery, tokens),
+            }))
+            .filter((entry) => entry.score >= 4);
 
-        let best: GeniusSong | null = null;
-        let bestScore = -Infinity;
+        if (scored.length === 0) {
+            return [];
+        }
 
-        for (const candidate of pool) {
-            const score = this.scoreCandidate(candidate, normalizedQuery, tokens);
-            log.trace(`Score ${score} pour: ${candidate.fullTitle}`);
-            if (score > bestScore) {
-                bestScore = score;
-                best = candidate;
+        scored.sort((a, b) => b.score - a.score);
+        const deduped = new Map<number, GeniusSong>();
+        for (const entry of scored) {
+            if (!deduped.has(entry.candidate.id)) {
+                deduped.set(entry.candidate.id, entry.candidate);
             }
         }
 
-        if (bestScore < 4) {
-            log.debug(`Meilleur score trop bas (${bestScore}), aucun resultat retenu`);
-            return null;
-        }
-
-        return best;
+        return Array.from(deduped.values());
     }
 
     private coerceSong(result: any): GeniusSong | null {
@@ -283,7 +312,10 @@ class GeniusService {
     }
 
     private scoreCandidate(candidate: GeniusSong, normalizedQuery: string, tokens: string[]): number {
-        const haystack = this.normalizeSearchText(`${candidate.title} ${candidate.fullTitle} ${candidate.artist}`);
+        const urlSlug = this.getSongUrlSlug(candidate.url);
+        const haystack = this.normalizeSearchText(
+            `${candidate.title} ${candidate.fullTitle} ${candidate.artist} ${urlSlug}`
+        );
         let score = 0;
 
         if (normalizedQuery && haystack.includes(normalizedQuery)) {
@@ -304,17 +336,18 @@ class GeniusService {
         }
 
         if (candidate.lyricsState === 'complete') {
-            score += 6;
+            score += 8;
         } else if (candidate.lyricsState === 'partial') {
-            score += 2;
+            score -= 2;
         } else if (candidate.lyricsState === 'unreleased') {
             score -= 6;
         }
 
         if (this.isTranslationCandidate(candidate)) {
-            score -= 50;
+            score -= 80;
         }
 
+        log.trace(`Score ${score} pour: ${candidate.fullTitle}`);
         return score;
     }
 
@@ -322,7 +355,8 @@ class GeniusService {
         return (
             this.hasTranslationMarker(candidate.title) ||
             this.hasTranslationMarker(candidate.fullTitle) ||
-            this.hasTranslationMarker(candidate.artist)
+            this.hasTranslationMarker(candidate.artist) ||
+            this.hasTranslationMarker(this.getSongUrlSlug(candidate.url))
         );
     }
 
@@ -341,9 +375,55 @@ class GeniusService {
             'traducao',
             'ubersetzung',
             'ubersetzungen',
+            'ceviri',
+            'cevirisi',
+            'ceviriler',
+            'turkce',
+            'turkceceviri',
+            'turkceceviriler',
+            'romanized',
+            'romaji',
+            'phonetic',
+            'transliteration',
         ];
 
         return markers.some((marker) => normalized.includes(marker));
+    }
+
+    private getSongUrlSlug(url: string): string {
+        try {
+            const parsed = new URL(url);
+            return parsed.pathname;
+        } catch {
+            return url;
+        }
+    }
+
+    private isLyricsQualityAcceptable(song: GeniusSong, lyrics: string, strictQuality: boolean): boolean {
+        const lines = lyrics
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
+
+        const charCount = lyrics.replace(/\s+/g, ' ').trim().length;
+        const uniqueLines = new Set(lines.map((line) => this.normalizeSearchText(line)));
+        const isShort = lines.length < 8 || charCount < 220;
+        const lowVariety = lines.length >= 6 && uniqueLines.size <= Math.max(3, Math.floor(lines.length * 0.35));
+        const isPartial = song.lyricsState === 'partial';
+
+        if (isShort || lowVariety) {
+            return false;
+        }
+
+        if (isPartial && strictQuality && (lines.length < 18 || charCount < 700)) {
+            return false;
+        }
+
+        if (strictQuality && (lines.length < 10 || charCount < 320)) {
+            return false;
+        }
+
+        return true;
     }
 
     private async getAccessToken(): Promise<string | null> {
@@ -479,14 +559,15 @@ class GeniusService {
         redirectCount: number = 0
     ): Promise<{ statusCode: number; body: string }> {
         return new Promise((resolve, reject) => {
+            const safeUrl = sanitizeUrlForLogs(url);
+
             if (redirectCount > this.maxRedirects) {
-                reject(new Error(`Too many redirects for ${url}`));
+                reject(new Error(`Too many redirects for ${safeUrl}`));
                 return;
             }
 
-            const urlObj = new URL(url);
-            const protocol = urlObj.protocol === 'https:' ? https : http;
-            const req = protocol.request(
+            const urlObj = assertHttpsUrlAllowed(url, this.allowedDomains);
+            const req = https.request(
                 {
                     method: options.method,
                     hostname: urlObj.hostname,
@@ -538,7 +619,7 @@ class GeniusService {
             );
 
             req.setTimeout(this.requestTimeoutMs, () => {
-                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${url}`));
+                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${safeUrl}`));
             });
             req.on('error', reject);
 
@@ -550,7 +631,7 @@ class GeniusService {
         });
     }
 
-    private getDecodedStream(res: http.IncomingMessage): NodeJS.ReadableStream {
+    private getDecodedStream(res: IncomingMessage): NodeJS.ReadableStream {
         const encoding = (res.headers['content-encoding'] || '').toString().toLowerCase();
         if (encoding.includes('br')) {
             return res.pipe(zlib.createBrotliDecompress());
@@ -565,32 +646,22 @@ class GeniusService {
     }
 
     private extractLyrics(html: string): string | null {
-        const containers: string[] = [];
-        const containerRegex = /<div[^>]+data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
-        let match = containerRegex.exec(html);
-        while (match) {
-            containers.push(match[1]);
-            match = containerRegex.exec(html);
-        }
+        const modernContainers = this.extractDivContainerContents(
+            html,
+            /<div\b[^>]*data-lyrics-container="true"[^>]*>/gi
+        );
+        const legacyContainers = modernContainers.length > 0
+            ? modernContainers
+            : this.extractDivContainerContents(
+                html,
+                /<div\b[^>]*class="[^"]*Lyrics__Container[^"]*"[^>]*>/gi
+            );
 
-        let raw = '';
-        if (containers.length > 0) {
-            raw = containers.join('\n');
-        } else {
-            const classRegex = /<div[^>]+class="[^"]*Lyrics__Container[^"]*"[^>]*>([\s\S]*?)<\/div>/g;
-            const classContainers: string[] = [];
-            let classMatch = classRegex.exec(html);
-            while (classMatch) {
-                classContainers.push(classMatch[1]);
-                classMatch = classRegex.exec(html);
-            }
-            if (classContainers.length > 0) {
-                raw = classContainers.join('\n');
-            } else {
-                const legacyMatch = html.match(/<div class="lyrics">([\s\S]*?)<\/div>/);
-                if (legacyMatch) {
-                    raw = legacyMatch[1];
-                }
+        let raw = legacyContainers.join('\n');
+        if (!raw) {
+            const legacyMatch = html.match(/<div class="lyrics">([\s\S]*?)<\/div>/);
+            if (legacyMatch) {
+                raw = legacyMatch[1];
             }
         }
 
@@ -598,12 +669,65 @@ class GeniusService {
             return null;
         }
 
-        const withBreaks = raw.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n');
+        const withBreaks = raw
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/(p|div|li|h[1-6])>/gi, '\n');
         const stripped = withBreaks.replace(/<[^>]+>/g, '');
         const decoded = this.decodeHtmlEntities(stripped);
         const cleaned = decoded.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
         const sanitized = this.cleanupLyrics(cleaned);
         return sanitized || null;
+    }
+
+    private extractDivContainerContents(html: string, openTagRegex: RegExp): string[] {
+        const source = openTagRegex.source;
+        const flags = openTagRegex.flags.includes('g') ? openTagRegex.flags : `${openTagRegex.flags}g`;
+        const regex = new RegExp(source, flags);
+
+        const containers: string[] = [];
+        let match = regex.exec(html);
+        while (match) {
+            const openTagStart = match.index;
+            const openTagEnd = html.indexOf('>', openTagStart);
+            if (openTagEnd < 0) {
+                break;
+            }
+
+            const contentStart = openTagEnd + 1;
+            const contentEnd = this.findMatchingDivClose(html, contentStart);
+            if (contentEnd > contentStart) {
+                containers.push(html.slice(contentStart, contentEnd));
+                regex.lastIndex = contentEnd + 6; // </div>
+            } else {
+                regex.lastIndex = contentStart;
+            }
+
+            match = regex.exec(html);
+        }
+
+        return containers;
+    }
+
+    private findMatchingDivClose(html: string, fromIndex: number): number {
+        const tagRegex = /<\/?div\b[^>]*>/gi;
+        tagRegex.lastIndex = fromIndex;
+        let depth = 1;
+        let match = tagRegex.exec(html);
+
+        while (match) {
+            const tag = match[0];
+            if (tag.startsWith('</')) {
+                depth -= 1;
+                if (depth === 0) {
+                    return match.index;
+                }
+            } else {
+                depth += 1;
+            }
+            match = tagRegex.exec(html);
+        }
+
+        return -1;
     }
 
     private cleanupLyrics(text: string): string {
@@ -612,6 +736,7 @@ class GeniusService {
             const trimmed = line.trim();
             if (!trimmed) return true;
 
+            if (this.isLanguageNavigationLine(trimmed)) return false;
             if (/contributors?/i.test(trimmed)) return false;
             if (/you might also like/i.test(trimmed)) return false;
             if (/^embed$/i.test(trimmed)) return false;
@@ -620,11 +745,72 @@ class GeniusService {
             if (/lyrics$/i.test(trimmed) && /genius/i.test(trimmed)) return false;
             if (/open on genius/i.test(trimmed)) return false;
             if (/ouvrir sur genius/i.test(trimmed)) return false;
+            if (/lyrics$/i.test(trimmed)) return false;
+            if (/^paroles de/i.test(trimmed)) return false;
+            if (trimmed.length <= 80 && this.hasTranslationMarker(trimmed)) return false;
 
             return true;
         });
 
-        return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        const trimmedIntro = this.trimIntroNoise(filtered);
+        return trimmedIntro.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    private trimIntroNoise(lines: string[]): string[] {
+        const firstSectionIndex = lines.findIndex((line) =>
+            /^\[(couplet|verse|refrain|chorus|pont|bridge|intro|outro|pre-chorus|post-chorus|hook)/i.test(line.trim())
+        );
+
+        if (firstSectionIndex > 0) {
+            return lines.slice(firstSectionIndex);
+        }
+
+        return lines;
+    }
+
+    private isLanguageNavigationLine(line: string): boolean {
+        if (/^(العربية|русский|日本語|한국어|中文|繁體中文|简体中文)$/iu.test(line.trim())) {
+            return true;
+        }
+
+        const normalized = this.normalizeSearchText(line);
+        if (!normalized) {
+            return false;
+        }
+
+        const languageTokens = new Set([
+            'english',
+            'francais',
+            'french',
+            'espanol',
+            'spanish',
+            'deutsch',
+            'german',
+            'magyar',
+            'italiano',
+            'portugues',
+            'portuguese',
+            'arabic',
+            'arabe',
+            'turkce',
+            'turkish',
+            'russian',
+            'japanese',
+            'korean',
+            'chinese',
+            'zhongwen',
+            'hindi',
+            'polski',
+            'dutch',
+            'nederlands',
+        ]);
+
+        const tokens = normalized.split(' ').filter(Boolean);
+        if (tokens.length === 0 || tokens.length > 4) {
+            return false;
+        }
+
+        return tokens.every((token) => languageTokens.has(token));
     }
 
     private decodeHtmlEntities(text: string): string {

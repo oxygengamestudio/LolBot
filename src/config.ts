@@ -8,6 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 type NodeEnv = 'development' | 'test' | 'production';
+type CommandScope = 'auto' | 'guild' | 'global';
 
 export interface AppConfig {
     nodeEnv: NodeEnv;
@@ -15,6 +16,7 @@ export interface AppConfig {
         token: string;
         clientId: string;
         guildId?: string;
+        commandScope: CommandScope;
     };
     youtube: {
         apiKey: string;
@@ -117,9 +119,26 @@ function normalizeNodeEnv(): NodeEnv {
     return 'development';
 }
 
+function normalizeCommandScope(): CommandScope {
+    const rawScope = getOptionalEnv('DISCORD_COMMAND_SCOPE');
+    if (!rawScope) {
+        return 'auto';
+    }
+
+    const normalized = rawScope.toLowerCase();
+    if (normalized === 'auto' || normalized === 'guild' || normalized === 'global') {
+        return normalized;
+    }
+
+    throw new Error(
+        `[config] Invalid DISCORD_COMMAND_SCOPE "${rawScope}". Allowed values: auto, guild, global.`
+    );
+}
+
 const discordToken = getRequiredEnv('DISCORD_TOKEN');
 const discordClientId = getRequiredEnv('DISCORD_CLIENT_ID', ['CLIENT_ID']);
 const discordGuildId = getOptionalEnv('DISCORD_GUILD_ID', ['GUILD_ID']);
+const discordCommandScope = normalizeCommandScope();
 const googleApiKey = getRequiredEnv('GOOGLE_API_KEY', ['YOUTUBE_API_KEY']);
 
 export const config: AppConfig = {
@@ -128,6 +147,7 @@ export const config: AppConfig = {
         token: discordToken,
         clientId: discordClientId,
         guildId: discordGuildId,
+        commandScope: discordCommandScope,
     },
     youtube: {
         apiKey: googleApiKey,

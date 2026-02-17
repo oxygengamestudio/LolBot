@@ -37,7 +37,10 @@ import {
     SETTINGS_SELECT_IDS,
 } from './utils/settings-ui.js';
 import { logger } from './utils/Logger.js';
+import { acquireProcessLock } from './utils/processLock.js';
+import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
 import fs from 'fs';
+import { join } from 'path';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
@@ -58,6 +61,7 @@ type SettingsPromptState = {
 
 const settingsPromptStates = new Map<string, SettingsPromptState>();
 const settingsPromptByUser = new Map<string, string>();
+let processLock: ReturnType<typeof acquireProcessLock> | null = null;
 
 function isVoiceOrStageChannel(channel: unknown): channel is VoiceChannel | StageChannel {
     if (!channel || typeof channel !== 'object' || !('type' in channel)) {
@@ -161,13 +165,23 @@ if (!fs.existsSync(config.paths.guilds)) {
     log.debug('Dossier guild créé');
 }
 
+try {
+    processLock = acquireProcessLock(join(config.paths.data, 'bot.lock'));
+    log.debug(`Verrou process acquis: ${processLock.path}`);
+    process.on('exit', () => {
+        processLock?.release();
+    });
+} catch (error) {
+    log.error('Impossible de démarrer une seconde instance du bot:', error);
+    process.exit(1);
+}
+
 // Créer le client Discord avec tous les intents nécessaires
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
     ],
 });
 
@@ -334,7 +348,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await command.execute(interaction);
         }
     } catch (error) {
+        if (isKnownInteractionResponseError(error)) {
+            const code = getDiscordErrorCode(error) ?? 'unknown';
+            log.warn(
+                `Interaction ignorée (code ${code}): déjà traitée ou expirée. Vérifie qu'une seule instance du bot est active.`
+            );
+            return;
+        }
+
         log.error('Erreur lors du traitement de l\'interaction:', error);
+
+        if (interaction.isAutocomplete()) {
+            return;
+        }
 
         // Essayer de répondre à l'interaction si possible
         if (interaction.isRepliable()) {
@@ -346,7 +372,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral });
                 }
             } catch (e) {
-                log.trace('Impossible de répondre à l\'interaction');
+                if (!isKnownInteractionResponseError(e)) {
+                    log.trace('Impossible de répondre à l\'interaction');
+                }
             }
         }
     }
@@ -522,6 +550,20 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
         case SETTINGS_BUTTON_IDS.always: {
             const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
                 stayConnectedAlways: !settings.stayConnectedAlways,
+            });
+            await interaction.update(buildSettingsMessage(updated));
+            return;
+        }
+        case SETTINGS_BUTTON_IDS.pauseOnEmpty: {
+            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                pauseOnEmptyChannelWhenAlwaysConnected: !settings.pauseOnEmptyChannelWhenAlwaysConnected,
+            });
+            await interaction.update(buildSettingsMessage(updated));
+            return;
+        }
+        case SETTINGS_BUTTON_IDS.crossfade: {
+            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                crossfadeEnabled: !settings.crossfadeEnabled,
             });
             await interaction.update(buildSettingsMessage(updated));
             return;
@@ -880,26 +922,59 @@ async function registerCommands(): Promise<void> {
         log.info('Actualisation des commandes slash...');
 
         const commandsData = commands.map(cmd => cmd.data.toJSON());
+        const configuredScope = config.discord.commandScope;
+        const effectiveScope = configuredScope === 'auto'
+            ? (config.discord.guildId ? 'guild' : 'global')
+            : configuredScope;
 
-        // Enregistrer globalement
-        log.debug('Enregistrement global...');
+        if (effectiveScope === 'guild') {
+            if (!config.discord.guildId) {
+                throw new Error(
+                    'DISCORD_COMMAND_SCOPE=guild requires DISCORD_GUILD_ID.'
+                );
+            }
+
+            log.debug(
+                `Enregistrement guild (${config.discord.guildId}) (configured: ${configuredScope}, effective: guild)...`
+            );
+            await rest.put(
+                Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
+                { body: commandsData }
+            );
+
+            log.debug('Nettoyage des commandes globales (évite les doublons)...');
+            await rest.put(
+                Routes.applicationCommands(config.discord.clientId),
+                { body: [] }
+            );
+
+            log.info(
+                `${commandsData.length} commande(s) actualisée(s) (configured: ${configuredScope}, effective: guild)`
+            );
+            return;
+        }
+
+        log.debug(
+            `Enregistrement global (configured: ${configuredScope}, effective: global)...`
+        );
         await rest.put(
             Routes.applicationCommands(config.discord.clientId),
             { body: commandsData }
         );
 
         if (config.discord.guildId) {
-            // Enregistrement sur le serveur de test pour mise à jour instantanée
-            log.debug(`Enregistrement guild (${config.discord.guildId})...`);
+            log.debug(
+                `Nettoyage des commandes guild (${config.discord.guildId}) pour éviter les doublons...`
+            );
             await rest.put(
                 Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
-                { body: commandsData }
+                { body: [] }
             );
-        } else {
-            log.info('DISCORD_GUILD_ID non défini, enregistrement guild ignoré.');
         }
 
-        log.info(`${commandsData.length} commande(s) actualisée(s)`);
+        log.info(
+            `${commandsData.length} commande(s) actualisée(s) (configured: ${configuredScope}, effective: global)`
+        );
     } catch (error) {
         log.error('Erreur lors de l\'actualisation des commandes:', error);
     }
@@ -941,6 +1016,8 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
     }
 
     try {
+        processLock?.release();
+        processLock = null;
         client.destroy();
     } catch (error) {
         log.error('Erreur lors de la fermeture du client Discord:', error);
@@ -967,13 +1044,3 @@ console.log('');
 // Connexion du bot
 log.info('Démarrage du bot...');
 client.login(config.discord.token);
-
-
-
-
-
-
-
-
-
-

@@ -20,6 +20,8 @@ export const SETTINGS_BUTTON_IDS = {
     locale: 'settings_locale',
     stay: 'settings_stay',
     always: 'settings_always',
+    pauseOnEmpty: 'settings_pause_on_empty',
+    crossfade: 'settings_crossfade',
     preferred: 'settings_preferred',
     voice: 'settings_voice',
     roles: 'settings_roles',
@@ -58,6 +60,8 @@ export function buildSettingsMessage(settings: GuildSettings): {
         `🌐 Langue : ${settings.locale === 'fr' ? 'Français' : 'English'}`,
         `📌 Rester connecté (queue vide) : ${settings.stayConnected ? '✅ Oui' : '❌ Non'}`,
         `🔗 Toujours connecté : ${settings.stayConnectedAlways ? '✅ Oui' : '❌ Non'}`,
+        `⏸️ Pause auto canal vide (mode toujours connecté) : ${settings.pauseOnEmptyChannelWhenAlwaysConnected ? '✅ Oui' : '❌ Non'}`,
+        `🎚️ Fondu enchaîné : ${settings.crossfadeEnabled ? '✅ Oui (3s)' : '❌ Non'}`,
         `🎙️ Canal préféré : ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : 'Aucun'}`,
         `🚪 Channels vocaux : ${formatModeLabel(
             settings.voiceChannelMode,
@@ -110,7 +114,18 @@ export function buildSettingsMessage(settings: GuildSettings): {
             .setStyle(modeButtonStyle(settings.rolePermissionMode))
     );
 
-    return { embeds: [embed], components: [row1, row2] };
+    const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.pauseOnEmpty)
+            .setEmoji('⏸️')
+            .setStyle(settings.pauseOnEmptyChannelWhenAlwaysConnected ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.crossfade)
+            .setEmoji('🎚️')
+            .setStyle(settings.crossfadeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [row1, row2, row3] };
 }
 
 export function buildSettingsModal(

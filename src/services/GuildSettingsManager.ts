@@ -37,6 +37,8 @@ class GuildSettingsManager {
             volume: 100,
             stayConnected: false,
             stayConnectedAlways: false,
+            pauseOnEmptyChannelWhenAlwaysConnected: false,
+            crossfadeEnabled: false,
             preferredVoiceChannel: null,
             voiceChannelMode: 'allow_all',
             allowedVoiceChannels: [],

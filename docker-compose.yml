@@ -1,9 +1,0 @@
-services:
-  bot:
-    image: ${DOCKER_IMAGE}:latest
-    container_name: lolbot
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data

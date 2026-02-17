@@ -52,6 +52,9 @@ export interface GuildQueue {
     startedAt: number | null;
     pausedAt: number | null;
     totalPausedTime: number;
+    autoPausedByEmptyChannel: boolean;
+    crossfadeInProgress: boolean;
+    crossfadeTargetTrackId: string | null;
 }
 
 export interface CachedAudio {
@@ -94,6 +97,8 @@ export interface GuildSettings {
     volume: number;
     stayConnected: boolean;
     stayConnectedAlways: boolean;
+    pauseOnEmptyChannelWhenAlwaysConnected: boolean;
+    crossfadeEnabled: boolean;
     preferredVoiceChannel: string | null;
     voiceChannelMode: VoiceChannelMode;
     allowedVoiceChannels: string[];

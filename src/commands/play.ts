@@ -13,9 +13,25 @@ import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
+import { isKnownInteractionResponseError } from '../utils/discordApiErrors.js';
 import type { Track } from '../types/index.js';
 
 const log = logger.createModuleLogger('PlayCmd');
+const AUTOCOMPLETE_DEBOUNCE_MS = 1_500;
+const AUTOCOMPLETE_HINT_PREFIX = '__hint_';
+const AUTOCOMPLETE_HINT_START_TYPING = '__hint_start_typing__';
+const AUTOCOMPLETE_HINT_REFINE = '__hint_refine_query__';
+const AUTOCOMPLETE_HINT_NO_RESULTS = '__hint_no_results__';
+const MAX_AUTOCOMPLETE_OPTIONS = 25;
+
+type AutocompleteOption = { name: string; value: string };
+type AutocompleteState = {
+    lastApiCallAt: number;
+    lastQuery: string;
+    lastOptions: AutocompleteOption[];
+};
+
+const autocompleteState = new Map<string, AutocompleteState>();
 
 export const data = new SlashCommandBuilder()
     .setName('play')
@@ -72,6 +88,15 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
 
     const query = interaction.options.getString('query', true);
+    if (isAutocompleteHintValue(query)) {
+        await interaction.reply({
+            content: 'ℹ️ Cette option est une aide de saisie. Entrez un titre ou une URL YouTube puis validez.',
+            flags: MessageFlags.Ephemeral,
+        });
+        deleteEphemeralAfterDelay(interaction);
+        return;
+    }
+
     const textChannel = interaction.channel as TextChannel;
 
     const settings = await guildSettingsManager.getSettings(guildId);
@@ -97,7 +122,15 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
 
     log.info(`Query: ${query}`);
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    } catch (error) {
+        if (isKnownInteractionResponseError(error)) {
+            log.warn('Interaction /play déjà traitée ou expirée, abandon.');
+            return;
+        }
+        throw error;
+    }
 
     try {
         if (youtubeService.isYouTubeUrl(query)) {
@@ -191,15 +224,17 @@ async function handleYouTubeUrl(
             return;
         }
 
+        if (wasEmpty && addedCount > 0) {
+            log.debug('Queue etait vide, demarrage de la lecture');
+            const playNextStart = Date.now();
+            await queueManager.playNext(interaction.guildId!);
+            log.debug(`request_to_playNext_ms=${Date.now() - playNextStart} (playlist)`);
+        }
+
         await interaction.editReply({
             content: `**${playlist.title}**\n${addedCount} piste${addedCount > 1 ? 's' : ''} ajoutee${addedCount > 1 ? 's' : ''} a la file d'attente.`,
         });
         deleteEphemeralAfterDelay(interaction);
-
-        if (wasEmpty && addedCount > 0) {
-            log.debug('Queue etait vide, demarrage de la lecture');
-            await queueManager.playNext(interaction.guildId!);
-        }
         return;
     }
 
@@ -296,15 +331,17 @@ async function addTrackToQueue(
         return;
     }
 
+    if (wasEmpty) {
+        log.debug('Queue etait vide, demarrage de la lecture');
+        const playNextStart = Date.now();
+        await queueManager.playNext(interaction.guildId!);
+        log.debug(`request_to_playNext_ms=${Date.now() - playNextStart}`);
+    }
+
     await interaction.editReply({
         content: `**${track.title}** ajoutee a la file d'attente.`,
     });
     deleteEphemeralAfterDelay(interaction);
-
-    if (wasEmpty) {
-        log.debug('Queue etait vide, demarrage de la lecture');
-        await queueManager.playNext(interaction.guildId!);
-    }
 }
 
 function truncateString(str: string, maxLength: number): string {
@@ -323,31 +360,200 @@ async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteractio
 }
 
 export async function autocomplete(interaction: any): Promise<void> {
-    const focusedValue = interaction.options.getFocused();
+    const focusedValue = interaction.options.getFocused() as string;
+    const query = focusedValue.trim();
 
-    if (!focusedValue || focusedValue.length < 2) {
-        await interaction.respond([]);
-        return;
-    }
-
-    if (youtubeService.isYouTubeUrl(focusedValue)) {
-        await interaction.respond([
-            { name: 'Utiliser cette URL', value: focusedValue },
+    if (!query) {
+        await safeAutocompleteRespond(interaction, [
+            {
+                name: '✍️ Commence a ecrire un titre ou colle une URL YouTube',
+                value: AUTOCOMPLETE_HINT_START_TYPING,
+            },
         ]);
         return;
     }
 
+    if (query.length < 2 && !youtubeService.isYouTubeUrl(query)) {
+        await safeAutocompleteRespond(interaction, [
+            {
+                name: '⌨️ Continue a ecrire pour lancer la recherche',
+                value: AUTOCOMPLETE_HINT_REFINE,
+            },
+        ]);
+        return;
+    }
+
+    // URL YouTube: l'option par défaut conserve l'URL saisie.
+    if (youtubeService.isYouTubeUrl(query)) {
+        const urlOptions = await buildYouTubeUrlAutocompleteOptions(query);
+        await safeAutocompleteRespond(interaction, urlOptions);
+        return;
+    }
+
+    const key = getAutocompleteKey(interaction);
+    const state = autocompleteState.get(key);
+    const now = Date.now();
+
+    if (state && state.lastQuery === query) {
+        await safeAutocompleteRespond(interaction, state.lastOptions);
+        return;
+    }
+
+    if (state && now - state.lastApiCallAt < AUTOCOMPLETE_DEBOUNCE_MS) {
+        const throttledOptions = withHintOption(
+            state.lastOptions,
+            '⏳ Pause 1.5s apres la derniere frappe pour affiner',
+            AUTOCOMPLETE_HINT_REFINE
+        );
+        await safeAutocompleteRespond(interaction, throttledOptions);
+        return;
+    }
+
     try {
-        const results = await youtubeService.search(focusedValue, config.audio.searchResults);
+        const results = await youtubeService.search(query, config.audio.searchResults);
 
         const options = results.map(r => ({
             name: truncateString(`${r.title} ${r.duration}`, 100),
             value: `https://www.youtube.com/watch?v=${r.id}`,
         }));
 
-        await interaction.respond(options);
+        const safeOptions = options.length > 0
+            ? options
+            : [{
+                name: '🔎 Aucun resultat, continue a ecrire pour preciser',
+                value: AUTOCOMPLETE_HINT_NO_RESULTS,
+            }];
+
+        autocompleteState.set(key, {
+            lastApiCallAt: Date.now(),
+            lastQuery: query,
+            lastOptions: safeOptions,
+        });
+
+        await safeAutocompleteRespond(interaction, safeOptions);
     } catch (error) {
+        if (isKnownInteractionResponseError(error)) {
+            log.warn('Autocomplete déjà traitée ou expirée, abandon.');
+            return;
+        }
         log.error('Erreur autocomplete:', error);
-        await interaction.respond([]);
+        await safeAutocompleteRespond(interaction, [
+            {
+                name: '⚠️ Recherche indisponible, reessaie dans un instant',
+                value: AUTOCOMPLETE_HINT_REFINE,
+            },
+        ]);
+    }
+}
+
+async function buildYouTubeUrlAutocompleteOptions(query: string): Promise<AutocompleteOption[]> {
+    const optionValue = toAutocompleteValue(query);
+    const options: AutocompleteOption[] = [
+        {
+            name: truncateString('🔗 Garder cette URL (ne remplace pas la saisie)', 100),
+            value: optionValue,
+        },
+    ];
+
+    const videoId = youtubeService.extractVideoId(query);
+    if (videoId) {
+        try {
+            const info = await youtubeService.getVideoInfo(videoId);
+            if (info) {
+                options.push({
+                    name: truncateString(`🎵 Titre detecte: ${info.title} • ${formatDuration(info.duration)}`, 100),
+                    value: AUTOCOMPLETE_HINT_REFINE,
+                });
+                return options;
+            }
+        } catch (error) {
+            log.trace('Impossible de resoudre le titre de l\'URL en autocomplete', error);
+        }
+    }
+
+    return options;
+}
+
+function withHintOption(
+    options: AutocompleteOption[],
+    hintName: string,
+    hintValue: string
+): AutocompleteOption[] {
+    const unique = options.filter(option => option.value !== hintValue);
+    if (unique.length >= MAX_AUTOCOMPLETE_OPTIONS) {
+        return unique.slice(0, MAX_AUTOCOMPLETE_OPTIONS);
+    }
+
+    return [
+        ...unique,
+        {
+            name: truncateString(hintName, 100),
+            value: hintValue,
+        },
+    ];
+}
+
+function isAutocompleteHintValue(value: string): boolean {
+    return value.startsWith(AUTOCOMPLETE_HINT_PREFIX);
+}
+
+function formatDuration(totalSeconds: number): string {
+    const safe = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(safe / 3600);
+    const minutes = Math.floor((safe % 3600) / 60);
+    const seconds = safe % 60;
+
+    if (hours > 0) {
+        return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+function toAutocompleteValue(query: string): string {
+    if (query.length <= 100) {
+        return query;
+    }
+
+    const videoId = youtubeService.extractVideoId(query);
+    if (videoId) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+    }
+
+    const playlistId = youtubeService.extractPlaylistId(query);
+    if (playlistId) {
+        return `https://www.youtube.com/playlist?list=${playlistId}`;
+    }
+
+    return query.slice(0, 100);
+}
+
+function getAutocompleteKey(interaction: {
+    guildId?: string | null;
+    channelId?: string | null;
+    user: { id: string };
+}): string {
+    const guildId = interaction.guildId ?? 'dm';
+    const channelId = interaction.channelId ?? 'unknown-channel';
+    return `${guildId}:${channelId}:${interaction.user.id}`;
+}
+
+async function safeAutocompleteRespond(
+    interaction: { respond: (options: Array<{ name: string; value: string }>) => Promise<void> },
+    options: Array<{ name: string; value: string }>
+): Promise<void> {
+    try {
+        const fallback = options.length > 0
+            ? options
+            : [{
+                name: '✍️ Commence a ecrire un titre ou colle une URL YouTube',
+                value: AUTOCOMPLETE_HINT_START_TYPING,
+            }];
+        await interaction.respond(fallback.slice(0, MAX_AUTOCOMPLETE_OPTIONS));
+    } catch (error) {
+        if (isKnownInteractionResponseError(error)) {
+            return;
+        }
+        throw error;
     }
 }
