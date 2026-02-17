@@ -4,36 +4,35 @@ import { commands } from './commands/index.js';
 
 const rest = new REST({ version: '10' }).setToken(config.discord.token);
 
-async function registerCommands() {
+async function registerCommands(): Promise<void> {
     try {
-        console.log('🔄 Début de l\'enregistrement des commandes slash...');
+        console.log('[INFO] Starting slash command registration...');
 
-        const commandsData = commands.map(cmd => cmd.data.toJSON());
+        const commandsData = commands.map((cmd) => cmd.data.toJSON());
 
-        // Enregistrer globalement
-        console.log('📡 Enregistrement global des commandes...');
-        await rest.put(
-            Routes.applicationCommands(config.discord.clientId),
-            { body: commandsData }
-        );
-        console.log('✅ Commandes globales enregistrées.');
+        console.log('[INFO] Registering global commands...');
+        await rest.put(Routes.applicationCommands(config.discord.clientId), {
+            body: commandsData,
+        });
+        console.log('[OK] Global commands registered.');
 
-        // Enregistrer dans le serveur de test (mise à jour instantanée)
-        console.log(`📡 Enregistrement dans le serveur de test (${config.discord.guildId})...`);
-        await rest.put(
-            Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
-            { body: commandsData }
-        );
-        console.log('✅ Commandes du serveur de test enregistrées.');
+        if (config.discord.guildId) {
+            console.log(`[INFO] Registering guild commands (${config.discord.guildId})...`);
+            await rest.put(Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId), {
+                body: commandsData,
+            });
+            console.log('[OK] Guild commands registered.');
+        } else {
+            console.log('[INFO] DISCORD_GUILD_ID is not set. Skipping guild command registration.');
+        }
 
-        console.log(`✅ ${commandsData.length} commande(s) enregistrée(s) avec succès!`);
-        console.log('📋 Commandes disponibles:');
-        commandsData.forEach(cmd => {
+        console.log(`[OK] ${commandsData.length} command(s) registered.`);
+        console.log('[INFO] Available commands:');
+        commandsData.forEach((cmd) => {
             console.log(`   /${cmd.name} - ${cmd.description}`);
         });
-
     } catch (error) {
-        console.error('❌ Erreur lors de l\'enregistrement des commandes:', error);
+        console.error('[ERROR] Failed to register commands:', error);
         process.exit(1);
     }
 }

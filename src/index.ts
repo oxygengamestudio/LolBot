@@ -186,6 +186,8 @@ const idleStatuses = [
 ];
 
 let currentStatusIndex = 0;
+let idleStatusInterval: NodeJS.Timeout | null = null;
+let isShuttingDown = false;
 
 // Collection des commandes
 const commandsMap = new Collection<string, CommandDefinition>();
@@ -235,7 +237,11 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateIdleStatus();
 
     // Changer le status toutes les 30 secondes quand inactif
-    setInterval(() => {
+    if (idleStatusInterval) {
+        clearInterval(idleStatusInterval);
+    }
+
+    idleStatusInterval = setInterval(() => {
         const activeQueues = queueManager.getAllQueues();
         if (activeQueues.size === 0) {
             updateIdleStatus();
@@ -882,12 +888,16 @@ async function registerCommands(): Promise<void> {
             { body: commandsData }
         );
 
-        // Enregistrer sur le serveur de test pour mise à jour instantanée
-        log.debug(`Enregistrement guild (${config.discord.guildId})...`);
-        await rest.put(
-            Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
-            { body: commandsData }
-        );
+        if (config.discord.guildId) {
+            // Enregistrement sur le serveur de test pour mise à jour instantanée
+            log.debug(`Enregistrement guild (${config.discord.guildId})...`);
+            await rest.put(
+                Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
+                { body: commandsData }
+            );
+        } else {
+            log.info('DISCORD_GUILD_ID non défini, enregistrement guild ignoré.');
+        }
 
         log.info(`${commandsData.length} commande(s) actualisée(s)`);
     } catch (error) {
@@ -905,17 +915,46 @@ process.on('uncaughtException', (error) => {
 });
 
 // Gestion de l'arrêt propre
-process.on('SIGINT', () => {
-    log.info('Signal SIGINT reçu, arrêt du bot...');
+async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
+    if (isShuttingDown) {
+        log.warn(`Signal ${signal} reçu pendant l'arrêt, arrêt déjà en cours.`);
+        return;
+    }
 
-    // Déconnecter toutes les queues
-    const queues = queueManager.getAllQueues();
-    for (const [guildId] of queues) {
+    isShuttingDown = true;
+    log.info(`Signal ${signal} reçu, arrêt du bot...`);
+
+    if (idleStatusInterval) {
+        clearInterval(idleStatusInterval);
+        idleStatusInterval = null;
+    }
+
+    for (const state of settingsPromptStates.values()) {
+        clearTimeout(state.timeout);
+    }
+    settingsPromptStates.clear();
+    settingsPromptByUser.clear();
+
+    const guildIds = Array.from(queueManager.getAllQueues().keys());
+    for (const guildId of guildIds) {
         queueManager.deleteQueue(guildId);
     }
 
-    client.destroy();
+    try {
+        client.destroy();
+    } catch (error) {
+        log.error('Erreur lors de la fermeture du client Discord:', error);
+    }
+
     process.exit(0);
+}
+
+process.on('SIGINT', () => {
+    void gracefulShutdown('SIGINT');
+});
+
+process.on('SIGTERM', () => {
+    void gracefulShutdown('SIGTERM');
 });
 
 // Afficher les dépendances requises
