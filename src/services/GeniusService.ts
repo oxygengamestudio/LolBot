@@ -1,0 +1,660 @@
+import https from 'https';
+import http from 'http';
+import zlib from 'zlib';
+import { URLSearchParams } from 'url';
+import { config } from '../config.js';
+import { logger } from '../utils/Logger.js';
+
+const log = logger.createModuleLogger('GeniusService');
+
+interface GeniusSong {
+    id: number;
+    title: string;
+    fullTitle: string;
+    url: string;
+    artist: string;
+    lyricsState?: string;
+}
+
+export interface LyricsResult {
+    title: string;
+    fullTitle: string;
+    artist: string;
+    url: string;
+    lyrics: string;
+}
+
+class GeniusService {
+    private accessToken: string | null = null;
+    private tokenExpiresAt = 0;
+    private tokenPromise: Promise<string | null> | null = null;
+    private readonly requestTimeoutMs = 15_000;
+    private readonly maxRedirects = 5;
+
+    async getLyrics(query: string): Promise<LyricsResult | null> {
+        if (!query || query.trim().length === 0) {
+            log.warn('Empty query provided to getLyrics');
+            return null;
+        }
+
+        const queries = this.buildQueries(query);
+        if (queries.length === 0) {
+            log.warn('No valid queries after normalization');
+            return null;
+        }
+
+        for (const q of queries) {
+            const song = await this.searchSong(q);
+            if (!song) {
+                continue;
+            }
+
+            const html = await this.fetchText(song.url);
+            const lyrics = this.extractLyrics(html);
+            if (!lyrics) {
+                continue;
+            }
+
+            return {
+                title: song.title,
+                fullTitle: song.fullTitle,
+                artist: song.artist,
+                url: song.url,
+                lyrics,
+            };
+        }
+
+        return null;
+    }
+
+    private async searchSong(query: string): Promise<GeniusSong | null> {
+        if (!query || query.trim().length === 0) {
+            log.debug('searchSong: empty query, skipping');
+            return null;
+        }
+
+        const token = await this.getAccessToken();
+        if (token) {
+            try {
+                const params = new URLSearchParams({ q: query });
+                const url = `https://api.genius.com/search?${params.toString()}`;
+                const data = await this.fetchJson(url, token);
+
+                const hits = data?.response?.hits ?? [];
+                const results = Array.isArray(hits)
+                    ? hits.filter((item: any) => item.type === 'song').map((item: any) => item.result)
+                    : [];
+                const best = this.pickBestResult(query, results);
+                if (best) {
+                    return best;
+                }
+            } catch (error) {
+                log.warn('Genius API search failed, trying public search.', error);
+            }
+        } else {
+            log.warn('Genius token unavailable, trying public search.');
+        }
+
+        return this.searchSongPublic(query);
+    }
+
+    private async searchSongPublic(query: string): Promise<GeniusSong | null> {
+        if (!query || query.trim().length === 0) {
+            log.debug('searchSongPublic: empty query, skipping');
+            return null;
+        }
+
+        const params = new URLSearchParams({ q: query });
+        const url = `https://genius.com/api/search/multi?${params.toString()}`;
+        const data = await this.fetchJsonPublic(url);
+
+        const sections = data?.response?.sections ?? [];
+        const results: any[] = [];
+
+        for (const section of sections) {
+            if (!section || !Array.isArray(section.hits)) {
+                continue;
+            }
+            if (section.type === 'song' || section.type === 'top_hit') {
+                for (const hit of section.hits) {
+                    if (hit?.result) {
+                        results.push(hit.result);
+                    }
+                }
+            }
+        }
+
+        if (results.length === 0) {
+            const lyricSection = sections.find((section: any) => section.type === 'lyric');
+            const lyricHits = lyricSection?.hits ?? [];
+            if (Array.isArray(lyricHits)) {
+                results.push(...lyricHits.map((hit: any) => hit?.result).filter(Boolean));
+            }
+        }
+
+        return this.pickBestResult(query, results);
+    }
+
+    private pickBestResult(query: string, results: any[]): GeniusSong | null {
+        const candidates = results
+            .map((result) => this.coerceSong(result))
+            .filter((candidate): candidate is GeniusSong => Boolean(candidate));
+
+        if (candidates.length === 0) {
+            return null;
+        }
+
+        const normalizedQuery = this.normalizeSearchText(query);
+        const tokens = this.tokenizeQuery(normalizedQuery);
+
+        const nonTranslated = candidates.filter((candidate) => !this.isTranslationCandidate(candidate));
+        const pool = nonTranslated.length > 0 ? nonTranslated : candidates;
+
+        let best: GeniusSong | null = null;
+        let bestScore = -Infinity;
+
+        for (const candidate of pool) {
+            const score = this.scoreCandidate(candidate, normalizedQuery, tokens);
+            log.trace(`Score ${score} pour: ${candidate.fullTitle}`);
+            if (score > bestScore) {
+                bestScore = score;
+                best = candidate;
+            }
+        }
+
+        if (bestScore < 4) {
+            log.debug(`Meilleur score trop bas (${bestScore}), aucun resultat retenu`);
+            return null;
+        }
+
+        return best;
+    }
+
+    private coerceSong(result: any): GeniusSong | null {
+        if (!result || !result.id || !result.url || !result.title) {
+            return null;
+        }
+
+        const title = this.decodeHtmlEntities(String(result.title));
+        const fullTitle = this.decodeHtmlEntities(String(result.full_title ?? result.title));
+        const artist = this.decodeHtmlEntities(String(result.primary_artist?.name ?? 'Unknown'));
+
+        return {
+            id: result.id,
+            title,
+            fullTitle,
+            url: result.url,
+            artist,
+            lyricsState: result.lyrics_state,
+        };
+    }
+
+    private buildQueries(query: string): string[] {
+        const cleaned = this.normalizeQuery(query);
+        const stripped = this.stripBrackets(query);
+        const strippedClean = this.normalizeQuery(stripped);
+
+        const unique = new Set<string>();
+        const add = (value: string) => {
+            const trimmed = value.trim();
+            if (trimmed.length > 0) {
+                unique.add(trimmed);
+            }
+        };
+
+        const addNormalized = (value: string) => {
+            add(value);
+            add(this.stripBrackets(value));
+            add(this.normalizeQuery(value));
+            add(this.normalizeQuery(this.stripBrackets(value)));
+        };
+
+        [query, stripped, cleaned, strippedClean].forEach(add);
+
+        const splitVariants = this.buildSplitVariants(query);
+        for (const variant of splitVariants) {
+            addNormalized(variant);
+        }
+
+        return Array.from(unique);
+    }
+
+    private buildSplitVariants(text: string): string[] {
+        const variants = new Set<string>();
+        const addPair = (left: string, right: string) => {
+            const a = left.trim();
+            const b = right.trim();
+            if (!a || !b) return;
+            variants.add(`${a} ${b}`);
+            variants.add(`${b} ${a}`);
+            variants.add(a);
+            variants.add(b);
+        };
+
+        const splitBy = (value: string) => {
+            const parts = value.split(/\s[-–—|•:]\s/);
+            if (parts.length >= 2) {
+                const left = parts[0];
+                const right = parts.slice(1).join(' ');
+                addPair(left, right);
+            }
+        };
+
+        splitBy(text);
+
+        const byParts = text.split(/\s+by\s+/i);
+        if (byParts.length === 2) {
+            addPair(byParts[0], byParts[1]);
+        }
+
+        return Array.from(variants);
+    }
+
+    private stripBrackets(text: string): string {
+        return text.replace(/\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    private normalizeQuery(text: string): string {
+        const lowered = text.toLowerCase();
+        const withoutTags = lowered
+            .replace(/\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*/g, ' ')
+            .replace(/\b(official|officiel|officielle|lyrics|lyric|audio|video|mv|m\/v|clip|visualizer|live|remix|remastered|hd|hq|4k|8k|ost|theme|soundtrack|feat|ft|featuring|version|edit|prod|produced)\b/g, ' ')
+            .replace(/[&]/g, ' ')
+            .replace(/[-|]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        return withoutTags;
+    }
+
+    private normalizeSearchText(text: string): string {
+        return text
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    private tokenizeQuery(normalizedQuery: string): string[] {
+        if (!normalizedQuery) return [];
+        return normalizedQuery.split(' ').filter((token) => token.length > 0);
+    }
+
+    private scoreCandidate(candidate: GeniusSong, normalizedQuery: string, tokens: string[]): number {
+        const haystack = this.normalizeSearchText(`${candidate.title} ${candidate.fullTitle} ${candidate.artist}`);
+        let score = 0;
+
+        if (normalizedQuery && haystack.includes(normalizedQuery)) {
+            score += 20;
+        }
+
+        let matchedTokens = 0;
+        for (const token of tokens) {
+            if (token.length >= 2 && haystack.includes(token)) {
+                score += 4;
+                matchedTokens++;
+            }
+        }
+
+        const significantTokens = tokens.filter((t) => t.length >= 2);
+        if (significantTokens.length > 0 && matchedTokens === 0) {
+            return -100;
+        }
+
+        if (candidate.lyricsState === 'complete') {
+            score += 6;
+        } else if (candidate.lyricsState === 'partial') {
+            score += 2;
+        } else if (candidate.lyricsState === 'unreleased') {
+            score -= 6;
+        }
+
+        if (this.isTranslationCandidate(candidate)) {
+            score -= 50;
+        }
+
+        return score;
+    }
+
+    private isTranslationCandidate(candidate: GeniusSong): boolean {
+        return (
+            this.hasTranslationMarker(candidate.title) ||
+            this.hasTranslationMarker(candidate.fullTitle) ||
+            this.hasTranslationMarker(candidate.artist)
+        );
+    }
+
+    private hasTranslationMarker(text: string): boolean {
+        const normalized = this.normalizeSearchText(text);
+        const markers = [
+            'translation',
+            'translations',
+            'translated',
+            'traduction',
+            'traductions',
+            'traduccion',
+            'traducciones',
+            'traduzione',
+            'traduzioni',
+            'traducao',
+            'ubersetzung',
+            'ubersetzungen',
+        ];
+
+        return markers.some((marker) => normalized.includes(marker));
+    }
+
+    private async getAccessToken(): Promise<string | null> {
+        if (config.genius.accessToken) {
+            return config.genius.accessToken;
+        }
+
+        if (this.accessToken && Date.now() < this.tokenExpiresAt) {
+            return this.accessToken;
+        }
+
+        if (this.tokenPromise) {
+            return this.tokenPromise;
+        }
+
+        if (!config.genius.clientId || !config.genius.clientSecret) {
+            return null;
+        }
+
+        this.tokenPromise = this.requestToken(config.genius.clientId, config.genius.clientSecret)
+            .finally(() => {
+                this.tokenPromise = null;
+            });
+
+        return this.tokenPromise;
+    }
+
+    private async requestToken(clientId: string, clientSecret: string): Promise<string | null> {
+        const body = new URLSearchParams({
+            grant_type: 'client_credentials',
+            client_id: clientId,
+            client_secret: clientSecret,
+        }).toString();
+
+        try {
+            const response = await this.requestRaw('https://api.genius.com/oauth/token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Content-Length': Buffer.byteLength(body).toString(),
+                },
+                body,
+            });
+
+            if (response.statusCode >= 400) {
+                log.debug(`Genius token request failed with HTTP ${response.statusCode}`);
+                return null;
+            }
+
+            const json = JSON.parse(response.body);
+            const token = json.access_token as string | undefined;
+            const expiresIn = Number(json.expires_in ?? 0);
+            if (!token) {
+                return null;
+            }
+
+            this.accessToken = token;
+            this.tokenExpiresAt = Date.now() + Math.max(expiresIn - 60, 0) * 1000;
+            return token;
+        } catch (error) {
+            log.error('Genius token request failed', error);
+            return null;
+        }
+    }
+
+    private async fetchJson(url: string, token: string): Promise<any> {
+        const response = await this.requestRaw(url, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'User-Agent': 'LolBot/1.0',
+                'Accept-Encoding': 'gzip, deflate, br',
+            },
+        });
+
+        if (response.statusCode >= 400) {
+            log.debug(`Genius API (auth) returned ${response.statusCode} for: ${url}`);
+            return { response: { hits: [] } };
+        }
+
+        try {
+            return JSON.parse(response.body);
+        } catch {
+            throw new Error('Invalid JSON response');
+        }
+    }
+
+    private async fetchJsonPublic(url: string): Promise<any> {
+        const response = await this.requestRaw(url, {
+            method: 'GET',
+            headers: {
+                'User-Agent': 'LolBot/1.0',
+                'Accept-Encoding': 'gzip, deflate, br',
+            },
+        });
+
+        if (response.statusCode >= 400) {
+            log.debug(`Genius API returned ${response.statusCode} for query: ${url}`);
+            return { response: { sections: [] } };
+        }
+
+        try {
+            return JSON.parse(response.body);
+        } catch {
+            throw new Error('Invalid JSON response');
+        }
+    }
+
+    private async fetchText(url: string): Promise<string> {
+        const response = await this.requestRaw(url, {
+            method: 'GET',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+            },
+        });
+
+        if (response.statusCode >= 400) {
+            throw new Error(`Genius page error: ${response.statusCode}`);
+        }
+
+        return response.body;
+    }
+
+    private requestRaw(
+        url: string,
+        options: {
+            method: 'GET' | 'POST';
+            headers?: Record<string, string>;
+            body?: string;
+        },
+        redirectCount: number = 0
+    ): Promise<{ statusCode: number; body: string }> {
+        return new Promise((resolve, reject) => {
+            if (redirectCount > this.maxRedirects) {
+                reject(new Error(`Too many redirects for ${url}`));
+                return;
+            }
+
+            const urlObj = new URL(url);
+            const protocol = urlObj.protocol === 'https:' ? https : http;
+            const req = protocol.request(
+                {
+                    method: options.method,
+                    hostname: urlObj.hostname,
+                    port: urlObj.port ? Number(urlObj.port) : undefined,
+                    path: urlObj.pathname + urlObj.search,
+                    headers: options.headers,
+                },
+                (res) => {
+                    const statusCode = res.statusCode ?? 0;
+
+                    if (statusCode >= 300 && statusCode < 400 && res.headers.location) {
+                        const redirectUrl = new URL(res.headers.location, urlObj).toString();
+                        res.resume();
+
+                        const shouldSwitchToGet =
+                            statusCode === 303 || ((statusCode === 301 || statusCode === 302) && options.method === 'POST');
+                        const nextMethod = shouldSwitchToGet ? 'GET' : options.method;
+                        const nextHeaders = { ...(options.headers ?? {}) };
+                        const nextBody = shouldSwitchToGet ? undefined : options.body;
+
+                        if (shouldSwitchToGet) {
+                            delete nextHeaders['Content-Length'];
+                            delete nextHeaders['Content-Type'];
+                        }
+
+                        this.requestRaw(
+                            redirectUrl,
+                            { method: nextMethod, headers: nextHeaders, body: nextBody },
+                            redirectCount + 1
+                        )
+                            .then(resolve)
+                            .catch(reject);
+                        return;
+                    }
+
+                    const stream = this.getDecodedStream(res);
+                    let data = '';
+
+                    stream.on('data', (chunk) => {
+                        data += chunk.toString();
+                    });
+                    stream.on('end', () => {
+                        resolve({ statusCode, body: data });
+                    });
+                    stream.on('error', (error) => {
+                        reject(error);
+                    });
+                }
+            );
+
+            req.setTimeout(this.requestTimeoutMs, () => {
+                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${url}`));
+            });
+            req.on('error', reject);
+
+            if (options.body) {
+                req.write(options.body);
+            }
+
+            req.end();
+        });
+    }
+
+    private getDecodedStream(res: http.IncomingMessage): NodeJS.ReadableStream {
+        const encoding = (res.headers['content-encoding'] || '').toString().toLowerCase();
+        if (encoding.includes('br')) {
+            return res.pipe(zlib.createBrotliDecompress());
+        }
+        if (encoding.includes('gzip')) {
+            return res.pipe(zlib.createGunzip());
+        }
+        if (encoding.includes('deflate')) {
+            return res.pipe(zlib.createInflate());
+        }
+        return res;
+    }
+
+    private extractLyrics(html: string): string | null {
+        const containers: string[] = [];
+        const containerRegex = /<div[^>]+data-lyrics-container="true"[^>]*>([\s\S]*?)<\/div>/g;
+        let match = containerRegex.exec(html);
+        while (match) {
+            containers.push(match[1]);
+            match = containerRegex.exec(html);
+        }
+
+        let raw = '';
+        if (containers.length > 0) {
+            raw = containers.join('\n');
+        } else {
+            const classRegex = /<div[^>]+class="[^"]*Lyrics__Container[^"]*"[^>]*>([\s\S]*?)<\/div>/g;
+            const classContainers: string[] = [];
+            let classMatch = classRegex.exec(html);
+            while (classMatch) {
+                classContainers.push(classMatch[1]);
+                classMatch = classRegex.exec(html);
+            }
+            if (classContainers.length > 0) {
+                raw = classContainers.join('\n');
+            } else {
+                const legacyMatch = html.match(/<div class="lyrics">([\s\S]*?)<\/div>/);
+                if (legacyMatch) {
+                    raw = legacyMatch[1];
+                }
+            }
+        }
+
+        if (!raw) {
+            return null;
+        }
+
+        const withBreaks = raw.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n');
+        const stripped = withBreaks.replace(/<[^>]+>/g, '');
+        const decoded = this.decodeHtmlEntities(stripped);
+        const cleaned = decoded.replace(/\r/g, '').replace(/\n{3,}/g, '\n\n').trim();
+        const sanitized = this.cleanupLyrics(cleaned);
+        return sanitized || null;
+    }
+
+    private cleanupLyrics(text: string): string {
+        const lines = text.split(/\r?\n/);
+        const filtered = lines.filter((line) => {
+            const trimmed = line.trim();
+            if (!trimmed) return true;
+
+            if (/contributors?/i.test(trimmed)) return false;
+            if (/you might also like/i.test(trimmed)) return false;
+            if (/^embed$/i.test(trimmed)) return false;
+            if (/^translations?/i.test(trimmed)) return false;
+            if (/^genius/i.test(trimmed) && /lyrics/i.test(trimmed)) return false;
+            if (/lyrics$/i.test(trimmed) && /genius/i.test(trimmed)) return false;
+            if (/open on genius/i.test(trimmed)) return false;
+            if (/ouvrir sur genius/i.test(trimmed)) return false;
+
+            return true;
+        });
+
+        return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    private decodeHtmlEntities(text: string): string {
+        const entities: Record<string, string> = {
+            '&amp;': '&',
+            '&lt;': '<',
+            '&gt;': '>',
+            '&quot;': '"',
+            '&#39;': "'",
+            '&apos;': "'",
+            '&#x27;': "'",
+            '&#x2F;': '/',
+            '&#x60;': '`',
+            '&#x3D;': '=',
+            '&nbsp;': ' ',
+        };
+
+        const namedDecoded = text.replace(/&[#\w]+;/g, (entity) => entities[entity] || entity);
+        return namedDecoded
+            .replace(/&#x([0-9a-fA-F]+);/g, (_match, hex) => {
+                const code = Number.parseInt(hex, 16);
+                if (Number.isNaN(code)) return _match;
+                return String.fromCodePoint(code);
+            })
+            .replace(/&#([0-9]+);/g, (_match, dec) => {
+                const code = Number.parseInt(dec, 10);
+                if (Number.isNaN(code)) return _match;
+                return String.fromCodePoint(code);
+            });
+    }
+}
+
+export const geniusService = new GeniusService();
