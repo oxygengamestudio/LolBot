@@ -1,70 +1,52 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { sendLyrics } from '../utils/lyrics.js';
-import { config } from '../config.js';
-import { t } from '../utils/i18n.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('LyricsCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('lyrics')
-    .setDescription('Affiche les paroles')
+    .setDescription('Show lyrics')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Affiche les paroles', 'Show lyrics'))
     .setDMPermission(false)
-    .addStringOption(option =>
+    .addStringOption((option) =>
         option
             .setName('query')
-            .setDescription('Titre ou artiste')
+            .setDescription('Title or artist')
+            .setDescriptionLocalizations(commandDescriptionLocalizations('Titre ou artiste', 'Title or artist'))
             .setRequired(false)
     );
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     log.debug(`Commande lyrics par ${interaction.user.tag}`);
 
-    const locale = interaction.locale;
+    const locale = await getInteractionLocale(interaction);
     const query = interaction.options.getString('query');
     const guildId = interaction.guildId;
     const queue = guildId ? queueManager.getQueue(guildId) : undefined;
 
-    if (query && query.trim().length > 0) {
+    if (query?.trim()) {
         await sendLyrics(interaction, query.trim(), queue);
         return;
     }
 
     if (!guildId) {
-        await interaction.reply({
-            content: t(locale, 'error.generic'),
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, t(locale, 'error.generic'));
         return;
     }
 
     if (!queue?.currentTrack) {
-        await interaction.reply({
-            content: t(locale, 'lyrics.noTrack'),
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, t(locale, 'lyrics.noTrack'));
         return;
     }
 
     await sendLyrics(interaction, queue.currentTrack.title, queue);
-}
-
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch {
-            // Ignore
-        }
-    }, config.audio.ephemeralInfoDeleteDelay);
 }

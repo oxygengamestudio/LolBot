@@ -1,42 +1,45 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags, TextChannel } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags, TextChannel } from 'discord.js';
 import type { Collection, Message } from 'discord.js';
-import { canManageSettings } from '../utils/permissions.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
 import { queueManager } from '../services/QueueManager.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanManageSettings, getInteractionLocale, replyEphemeral, scheduleDeleteReply } from '../utils/commandHelpers.js';
 
 const log = logger.createModuleLogger('ClearCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('clear')
-    .setDescription('Supprime les messages du bot dans ce canal (Administrateurs uniquement)')
+    .setDescription('Delete bot messages in this channel')
+    .setDescriptionLocalizations(
+        commandDescriptionLocalizations(
+            'Supprime les messages du bot dans ce canal',
+            'Delete bot messages in this channel'
+        )
+    )
     .addStringOption((option) =>
         option
             .setName('count')
-            .setDescription("Nombre de messages à supprimer ('all' ou un nombre)")
+            .setDescription('How many messages to delete (`all` or a positive number)')
+            .setDescriptionLocalizations(
+                commandDescriptionLocalizations(
+                    'Nombre de messages a supprimer (`all` ou un nombre positif)',
+                    'How many messages to delete (`all` or a positive number)'
+                )
+            )
             .setRequired(false)
     )
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
+    const locale = await getInteractionLocale(interaction);
     const member = interaction.member as GuildMember;
-
-    if (!(await canManageSettings(member))) {
-        await interaction.reply({
-            content: '❌ Vous devez être administrateur pour utiliser cette commande.',
-            flags: MessageFlags.Ephemeral,
-        });
-        setTimeout(async () => {
-            try { await interaction.deleteReply(); } catch {}
-        }, config.audio.ephemeralInfoDeleteDelay);
+    if (!(await ensureCanManageSettings(interaction, member))) {
         return;
     }
 
@@ -46,13 +49,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     if (rawCount && rawCount.toLowerCase() !== 'all') {
         const parsed = Number.parseInt(rawCount, 10);
         if (!Number.isFinite(parsed) || parsed <= 0) {
-            await interaction.reply({
-                content: '❌ Valeur invalide. Utilisez `all` ou un nombre positif.',
-                flags: MessageFlags.Ephemeral,
-            });
-            setTimeout(async () => {
-                try { await interaction.deleteReply(); } catch {}
-            }, config.audio.ephemeralInfoDeleteDelay);
+            await replyEphemeral(interaction, `❌ ${t(locale, 'clear.invalidCount')}`);
             return;
         }
         maxToDelete = parsed;
@@ -63,7 +60,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     try {
         const channel = interaction.channel as TextChannel;
         let deletedCount = 0;
-        let lastMessageId: string | undefined = undefined;
+        let lastMessageId: string | undefined;
         let protectedMessageId: string | undefined;
 
         const queue = queueManager.getQueue(interaction.guildId!);
@@ -91,10 +88,10 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
                 if (deletedCount >= maxToDelete) break;
                 try {
                     await msg.delete();
-                    deletedCount++;
-                    await new Promise(resolve => setTimeout(resolve, 100));
+                    deletedCount += 1;
+                    await new Promise((resolve) => setTimeout(resolve, 100));
                 } catch {
-                    log.trace('Message non supprimable (trop ancien ou déjà supprimé)');
+                    log.trace('Message non supprimable (trop ancien ou deja supprime)');
                 }
             }
 
@@ -103,21 +100,19 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
             if (messages.size < 100) break;
         }
 
-        log.info(`${deletedCount} message(s) supprimé(s)`);
+        log.info(`${deletedCount} message(s) supprime(s)`);
 
         await interaction.editReply({
-            content: `🧹 **${deletedCount}** message(s) du bot supprimé(s) dans ce canal.`,
+            content: `🧹 ${t(locale, 'clear.deleted', { count: deletedCount })}`,
+            allowedMentions: { parse: [] },
         });
 
-        setTimeout(async () => {
-            try { await interaction.deleteReply(); } catch {}
-        }, config.audio.ephemeralInfoDeleteDelay);
+        scheduleDeleteReply(interaction, config.audio.ephemeralInfoDeleteDelay);
     } catch (error) {
         log.error('Erreur lors du nettoyage:', error);
         await interaction.editReply({
-            content: '❌ Erreur lors de la suppression des messages.',
+            content: `❌ ${t(locale, 'clear.failed')}`,
+            allowedMentions: { parse: [] },
         });
     }
 }
-
-

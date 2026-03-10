@@ -1,44 +1,41 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { audioWrapper } from '../audio/AudioWrapper.js';
-import { canUseBot } from '../utils/permissions.js';
+import { guildSettingsManager } from '../services/GuildSettingsManager.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
+import { safeContent } from '../utils/text.js';
 
 const log = logger.createModuleLogger('StatsCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('stats')
-    .setDescription('Affiche les informations de connexion et la qualite audio')
+    .setDescription('Show voice and audio stats')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Affiche les informations de connexion et la qualite audio', 'Show voice and audio stats'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-    if (!(await canUseBot(member))) {
-        await interaction.reply({
-            content: '❌ Vous n\'avez pas la permission d\'utiliser ce bot.',
-            flags: MessageFlags.Ephemeral,
-        });
+    const locale = await getInteractionLocale(interaction);
+    if (!(await ensureCanUseBot(interaction, member))) {
         return;
     }
 
     const guildId = interaction.guildId!;
     const queue = queueManager.getQueue(guildId);
     const connection = queue?.connection ?? null;
-
     const connectionStatus = connection?.state?.status ?? 'disconnected';
     const ping = connection?.ping;
     const wsPing = ping?.ws;
     const udpPing = ping?.udp;
 
-    const voiceChannelName = queue?.voiceChannel?.name ?? 'Aucun';
+    const voiceChannelName = queue?.voiceChannel?.name ?? t(locale, 'common.none');
     const membersCount = queue?.voiceChannel
         ? queue.voiceChannel.members.filter((m) => !m.user.bot).size
         : 0;
@@ -46,56 +43,62 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const playerStatus = queue?.player?.state?.status ?? 'idle';
     const currentTrack = queue?.currentTrack;
     const volume = queue?.volume ?? 100;
+    const telemetry = queue?.lastStartMetrics;
+    const settings = await guildSettingsManager.getSettings(guildId);
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.deferReply({ flags: 64 });
 
     const sourceBitrate = currentTrack
         ? await audioWrapper.getBestAudioBitrateKbps(currentTrack.url)
         : null;
     const outputBitrate = audioWrapper.getDiscordOutputBitrateKbps();
+    const sourceMode = queue ? audioWrapper.getLastSourceMode(guildId) : 'unknown';
 
     const audioQuality = [
-        `Source: ${sourceBitrate ? `${sourceBitrate} kbps` : 'n/a'}`,
-        `Discord: ${outputBitrate} kbps (Opus 48 kHz)`,
+        `${t(locale, 'stats.source')}: ${sourceBitrate ? `${sourceBitrate} kbps` : 'n/a'}`,
+        `${t(locale, 'stats.discord')}: ${outputBitrate} kbps (Opus 48 kHz)`,
     ].join('\n');
+
+    const telemetryValue = telemetry
+        ? t(locale, 'stats.telemetryValue', {
+            joinMs: telemetry.joinMs ?? 'n/a',
+            warmup: telemetry.warmHit ? `hit (${telemetry.warmupMs ?? 0}ms)` : `${telemetry.warmupMs ?? 'n/a'}ms`,
+            resourceMs: telemetry.resourceMs ?? 'n/a',
+            sourceMode,
+            crossfade: settings.crossfadeEnabled
+                ? (queue?.crossfadeInProgress ? 'on (active)' : 'on')
+                : 'off',
+        })
+        : 'n/a';
 
     const embed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setTitle('Stats du bot')
+        .setTitle(t(locale, 'stats.title'))
         .addFields(
-            { name: 'Connexion vocale', value: `Etat: ${connectionStatus}`, inline: true },
-            { name: 'Ping', value: formatPing(wsPing, udpPing), inline: true },
-            { name: 'Canal vocal', value: `${voiceChannelName} (${membersCount} membre(s))`, inline: false },
-            { name: 'Lecteur', value: `Etat: ${playerStatus}`, inline: true },
-            { name: 'Volume', value: `${volume}%`, inline: true },
-            { name: 'Qualite audio', value: audioQuality, inline: false },
-            { name: 'En lecture', value: currentTrack ? formatTrack(currentTrack.title, currentTrack.duration) : 'Aucune', inline: false }
+            { name: t(locale, 'stats.voiceConnection'), value: `Etat: ${connectionStatus}`, inline: true },
+            { name: t(locale, 'stats.ping'), value: formatPing(wsPing, udpPing), inline: true },
+            { name: t(locale, 'stats.voiceChannel'), value: t(locale, 'stats.queuedMembers', { channel: safeContent(voiceChannelName), count: membersCount }), inline: false },
+            { name: t(locale, 'stats.player'), value: `Etat: ${playerStatus}\nVolume: ${volume}%`, inline: true },
+            { name: t(locale, 'stats.audioQuality'), value: audioQuality, inline: false },
+            { name: t(locale, 'stats.telemetry'), value: telemetryValue, inline: false },
+            {
+                name: t(locale, 'stats.nowPlaying'),
+                value: currentTrack
+                    ? t(locale, 'stats.track', { title: safeContent(currentTrack.title), duration: formatDuration(currentTrack.duration) })
+                    : t(locale, 'stats.none'),
+                inline: false,
+            }
         )
-        .setFooter({ text: `Uptime: ${formatUptime(process.uptime())}` });
+        .setFooter({ text: `${t(locale, 'stats.uptime')}: ${formatUptime(process.uptime())}` });
 
-    await interaction.editReply({ embeds: [embed] });
-    deleteEphemeralAfterDelay(interaction);
+    await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
     log.debug('Commande /stats repondue');
-}
-
-function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): void {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch {
-            // Ignore
-        }
-    }, 10_000);
 }
 
 function formatPing(wsPing?: number, udpPing?: number): string {
     const ws = wsPing !== undefined ? `${Math.round(wsPing)} ms` : 'n/a';
     const udp = udpPing !== undefined ? `${Math.round(udpPing)} ms` : 'n/a';
     return `WS: ${ws}\nUDP: ${udp}`;
-}
-
-function formatTrack(title: string, duration: number): string {
-    return `${title} (${formatDuration(duration)})`;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -115,7 +118,7 @@ function formatUptime(totalSeconds: number): string {
     const days = Math.floor(totalSeconds / 86400);
 
     const parts = [] as string[];
-    if (days > 0) parts.push(`${days}j`);
+    if (days > 0) parts.push(`${days}d`);
     if (hours > 0) parts.push(`${hours}h`);
     if (minutes > 0) parts.push(`${minutes}m`);
     parts.push(`${seconds}s`);

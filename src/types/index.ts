@@ -55,6 +55,13 @@ export interface GuildQueue {
     autoPausedByEmptyChannel: boolean;
     crossfadeInProgress: boolean;
     crossfadeTargetTrackId: string | null;
+    lastStartMetrics: {
+        joinMs: number | null;
+        warmupMs: number | null;
+        resourceMs: number | null;
+        warmHit: boolean;
+        sourceMode: 'direct' | 'ytdlp' | 'unknown';
+    } | null;
 }
 
 export interface CachedAudio {
@@ -75,7 +82,6 @@ export interface YouTubeVideoInfo {
     title: string;
     duration: number;
     thumbnail: string;
-    audioStreamUrl: string;
 }
 
 export interface CommandDefinition {

@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.vscode
+.env
+.env.*
+!.env.example
+data
+dist
+node_modules
+*.log
+coverage
+test
+pterodactyl
+scripts
+README.md

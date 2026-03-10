@@ -1,9 +1,10 @@
 # LolBot
 
-Bot Discord TypeScript, 12-factor ready, deployable with Docker, Docker Compose, GitHub Actions and Pterodactyl.
+Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, Docker Compose, GitHub Actions et Pterodactyl.
 
 ## Requirements
 
+- Node.js >= 22.12.0
 - Node.js 24+ (recommended)
 - npm
 - FFmpeg
@@ -19,14 +20,14 @@ Use `.env.example` as template for local and preprod runs.
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID. |
 | `DISCORD_GUILD_ID` | No | Test guild ID for instant slash command sync. |
 | `DISCORD_COMMAND_SCOPE` | No | Slash registration scope: `auto` (default), `guild`, or `global`. |
+| `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. No owner is hardcoded in the image. |
 | `GOOGLE_API_KEY` | Yes | Google/YouTube API key. |
-| `RIOT_API_KEY` | No | Riot API key. |
-| `GENIUS_ACCESS_TOKEN` | No | Genius access token. |
 | `GENIUS_CLIENT_ID` | No | Genius OAuth client ID. |
 | `GENIUS_CLIENT_SECRET` | No | Genius OAuth client secret. |
-| `NODE_ENV` | No | Runtime environment (`development`, `test`, `production`). |
+| `DATA_DIR` | No | Base path for persistent bot data. Default: `./data` locally, `/home/container/data` in Pterodactyl. |
+| `YTDLP_AUTO_DOWNLOAD` | No | `true` to allow automatic yt-dlp download. Default: `false`. |
+| `YTDLP_PATH` | No | Custom path to an installed `yt-dlp` binary. |
 | `LOG_LEVEL` | No | Log verbosity (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`). |
-| `DOCKER_IMAGE` | Yes (infra) | Docker Hub image name, for compose/CI (ex: `youruser/lolbot`). |
 
 Legacy compatibility is kept temporarily:
 
@@ -50,6 +51,8 @@ Use VSCode Remote-SSH on your preprod host, then:
 cp .env.example .env
 # fill .env with preprod values (especially DISCORD_TOKEN)
 npm ci
+npm run typecheck
+npm test
 npm run dev
 ```
 
@@ -111,17 +114,15 @@ The compose file uses:
 
 Inject secrets and config through environment variables in the panel. Do not store secrets in files committed to git.
 
-For a TypeScript deployment, keep build output in `dist/` and run:
+This repository now ships a dedicated image and egg for panel deployment:
 
-```bash
-node dist/index.js
-```
+- Docker image: `luxxsy/lolbot-v1:20260310-secure` (or `latest`)
+- Egg export: `pterodactyl/egg-lolbot.json`
+- Startup command: `mkdir -p "$DATA_DIR" && node /opt/lolbot/dist/index.js`
 
-If your panel runs install/build automatically, use an install step such as:
+The bot code is bundled inside the image under `/opt/lolbot`, while persistent runtime data goes through `DATA_DIR` (default `/home/container/data` in the egg). The image runs as a non-root user and does not copy `.env` into the build context.
 
-```bash
-npm ci && npm run build
-```
+The egg intentionally exposes only runtime-safe variables. `YTDLP_EXTRA_ARGS` stays blocked by default and requires `YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true` if you explicitly choose to allow arbitrary yt-dlp flags.
 
 ## Stress Test (Single Instance, Multi Guild)
 

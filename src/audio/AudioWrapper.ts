@@ -2,17 +2,59 @@
 import { EventEmitter } from 'events';
 import { Readable, Transform } from 'stream';
 import type { ChildProcess } from 'child_process';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { mkdir, chmod, rename, unlink, readdir, rm, stat } from 'fs/promises';
 import { join } from 'path';
-import http from 'http';
-import https from 'https';
 import { createAudioResource, StreamType, AudioResource } from '@discordjs/voice';
 import type { Track } from '../types/index.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
+import { downloadFile } from '../utils/httpClient.js';
+import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
+
+const SAFE_CHILD_ENV_KEYS = [
+    'APPDATA',
+    'ComSpec',
+    'HOME',
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'LANG',
+    'LC_ALL',
+    'LC_CTYPE',
+    'LOCALAPPDATA',
+    'NODE_EXTRA_CA_CERTS',
+    'NO_PROXY',
+    'PATH',
+    'PATHEXT',
+    'SSL_CERT_DIR',
+    'SSL_CERT_FILE',
+    'SystemRoot',
+    'TZ',
+    'USERPROFILE',
+    'WINDIR',
+    'XDG_CACHE_HOME',
+    'XDG_CONFIG_HOME',
+    'XDG_RUNTIME_DIR',
+    'http_proxy',
+    'https_proxy',
+    'no_proxy',
+] as const;
+
+const REDACTED_YTDLP_FLAGS = new Set([
+    '--add-header',
+    '--ap-password',
+    '--ap-username',
+    '--cookies',
+    '--cookies-from-browser',
+    '--http-header',
+    '--netrc-cmd',
+    '--password',
+    '--proxy',
+    '--username',
+    '--video-password',
+]);
 
 interface CacheEntry {
     guildId: string;
@@ -43,9 +85,13 @@ export class AudioWrapper extends EventEmitter {
     private dependenciesReady: Promise<boolean> | null = null;
     private warmTracks: Map<string, WarmResourceEntry> = new Map();
     private warmupInFlight: Map<string, Promise<void>> = new Map();
+    private lastSourceModeByGuild: Map<string, 'direct' | 'ytdlp' | 'unknown'> = new Map();
     private readonly discordOpusBitrateKbps = 128;
-    private readonly streamReadyWaitMs = 750;
+    private readonly streamReadyWaitMs = 6_000;
+    private readonly directStreamReadyWaitMs = 4_000;
+    private readonly crossfadeReadyWaitMs = 4_000;
     private readonly warmResourceTtlMs = 90_000;
+    private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
         super();
@@ -77,7 +123,7 @@ export class AudioWrapper extends EventEmitter {
         this.ffmpegAvailable = await this.checkBinary('FFmpeg', this.ffmpegPath, ['-version']);
         this.ytdlpAvailable = await this.checkBinary('yt-dlp', this.ytdlpPath, ['--version']);
 
-        if (!this.ytdlpAvailable && !envYtdlp) {
+        if (!this.ytdlpAvailable && !envYtdlp && config.audio.ytdlpAutoDownload) {
             const downloaded = await this.downloadYtdlp(localYtdlpPath);
             if (downloaded) {
                 this.ytdlpPath = localYtdlpPath;
@@ -90,7 +136,11 @@ export class AudioWrapper extends EventEmitter {
         }
 
         if (!this.ytdlpAvailable) {
-            log.error('yt-dlp not found. Install it or set YTDLP_PATH.');
+            if (config.audio.ytdlpAutoDownload) {
+                log.error('yt-dlp not found. Install it or set YTDLP_PATH.');
+            } else {
+                log.error('yt-dlp not found. Install it, set YTDLP_PATH, or enable YTDLP_AUTO_DOWNLOAD=true.');
+            }
         }
 
         return this.ffmpegAvailable && this.ytdlpAvailable;
@@ -186,13 +236,21 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private getSpawnEnv(tempDir: string = config.paths.cache): NodeJS.ProcessEnv {
-        return {
-            ...process.env,
-            TMPDIR: tempDir,
-            TMP: tempDir,
-            TEMP: tempDir,
-            TEMPDIR: tempDir,
-        };
+        const safeEnv: NodeJS.ProcessEnv = {};
+
+        for (const key of SAFE_CHILD_ENV_KEYS) {
+            const value = process.env[key];
+            if (value) {
+                safeEnv[key] = value;
+            }
+        }
+
+        safeEnv.TMPDIR = tempDir;
+        safeEnv.TMP = tempDir;
+        safeEnv.TEMP = tempDir;
+        safeEnv.TEMPDIR = tempDir;
+
+        return safeEnv;
     }
 
     private async cleanupRunDirectory(runDir: string): Promise<void> {
@@ -221,6 +279,7 @@ export class AudioWrapper extends EventEmitter {
             }
         }
 
+        this.lastSourceModeByGuild.delete(guildId);
         const guildCacheDir = this.getGuildCacheDir(guildId);
         await rm(guildCacheDir, { recursive: true, force: true }).catch(() => undefined);
         await mkdir(guildCacheDir, { recursive: true }).catch(() => undefined);
@@ -269,7 +328,7 @@ export class AudioWrapper extends EventEmitter {
         if (process.env.YTDLP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES) {
             return true;
         }
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
+        const extraArgs = this.getUnsafeYtdlpExtraArgs();
         return extraArgs.some((arg) =>
             arg === '--cookies' ||
             arg === '--cookies-from-browser' ||
@@ -282,7 +341,7 @@ export class AudioWrapper extends EventEmitter {
         const args: string[] = [];
         const cookiesFromBrowser = includeCookies ? process.env.YTDLP_COOKIES_FROM_BROWSER : undefined;
         const cookies = includeCookies ? process.env.YTDLP_COOKIES : undefined;
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
+        const extraArgs = this.getUnsafeYtdlpExtraArgs();
 
         if (cookiesFromBrowser) {
             args.push('--cookies-from-browser', cookiesFromBrowser);
@@ -295,6 +354,51 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return args;
+    }
+
+    private getUnsafeYtdlpExtraArgs(): string[] {
+        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
+        if (extraArgs.length === 0) {
+            return [];
+        }
+
+        if (config.audio.allowUnsafeYtdlpExtraArgs) {
+            return extraArgs;
+        }
+
+        if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
+            this.warnedUnsafeYtdlpExtraArgsIgnored = true;
+            log.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only if you fully trust the server environment.');
+        }
+
+        return [];
+    }
+
+    private sanitizeYtdlpArgsForLogs(args: string[]): string {
+        const sanitized: string[] = [];
+
+        for (let index = 0; index < args.length; index += 1) {
+            const arg = args[index];
+            const equalsIndex = arg.indexOf('=');
+            const flag = equalsIndex >= 0 ? arg.slice(0, equalsIndex) : arg;
+
+            if (REDACTED_YTDLP_FLAGS.has(flag)) {
+                if (equalsIndex >= 0) {
+                    sanitized.push(`${flag}=[redacted]`);
+                } else {
+                    sanitized.push(flag);
+                    if (index + 1 < args.length) {
+                        sanitized.push('[redacted]');
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+
+            sanitized.push(arg);
+        }
+
+        return sanitized.join(' ');
     }
 
     private isCookieCopyError(stderr: string): boolean {
@@ -332,30 +436,42 @@ export class AudioWrapper extends EventEmitter {
                 resolve(result);
             };
 
+            const cleanup = () => {
+                if (stream) {
+                    stream.removeListener('readable', onReady);
+                }
+                ytdlp.removeListener('close', onYtdlpClose);
+                ffmpeg.removeListener('close', onFfmpegClose);
+            };
+
             const onReady = () => {
                 clearTimeout(timer);
+                cleanup();
                 finish('ready');
             };
             const onYtdlpClose = () => {
                 clearTimeout(timer);
+                cleanup();
                 finish('ytdlp-close');
             };
             const onFfmpegClose = () => {
                 clearTimeout(timer);
+                cleanup();
                 finish('ffmpeg-close');
             };
 
             timer = setTimeout(() => {
-                if (stream) {
-                    stream.removeListener('data', onReady);
-                }
-                ytdlp.removeListener('close', onYtdlpClose);
-                ffmpeg.removeListener('close', onFfmpegClose);
+                cleanup();
                 finish('timeout');
             }, timeoutMs);
 
+            if (stream && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
+                queueMicrotask(onReady);
+                return;
+            }
+
             if (stream) {
-                stream.once('data', onReady);
+                stream.once('readable', onReady);
             }
             ytdlp.once('close', onYtdlpClose);
             ffmpeg.once('close', onFfmpegClose);
@@ -371,12 +487,7 @@ export class AudioWrapper extends EventEmitter {
             const tempPath = `${targetPath}.tmp`;
 
             log.info(`Downloading yt-dlp from ${url}`);
-
-            const downloaded = await this.downloadFile(url, tempPath);
-
-            if (!downloaded) {
-                return false;
-            }
+            await downloadFile(url, tempPath, ['github.com', 'objects.githubusercontent.com']);
 
             if (existsSync(targetPath)) {
                 await unlink(targetPath);
@@ -394,59 +505,6 @@ export class AudioWrapper extends EventEmitter {
             log.error('yt-dlp download failed', error);
             return false;
         }
-    }
-
-    private async downloadFile(url: string, destination: string, redirectCount: number = 0): Promise<boolean> {
-        const maxRedirects = 5;
-        if (redirectCount > maxRedirects) {
-            log.error('yt-dlp download failed: too many redirects');
-            return false;
-        }
-
-        return new Promise((resolve) => {
-            const urlObj = new URL(url);
-            const protocol = urlObj.protocol === 'https:' ? https : http;
-
-            const request = protocol.get(
-                urlObj,
-                { headers: { 'User-Agent': 'Mozilla/5.0' } },
-                (response) => {
-                    const statusCode = response.statusCode ?? 0;
-                    const redirectStatuses = new Set([301, 302, 303, 307, 308]);
-
-                    if (redirectStatuses.has(statusCode) && response.headers.location) {
-                        const redirectUrl = new URL(response.headers.location, urlObj).toString();
-                        response.resume();
-                        resolve(this.downloadFile(redirectUrl, destination, redirectCount + 1));
-                        return;
-                    }
-
-                    if (statusCode !== 200) {
-                        log.error(`yt-dlp download failed with status ${statusCode}`);
-                        response.resume();
-                        resolve(false);
-                        return;
-                    }
-
-                    const fileStream = createWriteStream(destination);
-                    response.pipe(fileStream);
-
-                    fileStream.on('finish', () => {
-                        fileStream.close(() => resolve(true));
-                    });
-
-                    fileStream.on('error', (error) => {
-                        log.error('yt-dlp download failed while writing file', error);
-                        resolve(false);
-                    });
-                }
-            );
-
-            request.on('error', (error) => {
-                log.error('yt-dlp download request failed', error);
-                resolve(false);
-            });
-        });
     }
 
     private getYtdlpDownloadUrl(): string {
@@ -482,6 +540,7 @@ export class AudioWrapper extends EventEmitter {
                     startSeconds
                 );
                 if (directResource) {
+                    this.lastSourceModeByGuild.set(guildId, 'direct');
                     return directResource;
                 }
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
@@ -489,7 +548,9 @@ export class AudioWrapper extends EventEmitter {
 
             // Utiliser yt-dlp pour streamer directement
             log.debug('Utilisation de yt-dlp pour le streaming audio...');
-            return await this.createResourceWithYtdlp(guildId, track, startSeconds);
+            const resource = await this.createResourceWithYtdlp(guildId, track, startSeconds);
+            this.lastSourceModeByGuild.set(guildId, resource ? 'ytdlp' : 'unknown');
+            return resource;
         } catch (error) {
             log.error(`Erreur lors de la création de la ressource:`, error);
             return null;
@@ -521,8 +582,14 @@ export class AudioWrapper extends EventEmitter {
 
         const ffmpegArgs = [
             '-loglevel', 'warning',
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2',
             ...(safeOffset > 0 ? ['-ss', safeOffset.toString()] : []),
             '-i', currentUrl,
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2',
             '-i', nextUrl,
             '-filter_complex',
             `[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];` +
@@ -608,7 +675,7 @@ export class AudioWrapper extends EventEmitter {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, 1_500);
+        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, this.crossfadeReadyWaitMs);
         if (ready === 'close') {
             if (ffmpegErrors) {
                 log.trace('FFmpeg crossfade errors:', ffmpegErrors.slice(-500));
@@ -616,7 +683,9 @@ export class AudioWrapper extends EventEmitter {
             return null;
         }
         if (ready === 'timeout') {
-            log.trace('FFmpeg crossfade readiness timeout, continuing');
+            log.trace('FFmpeg crossfade readiness timeout, fallback possible');
+            teardown('crossfade readiness timeout');
+            return null;
         }
 
         return resource;
@@ -624,6 +693,10 @@ export class AudioWrapper extends EventEmitter {
 
     getDiscordOutputBitrateKbps(): number {
         return this.discordOpusBitrateKbps;
+    }
+
+    getLastSourceMode(guildId: string): 'direct' | 'ytdlp' | 'unknown' {
+        return this.lastSourceModeByGuild.get(guildId) ?? 'unknown';
     }
 
     async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
@@ -715,25 +788,36 @@ export class AudioWrapper extends EventEmitter {
                 resolve(result);
             };
 
+            const cleanup = () => {
+                if (stream) {
+                    stream.removeListener('readable', onReady);
+                }
+                processRef.removeListener('close', onClose);
+            };
+
             const onReady = () => {
                 clearTimeout(timer);
+                cleanup();
                 finish('ready');
             };
             const onClose = () => {
                 clearTimeout(timer);
+                cleanup();
                 finish('close');
             };
 
             timer = setTimeout(() => {
-                if (stream) {
-                    stream.removeListener('data', onReady);
-                }
-                processRef.removeListener('close', onClose);
+                cleanup();
                 finish('timeout');
             }, timeoutMs);
 
+            if (stream && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
+                queueMicrotask(onReady);
+                return;
+            }
+
             if (stream) {
-                stream.once('data', onReady);
+                stream.once('readable', onReady);
             }
             processRef.once('close', onClose);
         });
@@ -748,10 +832,6 @@ export class AudioWrapper extends EventEmitter {
         const runDir = await this.createRunDirectory(guildId);
         const ffmpegArgs = [
             '-loglevel', 'warning',
-            '-fflags', 'nobuffer',
-            '-flags', 'low_delay',
-            '-probesize', '32k',
-            '-analyzeduration', '0',
             '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '2',
@@ -841,7 +921,7 @@ export class AudioWrapper extends EventEmitter {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, 1_500);
+        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, this.directStreamReadyWaitMs);
         if (ready === 'close') {
             if (ffmpegErrors) {
                 log.trace('FFmpeg direct errors:', ffmpegErrors.slice(-500));
@@ -893,7 +973,7 @@ export class AudioWrapper extends EventEmitter {
         startSeconds: number
     ): Promise<{ resource: AudioResource | null; ytdlpErrors: string }> {
         log.debug(`Creation du stream avec yt-dlp (${includeCookies ? 'cookies' : 'no-cookies'})...`);
-        log.trace('URL:', track.url);
+        log.trace('URL:', sanitizeUrlForLogs(track.url));
 
         const runDir = await this.createRunDirectory(guildId);
 
@@ -910,7 +990,7 @@ export class AudioWrapper extends EventEmitter {
             track.url,
         ];
 
-        log.trace('yt-dlp args:', ytdlpArgs.join(' '));
+        log.trace('yt-dlp args:', this.sanitizeYtdlpArgsForLogs(ytdlpArgs));
 
         const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
             stdio: ['pipe', 'pipe', 'pipe'],
@@ -1126,7 +1206,7 @@ export class AudioWrapper extends EventEmitter {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const readyState = await this.waitForStreamReady(ytdlp.stdout, ytdlp, ffmpeg, this.streamReadyWaitMs);
+        const readyState = await this.waitForStreamReady(stream, ytdlp, ffmpeg, this.streamReadyWaitMs);
         if (readyState === 'ytdlp-close' || readyState === 'ffmpeg-close') {
             log.warn(`yt-dlp stream ended before start (${readyState})`);
             teardown(`stream ended before ready (${readyState})`);
@@ -1453,7 +1533,7 @@ export class AudioWrapper extends EventEmitter {
      * Nettoie le cache périodiquement
      */
     private startCacheCleanup(): void {
-        setInterval(() => {
+        const timer = setInterval(() => {
             const now = Date.now();
             const maxAge = 30 * 60 * 1000; // 30 minutes
             let cleaned = 0;
@@ -1481,6 +1561,7 @@ export class AudioWrapper extends EventEmitter {
             }
             void this.cleanupAllStaleTemp();
         }, 5 * 60 * 1000); // Vérifier toutes les 5 minutes
+        timer.unref();
     }
 
     /**
@@ -1505,6 +1586,7 @@ export class AudioWrapper extends EventEmitter {
         this.warmTracks.clear();
         this.warmupInFlight.clear();
         this.preloadingGuilds.clear();
+        this.lastSourceModeByGuild.clear();
         log.info(`Cache vidé: ${size} entrée(s) supprimée(s), warmup vidé: ${warmSize}, warmup in-flight: ${inFlightSize}`);
     }
 

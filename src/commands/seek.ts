@@ -1,34 +1,31 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
-import { canUseBot } from '../utils/permissions.js';
-import { config } from '../config.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, getInteractionLocale, replyEphemeral, scheduleDeleteReply } from '../utils/commandHelpers.js';
 
 export const data = new SlashCommandBuilder()
     .setName('seek')
-    .setDescription('Avance ou recule la lecture de X secondes')
+    .setDescription('Move playback forward or backward')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Avance ou recule la lecture de X secondes', 'Move playback forward or backward'))
     .setDMPermission(false)
-    .addIntegerOption(option =>
+    .addIntegerOption((option) =>
         option
             .setName('seconds')
-            .setDescription('Nombre de secondes (positif ou négatif)')
+            .setDescription('Seconds to move (positive or negative)')
+            .setDescriptionLocalizations(commandDescriptionLocalizations('Nombre de secondes (positif ou negatif)', 'Seconds to move (positive or negative)'))
             .setRequired(true)
     );
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-    if (!(await canUseBot(member))) {
-        await interaction.reply({
-            content: '❌ Vous n\'avez pas la permission d\'utiliser ce bot.',
-            flags: MessageFlags.Ephemeral,
-        });
+    const locale = await getInteractionLocale(interaction);
+
+    if (!(await ensureCanUseBot(interaction, member))) {
         return;
     }
 
@@ -36,39 +33,35 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const guildId = interaction.guildId!;
     const queue = queueManager.getQueue(guildId);
 
-    if (!queue || !queue.currentTrack) {
-        await interaction.reply({
-            content: '❌ Aucune musique en cours.',
-            flags: MessageFlags.Ephemeral,
-        });
+    if (!queue?.currentTrack) {
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.noTrack')}`);
         return;
     }
 
     if (!Number.isFinite(queue.currentTrack.duration) || queue.currentTrack.duration <= 0) {
-        await interaction.reply({
-            content: '❌ Cette piste ne permet pas le seek.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `❌ ${t(locale, 'seek.unavailable')}`);
         return;
     }
 
     const current = queueManager.getCurrentTime(guildId);
     const target = current + seconds;
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.deferReply({ flags: 64 });
 
     const ok = await queueManager.seekTo(guildId, target);
     if (!ok) {
-        await interaction.editReply({ content: '❌ Impossible de déplacer la lecture.' });
+        await interaction.editReply({
+            content: `❌ ${t(locale, 'seek.failed')}`,
+            allowedMentions: { parse: [] },
+        });
+        scheduleDeleteReply(interaction);
         return;
     }
 
-    const sign = seconds >= 0 ? '+' : '';
+    const delta = `${seconds >= 0 ? '+' : ''}${seconds}s`;
     await interaction.editReply({
-        content: `✅ Lecture déplacée: ${sign}${seconds}s (position: ${Math.max(0, target)}s)`
+        content: `✅ ${t(locale, 'seek.success', { delta, position: `${Math.max(0, target)}s` })}`,
+        allowedMentions: { parse: [] },
     });
-
-    setTimeout(async () => {
-        try { await interaction.deleteReply(); } catch {}
-    }, config.audio.ephemeralInfoDeleteDelay);
+    scheduleDeleteReply(interaction);
 }

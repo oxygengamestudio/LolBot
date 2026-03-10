@@ -1,20 +1,23 @@
-﻿import {
+import {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonInteraction,
     ButtonStyle,
     ColorResolvable,
     EmbedBuilder,
+    GuildMember,
     MessageFlags,
 } from 'discord.js';
 import { queueManager } from './QueueManager.js';
 import { queueViewManager } from './QueueViewManager.js';
 import { sendLyrics } from '../utils/lyrics.js';
 import { config } from '../config.js';
-import { t } from '../utils/i18n.js';
+import { resolveLocale, t } from '../utils/i18n.js';
 import { logger } from '../utils/Logger.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
 import type { GuildQueue } from '../types/index.js';
+import { safeContent } from '../utils/text.js';
+import { ensureCanUseBot, ensureSameVoiceChannel } from '../utils/commandHelpers.js';
 
 const log = logger.createModuleLogger('NowPlaying');
 
@@ -43,9 +46,8 @@ class NowPlayingManager {
         this.startUpdateInterval(queue);
     }
 
-    private async onTrackEnd(queue: GuildQueue): Promise<void> {
+    private async onTrackEnd(_queue: GuildQueue): Promise<void> {
         log.debug('Track end');
-        // The next track start or queue empty will handle updates/deletion.
     }
 
     async createOrUpdateNowPlaying(queue: GuildQueue): Promise<void> {
@@ -54,8 +56,9 @@ class NowPlayingManager {
             return;
         }
 
-        const embed = this.createEmbed(queue);
-        const row = this.createButtons(queue);
+        const locale = await resolveLocale(queue.guildId);
+        const embed = this.createEmbed(queue, locale);
+        const row = this.createButtons(queue, locale);
 
         try {
             if (queue.nowPlayingMessage) {
@@ -63,12 +66,14 @@ class NowPlayingManager {
                 await queue.nowPlayingMessage.edit({
                     embeds: [embed],
                     components: [row],
+                    allowedMentions: { parse: [] },
                 });
             } else {
                 log.debug('Creation d\'un nouveau message Now Playing');
                 const message = await queue.textChannel.send({
                     embeds: [embed],
                     components: [row],
+                    allowedMentions: { parse: [] },
                 });
                 queue.nowPlayingMessage = message;
                 log.info('Message Now Playing cree');
@@ -85,15 +90,17 @@ class NowPlayingManager {
     async updateNowPlaying(queue: GuildQueue): Promise<void> {
         if (!queue.nowPlayingMessage || !queue.currentTrack) return;
 
-        const embed = this.createEmbed(queue);
-        const row = this.createButtons(queue);
+        const locale = await resolveLocale(queue.guildId);
+        const embed = this.createEmbed(queue, locale);
+        const row = this.createButtons(queue, locale);
 
         try {
             await queue.nowPlayingMessage.edit({
                 embeds: [embed],
                 components: [row],
+                allowedMentions: { parse: [] },
             });
-        } catch (error) {
+        } catch {
             log.trace('Message supprime, reset');
             queue.nowPlayingMessage = null;
         }
@@ -107,14 +114,14 @@ class NowPlayingManager {
             try {
                 await queue.nowPlayingMessage.delete();
                 log.info('Message Now Playing supprime');
-            } catch (error) {
+            } catch {
                 log.trace('Message deja supprime');
             }
             queue.nowPlayingMessage = null;
         }
     }
 
-    private createEmbed(queue: GuildQueue): EmbedBuilder {
+    private createEmbed(queue: GuildQueue, locale: 'en' | 'fr'): EmbedBuilder {
         const track = queue.currentTrack!;
         const currentTime = queueManager.getCurrentTime(queue.guildId);
         const progress = this.createProgressBar(currentTime, track.duration);
@@ -122,34 +129,40 @@ class NowPlayingManager {
         const totalTimeString = this.formatTime(track.duration);
 
         const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
-        const statusLabel = queue.isPaused ? '⏸️ En pause' : '▶️ Lecture en cours';
+        const statusLabel = queue.isPaused
+            ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
+            : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
         const largeCover = this.getLargeCover(track.thumbnail);
 
         const embed = new EmbedBuilder()
             .setColor(color)
             .setAuthor({ name: statusLabel })
-            .setTitle(track.title)
+            .setTitle(safeContent(track.title))
             .setURL(track.url)
             .setDescription(`\`${currentTimeString}\` ${progress} \`${totalTimeString}\``)
             .addFields(
                 {
-                    name: 'Informations',
+                    name: t(locale, 'nowPlaying.field.info'),
                     value: [
                         `👤 <@${track.requestedById}>`,
-                        `📋 ${queue.tracks.length} en attente`,
+                        `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
                         `🔊 ${queue.volume}%`,
                     ].join('\n'),
                     inline: true,
                 },
                 {
-                    name: 'Miniature',
-                    value: largeCover ? 'Voir image ci-dessous' : 'Indisponible',
+                    name: t(locale, 'nowPlaying.field.thumbnail'),
+                    value: largeCover
+                        ? t(locale, 'nowPlaying.field.thumbnailAvailable')
+                        : t(locale, 'nowPlaying.field.thumbnailUnavailable'),
                     inline: true,
                 }
             )
             .setFooter({
-                text: queue.isPaused ? 'Lecture en pause' : 'Lecture active',
+                text: queue.isPaused
+                    ? t(locale, 'nowPlaying.footer.paused')
+                    : t(locale, 'nowPlaying.footer.playing'),
             });
 
         if (squareCover) {
@@ -162,35 +175,35 @@ class NowPlayingManager {
         return embed;
     }
 
-    private createButtons(queue: GuildQueue): ActionRowBuilder<ButtonBuilder> {
+    private createButtons(queue: GuildQueue, locale: 'en' | 'fr'): ActionRowBuilder<ButtonBuilder> {
         const playPauseButton = new ButtonBuilder()
             .setCustomId(queue.isPaused ? 'np_resume' : 'np_pause')
             .setEmoji(queue.isPaused ? '▶️' : '⏸️')
-            .setLabel(queue.isPaused ? 'Reprendre' : 'Pause')
+            .setLabel(queue.isPaused ? t(locale, 'nowPlaying.button.resume') : t(locale, 'nowPlaying.button.pause'))
             .setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Secondary);
 
         const skipButton = new ButtonBuilder()
             .setCustomId('np_skip')
             .setEmoji('⏭️')
-            .setLabel('Passer')
+            .setLabel(t(locale, 'nowPlaying.button.skip'))
             .setStyle(ButtonStyle.Primary);
 
         const queueButton = new ButtonBuilder()
             .setCustomId('np_queue')
             .setEmoji('📋')
-            .setLabel('File')
+            .setLabel(t(locale, 'nowPlaying.button.queue'))
             .setStyle(ButtonStyle.Secondary);
 
         const lyricsButton = new ButtonBuilder()
             .setCustomId('np_lyrics')
             .setEmoji('🎤')
-            .setLabel('Paroles')
+            .setLabel(t(locale, 'nowPlaying.button.lyrics'))
             .setStyle(ButtonStyle.Secondary);
 
         const stopButton = new ButtonBuilder()
             .setCustomId('np_stop')
             .setEmoji('⏹️')
-            .setLabel('Stop')
+            .setLabel(t(locale, 'nowPlaying.button.stop'))
             .setStyle(ButtonStyle.Danger);
 
         return new ActionRowBuilder<ButtonBuilder>()
@@ -204,11 +217,7 @@ class NowPlayingManager {
         const filled = Math.round(progress * barLength);
         let bar = '';
         for (let i = 0; i < barLength; i += 1) {
-            if (i < filled) {
-                bar += '▰';
-            } else {
-                bar += '▱';
-            }
+            bar += i < filled ? '▰' : '▱';
         }
         return `\`${bar}\``;
     }
@@ -236,8 +245,6 @@ class NowPlayingManager {
             }
             const host = parsed.hostname.toLowerCase();
 
-            // Crop centré carré pour les miniatures YouTube
-            // afin d'obtenir un rendu type "pochette d'album".
             if (host.endsWith('ytimg.com') || host.endsWith('youtube.com') || host.endsWith('youtu.be')) {
                 const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
                 const params = new URLSearchParams({
@@ -295,7 +302,7 @@ class NowPlayingManager {
         const interval = setInterval(() => {
             const currentQueue = queueManager.getQueue(queue.guildId);
             if (currentQueue && currentQueue.isPlaying && !currentQueue.isPaused) {
-                this.updateNowPlaying(currentQueue);
+                void this.updateNowPlaying(currentQueue);
             }
         }, config.audio.updateInterval);
 
@@ -319,13 +326,25 @@ class NowPlayingManager {
             return;
         }
 
+        const locale = await resolveLocale(guildId, interaction.locale);
         const queue = queueManager.getQueue(guildId);
         if (!queue) {
             await interaction.reply({
-                content: t(interaction.locale, 'queue.noQueue'),
+                content: t(locale, 'queue.noQueue'),
                 flags: MessageFlags.Ephemeral,
+                allowedMentions: { parse: [] },
             });
             this.deleteEphemeralAfterDelay(interaction);
+            return;
+        }
+
+        const member = interaction.member as GuildMember;
+        if (!(await ensureCanUseBot(interaction, member))) {
+            return;
+        }
+
+        const requiresSameVoiceChannel = ['np_pause', 'np_resume', 'np_skip', 'np_stop'].includes(interaction.customId);
+        if (requiresSameVoiceChannel && !(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) {
             return;
         }
 
@@ -337,6 +356,7 @@ class NowPlayingManager {
                 await interaction.reply({
                     content: '⏸️',
                     flags: MessageFlags.Ephemeral,
+                    allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);
                 break;
@@ -348,6 +368,7 @@ class NowPlayingManager {
                 await interaction.reply({
                     content: '▶️',
                     flags: MessageFlags.Ephemeral,
+                    allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);
                 break;
@@ -358,6 +379,7 @@ class NowPlayingManager {
                 await interaction.reply({
                     content: '⏭️',
                     flags: MessageFlags.Ephemeral,
+                    allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);
                 break;
@@ -377,6 +399,7 @@ class NowPlayingManager {
                 await interaction.reply({
                     content: '⏹️',
                     flags: MessageFlags.Ephemeral,
+                    allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);
                 break;
@@ -388,8 +411,9 @@ class NowPlayingManager {
             case 'np_lyrics':
                 if (!queue.currentTrack) {
                     await interaction.reply({
-                        content: t(interaction.locale, 'lyrics.noTrack'),
+                        content: t(locale, 'lyrics.noTrack'),
                         flags: MessageFlags.Ephemeral,
+                        allowedMentions: { parse: [] },
                     });
                     this.deleteEphemeralAfterDelay(interaction);
                     break;
@@ -400,13 +424,14 @@ class NowPlayingManager {
     }
 
     private async deleteEphemeralAfterDelay(interaction: ButtonInteraction): Promise<void> {
+        const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
         setTimeout(async () => {
             try {
                 await interaction.deleteReply();
             } catch {
                 // Ignore
             }
-        }, config.audio.ephemeralInfoDeleteDelay);
+        }, delayMs);
     }
 }
 

@@ -1,10 +1,7 @@
-import https from 'https';
-import zlib from 'zlib';
 import { URLSearchParams } from 'url';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
-import { assertHttpsUrlAllowed, sanitizeUrlForLogs } from '../utils/networkSafety.js';
-import type { IncomingMessage } from 'http';
+import { httpRequest } from '../utils/httpClient.js';
 
 const log = logger.createModuleLogger('GeniusService');
 
@@ -30,8 +27,38 @@ class GeniusService {
     private tokenExpiresAt = 0;
     private tokenPromise: Promise<string | null> | null = null;
     private readonly requestTimeoutMs = 15_000;
-    private readonly maxRedirects = 5;
     private readonly allowedDomains = ['genius.com'] as const;
+    private readonly ignoredMatchTokens = new Set([
+        'a',
+        'an',
+        'and',
+        'as',
+        'at',
+        'au',
+        'aux',
+        'by',
+        'de',
+        'des',
+        'du',
+        'en',
+        'et',
+        'for',
+        'from',
+        'in',
+        'into',
+        'is',
+        'la',
+        'le',
+        'les',
+        'of',
+        'on',
+        'or',
+        'the',
+        'to',
+        'un',
+        'une',
+        'with',
+    ]);
 
     async getLyrics(query: string): Promise<LyricsResult | null> {
         if (!query || query.trim().length === 0) {
@@ -174,7 +201,7 @@ class GeniusService {
             return [];
         }
 
-        const normalizedQuery = this.normalizeSearchText(query);
+        const normalizedQuery = this.normalizeSearchText(this.normalizeQuery(query));
         const tokens = this.tokenizeQuery(normalizedQuery);
 
         const scored = candidates
@@ -308,12 +335,27 @@ class GeniusService {
 
     private tokenizeQuery(normalizedQuery: string): string[] {
         if (!normalizedQuery) return [];
-        return normalizedQuery.split(' ').filter((token) => token.length > 0);
+        return normalizedQuery
+            .split(' ')
+            .filter((token) => token.length >= 2)
+            .filter((token) => !this.ignoredMatchTokens.has(token));
+    }
+
+    private tokenizeCandidateText(text: string): Set<string> {
+        return new Set(
+            this.normalizeSearchText(text)
+                .split(' ')
+                .filter((token) => token.length >= 2)
+                .filter((token) => !this.ignoredMatchTokens.has(token))
+        );
     }
 
     private scoreCandidate(candidate: GeniusSong, normalizedQuery: string, tokens: string[]): number {
         const urlSlug = this.getSongUrlSlug(candidate.url);
         const haystack = this.normalizeSearchText(
+            `${candidate.title} ${candidate.fullTitle} ${candidate.artist} ${urlSlug}`
+        );
+        const haystackTokens = this.tokenizeCandidateText(
             `${candidate.title} ${candidate.fullTitle} ${candidate.artist} ${urlSlug}`
         );
         let score = 0;
@@ -324,14 +366,26 @@ class GeniusService {
 
         let matchedTokens = 0;
         for (const token of tokens) {
-            if (token.length >= 2 && haystack.includes(token)) {
-                score += 4;
+            if (haystackTokens.has(token)) {
+                score += 6;
                 matchedTokens++;
             }
         }
 
         const significantTokens = tokens.filter((t) => t.length >= 2);
         if (significantTokens.length > 0 && matchedTokens === 0) {
+            return -100;
+        }
+
+        const tokenCoverage = significantTokens.length > 0
+            ? matchedTokens / significantTokens.length
+            : 0;
+
+        if (significantTokens.length >= 2 && matchedTokens < Math.min(2, significantTokens.length) && !haystack.includes(normalizedQuery)) {
+            return -80;
+        }
+
+        if (significantTokens.length >= 4 && tokenCoverage < 0.5) {
             return -100;
         }
 
@@ -347,8 +401,27 @@ class GeniusService {
             score -= 80;
         }
 
+        if (!this.isLikelyLyricsPage(candidate.url)) {
+            score -= 20;
+        }
+
+        if (this.hasAnnotatedMarker(candidate)) {
+            score -= 20;
+        }
+
         log.trace(`Score ${score} pour: ${candidate.fullTitle}`);
         return score;
+    }
+
+    private isLikelyLyricsPage(url: string): boolean {
+        const slug = this.normalizeSearchText(this.getSongUrlSlug(url));
+        return slug.includes('lyrics');
+    }
+
+    private hasAnnotatedMarker(candidate: GeniusSong): boolean {
+        return this.normalizeSearchText(
+            `${candidate.title} ${candidate.fullTitle} ${candidate.artist} ${this.getSongUrlSlug(candidate.url)}`
+        ).includes('annotated');
     }
 
     private isTranslationCandidate(candidate: GeniusSong): boolean {
@@ -459,13 +532,17 @@ class GeniusService {
         }).toString();
 
         try {
-            const response = await this.requestRaw('https://api.genius.com/oauth/token', {
+            const response = await httpRequest({
+                url: 'https://api.genius.com/oauth/token',
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Content-Length': Buffer.byteLength(body).toString(),
                 },
                 body,
+                allowedDomains: this.allowedDomains,
+                timeoutMs: this.requestTimeoutMs,
+                responseType: 'text',
             });
 
             if (response.statusCode >= 400) {
@@ -473,7 +550,7 @@ class GeniusService {
                 return null;
             }
 
-            const json = JSON.parse(response.body);
+            const json = JSON.parse(response.body as string);
             const token = json.access_token as string | undefined;
             const expiresIn = Number(json.expires_in ?? 0);
             if (!token) {
@@ -490,13 +567,16 @@ class GeniusService {
     }
 
     private async fetchJson(url: string, token: string): Promise<any> {
-        const response = await this.requestRaw(url, {
+        const response = await httpRequest({
+            url,
             method: 'GET',
             headers: {
                 Authorization: `Bearer ${token}`,
                 'User-Agent': 'LolBot/1.0',
-                'Accept-Encoding': 'gzip, deflate, br',
             },
+            allowedDomains: this.allowedDomains,
+            timeoutMs: this.requestTimeoutMs,
+            responseType: 'text',
         });
 
         if (response.statusCode >= 400) {
@@ -504,20 +584,19 @@ class GeniusService {
             return { response: { hits: [] } };
         }
 
-        try {
-            return JSON.parse(response.body);
-        } catch {
-            throw new Error('Invalid JSON response');
-        }
+        return JSON.parse(response.body as string);
     }
 
     private async fetchJsonPublic(url: string): Promise<any> {
-        const response = await this.requestRaw(url, {
+        const response = await httpRequest({
+            url,
             method: 'GET',
             headers: {
                 'User-Agent': 'LolBot/1.0',
-                'Accept-Encoding': 'gzip, deflate, br',
             },
+            allowedDomains: this.allowedDomains,
+            timeoutMs: this.requestTimeoutMs,
+            responseType: 'text',
         });
 
         if (response.statusCode >= 400) {
@@ -525,124 +604,27 @@ class GeniusService {
             return { response: { sections: [] } };
         }
 
-        try {
-            return JSON.parse(response.body);
-        } catch {
-            throw new Error('Invalid JSON response');
-        }
+        return JSON.parse(response.body as string);
     }
 
     private async fetchText(url: string): Promise<string> {
-        const response = await this.requestRaw(url, {
+        const response = await httpRequest({
+            url,
             method: 'GET',
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
             },
+            allowedDomains: this.allowedDomains,
+            timeoutMs: this.requestTimeoutMs,
+            responseType: 'text',
         });
 
         if (response.statusCode >= 400) {
             throw new Error(`Genius page error: ${response.statusCode}`);
         }
 
-        return response.body;
-    }
-
-    private requestRaw(
-        url: string,
-        options: {
-            method: 'GET' | 'POST';
-            headers?: Record<string, string>;
-            body?: string;
-        },
-        redirectCount: number = 0
-    ): Promise<{ statusCode: number; body: string }> {
-        return new Promise((resolve, reject) => {
-            const safeUrl = sanitizeUrlForLogs(url);
-
-            if (redirectCount > this.maxRedirects) {
-                reject(new Error(`Too many redirects for ${safeUrl}`));
-                return;
-            }
-
-            const urlObj = assertHttpsUrlAllowed(url, this.allowedDomains);
-            const req = https.request(
-                {
-                    method: options.method,
-                    hostname: urlObj.hostname,
-                    port: urlObj.port ? Number(urlObj.port) : undefined,
-                    path: urlObj.pathname + urlObj.search,
-                    headers: options.headers,
-                },
-                (res) => {
-                    const statusCode = res.statusCode ?? 0;
-
-                    if (statusCode >= 300 && statusCode < 400 && res.headers.location) {
-                        const redirectUrl = new URL(res.headers.location, urlObj).toString();
-                        res.resume();
-
-                        const shouldSwitchToGet =
-                            statusCode === 303 || ((statusCode === 301 || statusCode === 302) && options.method === 'POST');
-                        const nextMethod = shouldSwitchToGet ? 'GET' : options.method;
-                        const nextHeaders = { ...(options.headers ?? {}) };
-                        const nextBody = shouldSwitchToGet ? undefined : options.body;
-
-                        if (shouldSwitchToGet) {
-                            delete nextHeaders['Content-Length'];
-                            delete nextHeaders['Content-Type'];
-                        }
-
-                        this.requestRaw(
-                            redirectUrl,
-                            { method: nextMethod, headers: nextHeaders, body: nextBody },
-                            redirectCount + 1
-                        )
-                            .then(resolve)
-                            .catch(reject);
-                        return;
-                    }
-
-                    const stream = this.getDecodedStream(res);
-                    let data = '';
-
-                    stream.on('data', (chunk) => {
-                        data += chunk.toString();
-                    });
-                    stream.on('end', () => {
-                        resolve({ statusCode, body: data });
-                    });
-                    stream.on('error', (error) => {
-                        reject(error);
-                    });
-                }
-            );
-
-            req.setTimeout(this.requestTimeoutMs, () => {
-                req.destroy(new Error(`Request timeout after ${this.requestTimeoutMs}ms for ${safeUrl}`));
-            });
-            req.on('error', reject);
-
-            if (options.body) {
-                req.write(options.body);
-            }
-
-            req.end();
-        });
-    }
-
-    private getDecodedStream(res: IncomingMessage): NodeJS.ReadableStream {
-        const encoding = (res.headers['content-encoding'] || '').toString().toLowerCase();
-        if (encoding.includes('br')) {
-            return res.pipe(zlib.createBrotliDecompress());
-        }
-        if (encoding.includes('gzip')) {
-            return res.pipe(zlib.createGunzip());
-        }
-        if (encoding.includes('deflate')) {
-            return res.pipe(zlib.createInflate());
-        }
-        return res;
+        return response.body as string;
     }
 
     private extractLyrics(html: string): string | null {

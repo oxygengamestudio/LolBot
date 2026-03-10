@@ -6,8 +6,12 @@ import { logger } from './Logger.js';
 
 const log = logger.createModuleLogger('Permissions');
 
+function isBotOwner(userId: string): boolean {
+    return Boolean(config.bot.ownerId && userId === config.bot.ownerId);
+}
+
 export async function canUseBot(member: GuildMember): Promise<boolean> {
-    if (member.user.id === config.bot.ownerId) {
+    if (isBotOwner(member.user.id)) {
         return true;
     }
 
@@ -89,7 +93,7 @@ export async function canJoinVoiceChannel(
 }
 
 export async function canManageSettings(member: GuildMember): Promise<boolean> {
-    if (member.user.id === config.bot.ownerId) {
+    if (isBotOwner(member.user.id)) {
         return true;
     }
 

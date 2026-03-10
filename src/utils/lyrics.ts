@@ -11,8 +11,9 @@ import { queueManager } from '../services/QueueManager.js';
 import { nowPlayingManager } from '../services/NowPlayingManager.js';
 import type { GuildQueue } from '../types/index.js';
 import { config } from '../config.js';
-import { t } from './i18n.js';
+import { resolveLocale, t } from './i18n.js';
 import { logger } from './Logger.js';
+import { safeContent } from './text.js';
 
 const log = logger.createModuleLogger('Lyrics');
 
@@ -23,7 +24,7 @@ export async function sendLyrics(
     query: string,
     queue?: GuildQueue
 ): Promise<void> {
-    const locale = interaction.locale;
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
     const guildId = interaction.guildId;
     const targetQueue = queue ?? (guildId ? queueManager.getQueue(guildId) : undefined);
     const trackId = targetQueue?.currentTrack?.id ?? null;
@@ -83,7 +84,9 @@ async function sendLyricsMessages(
     channel: TextBasedChannel & { send: (...args: any[]) => Promise<Message> },
     result: { title: string; fullTitle: string; artist: string; url: string; lyrics: string }
 ): Promise<Message[]> {
-    const headerTitle = result.title && result.artist ? `${result.title} - ${result.artist}` : (result.fullTitle || result.title);
+    const headerTitle = result.title && result.artist
+        ? `${safeContent(result.title)} - ${safeContent(result.artist)}`
+        : safeContent(result.fullTitle || result.title);
     const header = `🎤 ${headerTitle}`.trim();
     const chunks = splitLyrics(result.lyrics, 1800);
     if (chunks.length === 0) {
@@ -161,20 +164,22 @@ export async function handleLyricsDelete(interaction: ButtonInteraction): Promis
             content: '🗑️',
             flags: MessageFlags.Ephemeral,
         });
+        const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
         setTimeout(async () => {
             try { await interaction.deleteReply(); } catch { /* ignore */ }
-        }, config.audio.ephemeralInfoDeleteDelay);
+        }, delayMs);
     } catch {
         // ignore
     }
 }
 
 function scheduleDelete(interaction: LyricsInteraction): void {
+    const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
     setTimeout(async () => {
         try {
             await interaction.deleteReply();
         } catch {
             // Ignore
         }
-    }, config.audio.ephemeralInfoDeleteDelay);
+    }, delayMs);
 }

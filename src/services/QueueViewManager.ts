@@ -1,4 +1,4 @@
-﻿import {
+import {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonInteraction,
@@ -17,8 +17,9 @@
 } from 'discord.js';
 import { queueManager } from './QueueManager.js';
 import { config } from '../config.js';
-import { getLocale, t } from '../utils/i18n.js';
+import { resolveLocale, t } from '../utils/i18n.js';
 import type { GuildQueue } from '../types/index.js';
+import { safeContent } from '../utils/text.js';
 
 interface QueueViewState {
     messageId: string;
@@ -66,9 +67,10 @@ class QueueViewManager {
             return;
         }
 
+        const locale = await resolveLocale(guildId, interaction.locale);
         const queue = queueManager.getQueue(guildId);
         if (!queue) {
-            await this.replyInfo(interaction, t(interaction.locale, 'queue.noQueue'));
+            await this.replyInfo(interaction, t(locale, 'queue.noQueue'));
             return;
         }
 
@@ -80,7 +82,7 @@ class QueueViewManager {
             messageId: '',
             guildId,
             userId,
-            locale: getLocale(interaction.locale),
+            locale,
             page: 1,
             selectedIndex: null,
         };
@@ -100,9 +102,10 @@ class QueueViewManager {
         interaction: ButtonInteraction | StringSelectMenuInteraction
     ): Promise<void> {
         const messageId = interaction.message.id;
-        const state = this.getState(messageId, interaction);
+        const state = await this.getState(messageId, interaction);
         if (!state) {
-            await this.replyInfo(interaction, t(interaction.locale, 'queue.invalidAction'));
+            const locale = await resolveLocale(interaction.guildId, interaction.locale);
+            await this.replyInfo(interaction, t(locale, 'queue.invalidAction'));
             return;
         }
 
@@ -113,58 +116,57 @@ class QueueViewManager {
             return;
         }
 
-        if (interaction.isStringSelectMenu()) {
-            if (interaction.customId === 'queue_select') {
-                const selected = parseInt(interaction.values[0] ?? '', 10);
-                state.selectedIndex = Number.isNaN(selected) ? null : selected;
-                await this.updateView(interaction, queue, state);
-                return;
-            }
+        if (interaction.isStringSelectMenu() && interaction.customId === 'queue_select') {
+            const selected = Number.parseInt(interaction.values[0] ?? '', 10);
+            state.selectedIndex = Number.isNaN(selected) ? null : selected;
+            await this.updateView(interaction, queue, state);
+            return;
         }
 
-        if (interaction.isButton()) {
-            const { customId } = interaction;
-            if (customId.startsWith('queue_page_')) {
-                const page = parseInt(customId.replace('queue_page_', ''), 10);
-                state.page = Number.isNaN(page) ? state.page : page;
+        if (!interaction.isButton()) {
+            return;
+        }
+
+        const { customId } = interaction;
+        if (customId.startsWith('queue_page_')) {
+            const page = Number.parseInt(customId.replace('queue_page_', ''), 10);
+            state.page = Number.isNaN(page) ? state.page : page;
+            await this.updateView(interaction, queue, state);
+            return;
+        }
+
+        switch (customId) {
+            case 'queue_delete_selected':
+                if (state.selectedIndex === null) {
+                    await this.replyInfo(interaction, t(state.locale, 'queue.noSelection'));
+                    return;
+                }
+                queueManager.removeTrackAt(state.guildId, state.selectedIndex);
+                state.selectedIndex = null;
+                await this.updateView(interaction, queue, state);
+                return;
+            case 'queue_delete_page': {
+                const { startIndex, endIndex } = this.getPageInfo(queue, state.page);
+                queueManager.removeTracksRange(state.guildId, startIndex, endIndex);
+                state.selectedIndex = null;
                 await this.updateView(interaction, queue, state);
                 return;
             }
-
-            switch (customId) {
-                case 'queue_delete_selected': {
-                    if (state.selectedIndex === null) {
-                        await this.replyInfo(interaction, t(state.locale, 'queue.noSelection'));
-                        return;
-                    }
-                    queueManager.removeTrackAt(state.guildId, state.selectedIndex);
-                    state.selectedIndex = null;
-                    await this.updateView(interaction, queue, state);
+            case 'queue_delete_all':
+                queueManager.clearUpcoming(state.guildId);
+                state.selectedIndex = null;
+                state.page = 1;
+                await this.updateView(interaction, queue, state);
+                return;
+            case 'queue_move':
+                if (state.selectedIndex === null) {
+                    await this.replyInfo(interaction, t(state.locale, 'queue.noSelection'));
                     return;
                 }
-                case 'queue_delete_page': {
-                    const { startIndex, endIndex } = this.getPageInfo(queue, state.page);
-                    queueManager.removeTracksRange(state.guildId, startIndex, endIndex);
-                    state.selectedIndex = null;
-                    await this.updateView(interaction, queue, state);
-                    return;
-                }
-                case 'queue_delete_all': {
-                    queueManager.clearUpcoming(state.guildId);
-                    state.selectedIndex = null;
-                    state.page = 1;
-                    await this.updateView(interaction, queue, state);
-                    return;
-                }
-                case 'queue_move': {
-                    if (state.selectedIndex === null) {
-                        await this.replyInfo(interaction, t(state.locale, 'queue.noSelection'));
-                        return;
-                    }
-                    await this.showMoveModal(interaction, state.locale);
-                    return;
-                }
-            }
+                await this.showMoveModal(interaction, state.locale);
+                return;
+            default:
+                return;
         }
     }
 
@@ -176,9 +178,12 @@ class QueueViewManager {
         const messageId = interaction.customId.split(':')[1];
         const state = messageId ? this.views.get(messageId) : null;
         if (!state) {
-            await this.replyInfo(interaction, t(interaction.locale, 'queue.invalidAction'));
+            const locale = await resolveLocale(interaction.guildId, interaction.locale);
+            await this.replyInfo(interaction, t(locale, 'queue.invalidAction'));
             return;
         }
+
+        state.locale = await resolveLocale(state.guildId, interaction.locale);
 
         const queue = queueManager.getQueue(state.guildId);
         if (!queue) {
@@ -235,15 +240,16 @@ class QueueViewManager {
         await interaction.showModal(modal);
     }
 
-    private getState(
+    private async getState(
         messageId: string,
         interaction: ButtonInteraction | StringSelectMenuInteraction
-    ): QueueViewState | null {
+    ): Promise<QueueViewState | null> {
         const existing = this.views.get(messageId);
         if (existing) {
             if (existing.userId !== interaction.user.id) {
                 return null;
             }
+            existing.locale = await resolveLocale(existing.guildId, interaction.locale);
             return existing;
         }
 
@@ -251,7 +257,7 @@ class QueueViewManager {
             messageId,
             guildId: interaction.guildId ?? '',
             userId: interaction.user.id,
-            locale: getLocale(interaction.locale),
+            locale: await resolveLocale(interaction.guildId, interaction.locale),
             page: 1,
             selectedIndex: null,
         };
@@ -268,7 +274,10 @@ class QueueViewManager {
     ): Promise<void> {
         this.normalizeState(queue, state);
         const payload = this.buildPayload(queue, state);
-        await interaction.update(payload);
+        await interaction.update({
+            ...payload,
+            allowedMentions: { parse: [] },
+        });
         state.messageId = interaction.message.id;
         state.deleteReply = async () => {
             try {
@@ -309,7 +318,7 @@ class QueueViewManager {
             const statusIcon = queue.isPaused ? '⏸️' : '▶️';
             embed.addFields({
                 name: statusIcon,
-                value: `**${queue.currentTrack.title}**\n⏱️ \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
+                value: `**${safeContent(queue.currentTrack.title)}**\n⏱️ \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
                 inline: false,
             });
         }
@@ -321,12 +330,7 @@ class QueueViewManager {
                     return `**${position}.** ${this.truncateString(track.title, 60)}\n⏱️ \`${this.formatTime(track.duration)}\` • 👤 <@${track.requestedById}>`;
                 })
                 .join('\n\n');
-
-            embed.addFields({
-                name: t(state.locale, 'queue.listTitle'),
-                value: list,
-                inline: false,
-            });
+            embed.setDescription(this.fitEmbedDescription(`**${t(state.locale, 'queue.listTitle')}**\n${list}`));
         } else {
             embed.setDescription(t(state.locale, 'queue.empty'));
         }
@@ -428,10 +432,20 @@ class QueueViewManager {
         return Math.min(totalPages, this.maxPages);
     }
 
+    private fitEmbedDescription(text: string): string {
+        const maxLength = 4096;
+        if (text.length <= maxLength) {
+            return text;
+        }
+
+        return `${text.slice(0, maxLength - 3).trimEnd()}...`;
+    }
+
     private scheduleDelete(state: QueueViewState): void {
         if (state.timeout) {
             clearTimeout(state.timeout);
         }
+        const delayMs = Math.max(1, config.audio.ephemeralInteractiveDeleteDelay);
         state.timeout = setTimeout(async () => {
             if (state.deleteReply) {
                 try {
@@ -442,7 +456,7 @@ class QueueViewManager {
             }
             this.views.delete(state.messageId);
             this.activeByUser.delete(this.getUserKey(state.guildId, state.userId));
-        }, config.audio.ephemeralInteractiveDeleteDelay);
+        }, delayMs);
     }
 
     private async clearExistingView(userKey: string): Promise<void> {
@@ -475,9 +489,10 @@ class QueueViewManager {
     ): Promise<void> {
         const reply = await this.sendEphemeral(interaction, { content });
         if (reply.deleteReply) {
+            const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
             setTimeout(() => {
                 reply.deleteReply?.().catch(() => {});
-            }, config.audio.ephemeralInfoDeleteDelay);
+            }, delayMs);
         }
     }
 
@@ -486,7 +501,10 @@ class QueueViewManager {
         payload: QueueReplyPayload
     ): Promise<EphemeralReply> {
         if (interaction.deferred) {
-            await interaction.editReply(payload);
+            await interaction.editReply({
+                ...payload,
+                allowedMentions: { parse: [] },
+            });
             const message = await interaction.fetchReply().catch(() => null);
             return {
                 message,
@@ -505,6 +523,7 @@ class QueueViewManager {
                 ...payload,
                 flags: MessageFlags.Ephemeral,
                 fetchReply: true,
+                allowedMentions: { parse: [] },
             });
             const msg = message as Message;
             return {
@@ -522,6 +541,7 @@ class QueueViewManager {
         await interaction.reply({
             ...payload,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         const message = await interaction.fetchReply().catch(() => null);
         return {
@@ -548,8 +568,9 @@ class QueueViewManager {
     }
 
     private truncateString(str: string, maxLength: number): string {
-        if (str.length <= maxLength) return str;
-        return str.substring(0, maxLength - 3) + '...';
+        const sanitized = safeContent(str);
+        if (sanitized.length <= maxLength) return sanitized;
+        return sanitized.substring(0, maxLength - 3) + '...';
     }
 }
 

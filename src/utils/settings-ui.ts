@@ -1,4 +1,4 @@
-﻿import {
+import {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
@@ -14,6 +14,7 @@
     TextInputStyle,
 } from 'discord.js';
 import type { GuildSettings, RolePermissionMode, VoiceChannelMode } from '../types/index.js';
+import { booleanLabel, localeLabel, modeLabel, t } from './i18n.js';
 
 export const SETTINGS_BUTTON_IDS = {
     volume: 'settings_volume',
@@ -28,6 +29,7 @@ export const SETTINGS_BUTTON_IDS = {
 } as const;
 
 export const SETTINGS_SELECT_IDS = {
+    localeSelect: 'settings_locale_select',
     preferredSelect: 'settings_preferred_select',
     preferredClear: 'settings_preferred_clear',
     voiceMode: 'settings_voice_mode',
@@ -55,29 +57,22 @@ export function buildSettingsMessage(settings: GuildSettings): {
     embeds: EmbedBuilder[];
     components: ActionRowBuilder<ButtonBuilder>[];
 } {
+    const locale = settings.locale;
     const lines = [
-        `🔊 Volume : ${settings.volume}%`,
-        `🌐 Langue : ${settings.locale === 'fr' ? 'Français' : 'English'}`,
-        `📌 Rester connecté (queue vide) : ${settings.stayConnected ? '✅ Oui' : '❌ Non'}`,
-        `🔗 Toujours connecté : ${settings.stayConnectedAlways ? '✅ Oui' : '❌ Non'}`,
-        `⏸️ Pause auto canal vide (mode toujours connecté) : ${settings.pauseOnEmptyChannelWhenAlwaysConnected ? '✅ Oui' : '❌ Non'}`,
-        `🎚️ Fondu enchaîné : ${settings.crossfadeEnabled ? '✅ Oui (3s)' : '❌ Non'}`,
-        `🎙️ Canal préféré : ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : 'Aucun'}`,
-        `🚪 Channels vocaux : ${formatModeLabel(
-            settings.voiceChannelMode,
-            settings.allowedVoiceChannels.length,
-            settings.blockedVoiceChannels.length
-        )}`,
-        `👥 Permissions rôles : ${formatModeLabel(
-            settings.rolePermissionMode,
-            settings.allowedRoles.length,
-            settings.blockedRoles.length
-        )}`,
+        `🔊 ${t(locale, 'settings.volume')}: ${settings.volume}%`,
+        `🌐 ${t(locale, 'settings.language')}: ${localeLabel(locale)}`,
+        `📌 ${t(locale, 'settings.stayConnected')}: ${booleanLabel(locale, settings.stayConnected)}`,
+        `🔗 ${t(locale, 'settings.alwaysConnected')}: ${booleanLabel(locale, settings.stayConnectedAlways)}`,
+        `⏸️ ${t(locale, 'settings.pauseOnEmpty')}: ${booleanLabel(locale, settings.pauseOnEmptyChannelWhenAlwaysConnected)}`,
+        `🎚️ ${t(locale, 'settings.crossfade')}: ${settings.crossfadeEnabled ? `${t(locale, 'settings.value.enabled')} (3s)` : t(locale, 'settings.value.disabled')}`,
+        `🎙️ ${t(locale, 'settings.preferredChannel')}: ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : t(locale, 'settings.channel.none')}`,
+        `🚪 ${t(locale, 'settings.voiceChannels')}: ${formatModeLabel(locale, settings.voiceChannelMode, settings.allowedVoiceChannels.length, settings.blockedVoiceChannels.length)}`,
+        `👥 ${t(locale, 'settings.roles')}: ${formatModeLabel(locale, settings.rolePermissionMode, settings.allowedRoles.length, settings.blockedRoles.length)}`,
     ];
 
     const embed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setTitle('⚙️ Paramètres du Bot')
+        .setTitle(`⚙️ ${t(locale, 'settings.title')}`)
         .setDescription(lines.join('\n'));
 
     const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -88,7 +83,7 @@ export function buildSettingsMessage(settings: GuildSettings): {
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.locale)
             .setEmoji('🌐')
-            .setStyle(settings.locale === 'fr' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.stay)
             .setEmoji('📌')
@@ -133,12 +128,13 @@ export function buildSettingsModal(
     settings: GuildSettings,
     messageId: string
 ): ModalBuilder {
+    const locale = settings.locale;
     const modal = new ModalBuilder().setCustomId(`${MODAL_PREFIX}:${kind}:${messageId}`);
 
-    modal.setTitle('Volume');
+    modal.setTitle(t(locale, 'settings.volumeModalTitle'));
     const input = new TextInputBuilder()
         .setCustomId('value')
-        .setLabel('Volume (0-200)')
+        .setLabel(t(locale, 'settings.volumeModalLabel'))
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(String(settings.volume));
@@ -146,12 +142,12 @@ export function buildSettingsModal(
     return modal;
 }
 
-export function buildRolesAddModal(messageId: string): ModalBuilder {
+export function buildRolesAddModal(messageId: string, locale: 'en' | 'fr'): ModalBuilder {
     const modal = new ModalBuilder().setCustomId(`${ROLES_ADD_MODAL_PREFIX}:${messageId}`);
-    modal.setTitle('Ajouter des rôles');
+    modal.setTitle(t(locale, 'settings.rolesAddTitle'));
     const input = new TextInputBuilder()
         .setCustomId('roles')
-        .setLabel('Mentions, IDs ou noms (séparés par virgule)')
+        .setLabel(t(locale, 'settings.rolesAddLabel'))
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true);
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
@@ -176,13 +172,33 @@ export function parseRolesAddModalId(customId: string): string | null {
     return parts[1] || null;
 }
 
+export function buildLocalePrompt(settings: GuildSettings, messageId: string): {
+    content: string;
+    components: SettingsComponents[];
+} {
+    const locale = settings.locale;
+    const select = new StringSelectMenuBuilder()
+        .setCustomId(`${SETTINGS_SELECT_IDS.localeSelect}:${messageId}`)
+        .setPlaceholder(t(locale, 'settings.selectLanguagePlaceholder'))
+        .addOptions(
+            { label: localeLabel('fr'), value: 'fr', default: settings.locale === 'fr' },
+            { label: localeLabel('en'), value: 'en', default: settings.locale === 'en' }
+        );
+
+    return {
+        content: t(locale, 'settings.choiceLanguage'),
+        components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+    };
+}
+
 export function buildPreferredChannelPrompt(settings: GuildSettings, messageId: string): {
     content: string;
     components: SettingsComponents[];
 } {
+    const locale = settings.locale;
     const select = new ChannelSelectMenuBuilder()
         .setCustomId(`${SETTINGS_SELECT_IDS.preferredSelect}:${messageId}`)
-        .setPlaceholder('Choisir un canal vocal préféré')
+        .setPlaceholder(t(locale, 'settings.preferredPlaceholder'))
         .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
         .setMinValues(1)
         .setMaxValues(1);
@@ -192,12 +208,12 @@ export function buildPreferredChannelPrompt(settings: GuildSettings, messageId: 
         .setEmoji('🧹')
         .setStyle(ButtonStyle.Secondary);
 
-    const info = settings.preferredVoiceChannel
-        ? `Canal actuel: <#${settings.preferredVoiceChannel}>`
-        : 'Canal actuel: Aucun';
+    const info = t(locale, 'settings.promptCurrentChannel', {
+        channel: settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : t(locale, 'settings.channel.none'),
+    });
 
     return {
-        content: `Sélectionne le canal vocal préféré.\n${info}`,
+        content: `${t(locale, 'settings.promptPreferred')}\n${info}`,
         components: [
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(select),
             new ActionRowBuilder<ButtonBuilder>().addComponents(clearButton),
@@ -209,12 +225,13 @@ export function buildVoiceChannelsPrompt(settings: GuildSettings, messageId: str
     content: string;
     components: SettingsComponents[];
 } {
+    const locale = settings.locale;
     const modeSelect = new StringSelectMenuBuilder()
         .setCustomId(`${SETTINGS_SELECT_IDS.voiceMode}:${messageId}`)
-        .setPlaceholder('Mode des channels vocaux')
+        .setPlaceholder(t(locale, 'settings.voiceModePlaceholder'))
         .addOptions(
             {
-                label: 'Tous autorisés',
+                label: t(locale, 'settings.mode.allow_all'),
                 value: 'allow_all',
                 default: settings.voiceChannelMode === 'allow_all',
             },
@@ -237,7 +254,7 @@ export function buildVoiceChannelsPrompt(settings: GuildSettings, messageId: str
     if (settings.voiceChannelMode !== 'allow_all') {
         const channelSelect = new ChannelSelectMenuBuilder()
             .setCustomId(`${SETTINGS_SELECT_IDS.voiceList}:${messageId}`)
-            .setPlaceholder('Sélectionner les channels vocaux')
+            .setPlaceholder(t(locale, 'settings.voiceListPlaceholder'))
             .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
             .setMinValues(0)
             .setMaxValues(25);
@@ -251,8 +268,9 @@ export function buildVoiceChannelsPrompt(settings: GuildSettings, messageId: str
             : 0;
 
     return {
-        content: `Mode actuel: ${formatModeLabel(settings.voiceChannelMode, count, count)}.` +
-            (settings.voiceChannelMode === 'allow_all' ? ' Aucun salon à sélectionner.' : ''),
+        content: t(locale, 'settings.promptVoiceMode', {
+            mode: formatModeLabel(locale, settings.voiceChannelMode, count, count),
+        }) + (settings.voiceChannelMode === 'allow_all' ? ` ${t(locale, 'settings.promptVoiceNone')}` : ''),
         components,
     };
 }
@@ -266,12 +284,13 @@ export function buildRolesPrompt(
     content: string;
     components: SettingsComponents[];
 } {
+    const locale = settings.locale;
     const modeSelect = new StringSelectMenuBuilder()
         .setCustomId(`${SETTINGS_SELECT_IDS.rolesMode}:${messageId}`)
-        .setPlaceholder('Mode des rôles')
+        .setPlaceholder(t(locale, 'settings.rolesModePlaceholder'))
         .addOptions(
             {
-                label: 'Tous autorisés',
+                label: t(locale, 'settings.mode.allow_all'),
                 value: 'allow_all',
                 default: settings.rolePermissionMode === 'allow_all',
             },
@@ -310,7 +329,7 @@ export function buildRolesPrompt(
             if (pageRoles.length > 0) {
                 const roleSelect = new StringSelectMenuBuilder()
                     .setCustomId(`${SETTINGS_SELECT_IDS.rolesList}:${messageId}:${safePage}`)
-                    .setPlaceholder('Sélectionner les rôles')
+                    .setPlaceholder(t(locale, 'settings.rolesListPlaceholder'))
                     .setMinValues(0)
                     .setMaxValues(Math.min(25, pageRoles.length))
                     .addOptions(
@@ -341,14 +360,14 @@ export function buildRolesPrompt(
                         .setStyle(ButtonStyle.Secondary)
                         .setDisabled(safePage >= pageCount - 1)
                 );
-                pageInfo = ` Page ${safePage + 1}/${pageCount} (${total}).`;
+                pageInfo = t(locale, 'settings.promptRolesPage', { page: safePage + 1, pages: pageCount, total });
             } else if (total > 0) {
-                pageInfo = ` ${total} rôle(s).`;
+                pageInfo = t(locale, 'settings.promptRolesCount', { count: total });
             }
         } else {
             const roleSelect = new RoleSelectMenuBuilder()
                 .setCustomId(`${SETTINGS_SELECT_IDS.rolesList}:${messageId}`)
-                .setPlaceholder('Sélectionner les rôles')
+                .setPlaceholder(t(locale, 'settings.rolesListPlaceholder'))
                 .setMinValues(0)
                 .setMaxValues(25);
             components.push(new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(roleSelect));
@@ -364,9 +383,9 @@ export function buildRolesPrompt(
             : 0;
 
     return {
-        content:
-            `Mode actuel: ${formatModeLabel(settings.rolePermissionMode, count, count)}.` +
-            (settings.rolePermissionMode === 'allow_all' ? ' Aucun rôle à sélectionner.' : pageInfo),
+        content: t(locale, 'settings.promptRolesMode', {
+            mode: formatModeLabel(locale, settings.rolePermissionMode, count, count),
+        }) + (settings.rolePermissionMode === 'allow_all' ? ` ${t(locale, 'settings.promptRolesNone')}` : pageInfo),
         components,
     };
 }
@@ -388,17 +407,18 @@ export function parseSettingsSelectId(
 }
 
 function formatModeLabel(
+    locale: string,
     mode: VoiceChannelMode | RolePermissionMode,
     allowCount: number,
     blockCount: number
 ): string {
-    if (mode === 'allow_all') {
-        return 'Tous autorisés';
-    }
     if (mode === 'whitelist') {
-        return `Whitelist (${allowCount})`;
+        return modeLabel(locale, mode, allowCount);
     }
-    return `Blacklist (${blockCount})`;
+    if (mode === 'blacklist') {
+        return modeLabel(locale, mode, blockCount);
+    }
+    return modeLabel(locale, mode, 0);
 }
 
 function modeButtonStyle(mode: VoiceChannelMode | RolePermissionMode): ButtonStyle {

@@ -1,11 +1,12 @@
 import { config as dotenvConfig } from 'dotenv';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, isAbsolute, join } from 'path';
 
 dotenvConfig();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const rootPath = join(__dirname, '..');
 
 type NodeEnv = 'development' | 'test' | 'production';
 type CommandScope = 'auto' | 'guild' | 'global';
@@ -21,9 +22,6 @@ export interface AppConfig {
     youtube: {
         apiKey: string;
     };
-    riot: {
-        apiKey?: string;
-    };
     genius: {
         accessToken?: string;
         clientId?: string;
@@ -36,7 +34,7 @@ export interface AppConfig {
         guilds: string;
     };
     bot: {
-        ownerId: string;
+        ownerId?: string;
     };
     audio: {
         bufferSize: number;
@@ -47,6 +45,8 @@ export interface AppConfig {
         maxQueueTracks: number;
         maxPlaylistTracks: number;
         searchResults: number;
+        ytdlpAutoDownload: boolean;
+        allowUnsafeYtdlpExtraArgs: boolean;
     };
 }
 
@@ -135,11 +135,41 @@ function normalizeCommandScope(): CommandScope {
     );
 }
 
+function normalizeBooleanEnv(name: string, defaultValue: boolean): boolean {
+    const rawValue = getTrimmedEnv(name);
+    if (!rawValue) {
+        return defaultValue;
+    }
+
+    const normalized = rawValue.toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+        return true;
+    }
+    if (['0', 'false', 'no', 'off'].includes(normalized)) {
+        return false;
+    }
+
+    console.warn(`[config] Unsupported boolean value "${rawValue}" for ${name}. Falling back to ${defaultValue}.`);
+    return defaultValue;
+}
+
+function resolvePathEnv(name: string, defaultPath: string): string {
+    const rawValue = getOptionalEnv(name);
+    if (!rawValue) {
+        return defaultPath;
+    }
+
+    return isAbsolute(rawValue) ? rawValue : join(rootPath, rawValue);
+}
+
 const discordToken = getRequiredEnv('DISCORD_TOKEN');
 const discordClientId = getRequiredEnv('DISCORD_CLIENT_ID', ['CLIENT_ID']);
 const discordGuildId = getOptionalEnv('DISCORD_GUILD_ID', ['GUILD_ID']);
 const discordCommandScope = normalizeCommandScope();
 const googleApiKey = getRequiredEnv('GOOGLE_API_KEY', ['YOUTUBE_API_KEY']);
+const dataPath = resolvePathEnv('DATA_DIR', join(rootPath, 'data'));
+const cachePath = resolvePathEnv('CACHE_DIR', join(dataPath, 'cache'));
+const guildsPath = resolvePathEnv('GUILDS_DIR', join(dataPath, 'guild'));
 
 export const config: AppConfig = {
     nodeEnv: normalizeNodeEnv(),
@@ -152,22 +182,19 @@ export const config: AppConfig = {
     youtube: {
         apiKey: googleApiKey,
     },
-    riot: {
-        apiKey: getOptionalEnv('RIOT_API_KEY'),
-    },
     genius: {
         accessToken: getOptionalEnv('GENIUS_ACCESS_TOKEN'),
         clientId: getOptionalEnv('GENIUS_CLIENT_ID'),
         clientSecret: getOptionalEnv('GENIUS_CLIENT_SECRET'),
     },
     paths: {
-        root: join(__dirname, '..'),
-        data: join(__dirname, '..', 'data'),
-        cache: join(__dirname, '..', 'data', 'cache'),
-        guilds: join(__dirname, '..', 'data', 'guild'),
+        root: rootPath,
+        data: dataPath,
+        cache: cachePath,
+        guilds: guildsPath,
     },
     bot: {
-        ownerId: '189457295279783936',
+        ownerId: getOptionalEnv('BOT_OWNER_ID'),
     },
     audio: {
         bufferSize: 5,
@@ -178,5 +205,7 @@ export const config: AppConfig = {
         maxQueueTracks: 100,
         maxPlaylistTracks: 50,
         searchResults: 10,
+        ytdlpAutoDownload: normalizeBooleanEnv('YTDLP_AUTO_DOWNLOAD', false),
+        allowUnsafeYtdlpExtraArgs: normalizeBooleanEnv('YTDLP_ALLOW_UNSAFE_EXTRA_ARGS', false),
     },
 };

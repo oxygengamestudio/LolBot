@@ -1,5 +1,6 @@
 ﻿import {
     SlashCommandBuilder,
+    AutocompleteInteraction,
     ChatInputCommandInteraction,
     GuildMember,
     MessageFlags,
@@ -15,6 +16,8 @@ import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
 import { isKnownInteractionResponseError } from '../utils/discordApiErrors.js';
 import type { Track } from '../types/index.js';
+import { commandDescriptionLocalizations, resolveLocale, t } from '../utils/i18n.js';
+import { safeContent, truncate } from '../utils/text.js';
 
 const log = logger.createModuleLogger('PlayCmd');
 const AUTOCOMPLETE_DEBOUNCE_MS = 1_500;
@@ -35,12 +38,14 @@ const autocompleteState = new Map<string, AutocompleteState>();
 
 export const data = new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Joue une musique depuis YouTube')
+    .setDescription('Play a track from YouTube')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Joue une musique depuis YouTube', 'Play a track from YouTube'))
     .setDMPermission(false)
     .addStringOption(option =>
         option
             .setName('query')
-            .setDescription('URL YouTube ou termes de recherche')
+            .setDescription('YouTube URL or search terms')
+            .setDescriptionLocalizations(commandDescriptionLocalizations('URL YouTube ou termes de recherche', 'YouTube URL or search terms'))
             .setRequired(true)
             .setAutocomplete(true)
     );
@@ -48,21 +53,24 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
         await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
+            content: `❌ ${t(interaction.locale, 'error.guildOnly')}`,
+            allowedMentions: { parse: [] },
         });
         return;
     }
 
     const member = interaction.member as GuildMember;
     const voiceChannel = member.voice.channel;
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     log.debug(`Commande play par ${member.user.tag}`);
 
     // Vérification permissions
     if (!(await canUseBot(member))) {
         await interaction.reply({
-            content: '❌ Vous n\'avez pas la permission d\'utiliser ce bot.',
+            content: `❌ ${t(locale, 'error.noPermission')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -70,8 +78,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
 
     if (!voiceChannel) {
         await interaction.reply({
-            content: '❌ Vous devez être dans un canal vocal pour utiliser cette commande.',
+            content: `❌ ${t(locale, 'error.mustBeInVoice')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -80,8 +89,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const guildId = interaction.guildId;
     if (!guildId) {
         await interaction.reply({
-            content: 'Commande indisponible ici.',
+            content: `❌ ${t(locale, 'error.generic')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -90,8 +100,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const query = interaction.options.getString('query', true);
     if (isAutocompleteHintValue(query)) {
         await interaction.reply({
-            content: 'ℹ️ Cette option est une aide de saisie. Entrez un titre ou une URL YouTube puis validez.',
+            content: `ℹ️ ${t(locale, 'error.interactionHint')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -113,8 +124,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
 
     if (!(await canJoinVoiceChannel(targetChannel, guildId))) {
         await interaction.reply({
-            content: `❌ Je n'ai pas l'autorisation de rejoindre <#${targetChannel.id}>.`,
+            content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${targetChannel.id}>` })}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -135,15 +147,16 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     try {
         if (youtubeService.isYouTubeUrl(query)) {
             log.debug('Detecte comme URL YouTube');
-            await handleYouTubeUrl(interaction, query, member, targetChannel, textChannel);
+            await handleYouTubeUrl(interaction, query, member, targetChannel, textChannel, locale);
         } else {
             log.debug('Detecte comme recherche (auto)');
-            await handleSearchAuto(interaction, query, member, targetChannel, textChannel);
+            await handleSearchAuto(interaction, query, member, targetChannel, textChannel, locale);
         }
     } catch (error) {
         log.error('Erreur:', error);
         await interaction.editReply({
-            content: 'Une erreur est survenue lors du traitement de votre demande.',
+            content: t(locale, 'error.generic'),
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
     }
@@ -154,7 +167,8 @@ async function handleYouTubeUrl(
     url: string,
     member: GuildMember,
     voiceChannel: VoiceChannel | StageChannel,
-    textChannel: TextChannel
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
 ): Promise<void> {
     if (youtubeService.isPlaylistUrl(url)) {
         log.debug('URL de playlist detectee');
@@ -162,14 +176,16 @@ async function handleYouTubeUrl(
         if (!playlistId) {
             log.warn('ID de playlist invalide');
             await interaction.editReply({
-                content: 'URL de playlist invalide.',
+                content: t(locale, 'play.playlistInvalid'),
+                allowedMentions: { parse: [] },
             });
             deleteEphemeralAfterDelay(interaction);
             return;
         }
 
         await interaction.editReply({
-            content: 'Chargement de la playlist...',
+            content: t(locale, 'play.playlistLoading'),
+            allowedMentions: { parse: [] },
         });
 
         log.debug(`Chargement playlist: ${playlistId}`);
@@ -182,7 +198,8 @@ async function handleYouTubeUrl(
         if (!playlist || playlist.tracks.length === 0) {
             log.warn('Playlist introuvable ou vide');
             await interaction.editReply({
-                content: 'Playlist introuvable ou vide.',
+                content: t(locale, 'play.playlistEmpty'),
+                allowedMentions: { parse: [] },
             });
             deleteEphemeralAfterDelay(interaction);
             return;
@@ -198,7 +215,8 @@ async function handleYouTubeUrl(
         } else if (queue.voiceChannel.id !== voiceChannel.id) {
             if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
                 await interaction.editReply({
-                    content: `❌ Je n'ai pas l'autorisation de rejoindre <#${voiceChannel.id}>.`,
+                    content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
+                    allowedMentions: { parse: [] },
                 });
                 deleteEphemeralAfterDelay(interaction);
                 return;
@@ -206,7 +224,8 @@ async function handleYouTubeUrl(
             const moved = await queueManager.moveToChannel(queue, voiceChannel);
             if (!moved) {
                 await interaction.editReply({
-                    content: '❌ Impossible de déplacer le bot vers le canal préféré.',
+                    content: `❌ ${t(locale, 'settings.preferredMoveFailed')}`,
+                    allowedMentions: { parse: [] },
                 });
                 deleteEphemeralAfterDelay(interaction);
                 return;
@@ -218,7 +237,8 @@ async function handleYouTubeUrl(
 
         if (addedCount <= 0) {
             await interaction.editReply({
-                content: 'File d\'attente pleine.',
+                content: t(locale, 'play.queueFull'),
+                allowedMentions: { parse: [] },
             });
             deleteEphemeralAfterDelay(interaction);
             return;
@@ -232,7 +252,11 @@ async function handleYouTubeUrl(
         }
 
         await interaction.editReply({
-            content: `**${playlist.title}**\n${addedCount} piste${addedCount > 1 ? 's' : ''} ajoutee${addedCount > 1 ? 's' : ''} a la file d'attente.`,
+            content: t(locale, 'play.playlistAdded', {
+                title: safeContent(playlist.title),
+                count: addedCount,
+            }),
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -248,14 +272,15 @@ async function handleYouTubeUrl(
     if (!track) {
         log.error('Impossible de charger la video');
         await interaction.editReply({
-            content: 'Impossible de charger cette video.',
+            content: t(locale, 'play.videoLoadFailed'),
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
     }
 
     log.info(`Track cree: ${track.title}`);
-    await addTrackToQueue(interaction, track, voiceChannel, textChannel);
+    await addTrackToQueue(interaction, track, voiceChannel, textChannel, locale);
 }
 
 async function handleSearchAuto(
@@ -263,10 +288,12 @@ async function handleSearchAuto(
     query: string,
     member: GuildMember,
     voiceChannel: VoiceChannel | StageChannel,
-    textChannel: TextChannel
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
 ): Promise<void> {
     await interaction.editReply({
-        content: `Recherche de "${query}"...`,
+        content: t(locale, 'play.searching', { query: safeContent(query) }),
+        allowedMentions: { parse: [] },
     });
 
     log.debug(`Recherche YouTube (auto): ${query}`);
@@ -275,7 +302,8 @@ async function handleSearchAuto(
     if (results.length === 0) {
         log.debug('Aucun resultat (auto)');
         await interaction.editReply({
-            content: 'Aucun resultat trouve.',
+            content: t(locale, 'play.noResults'),
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -290,14 +318,15 @@ async function handleSearchAuto(
         member.id
     );
 
-    await addTrackToQueue(interaction, track, voiceChannel, textChannel);
+    await addTrackToQueue(interaction, track, voiceChannel, textChannel, locale);
 }
 
 async function addTrackToQueue(
     interaction: ChatInputCommandInteraction,
     track: Track,
     voiceChannel: VoiceChannel | StageChannel,
-    textChannel: TextChannel
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
 ): Promise<void> {
     let queue = queueManager.getQueue(interaction.guildId!);
     if (!queue) {
@@ -306,7 +335,8 @@ async function addTrackToQueue(
     } else if (queue.voiceChannel.id !== voiceChannel.id) {
         if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
             await interaction.editReply({
-                content: `❌ Je n'ai pas l'autorisation de rejoindre <#${voiceChannel.id}>.`,
+                content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
+                allowedMentions: { parse: [] },
             });
             deleteEphemeralAfterDelay(interaction);
             return;
@@ -314,7 +344,8 @@ async function addTrackToQueue(
         const moved = await queueManager.moveToChannel(queue, voiceChannel);
         if (!moved) {
             await interaction.editReply({
-                content: '❌ Impossible de déplacer le bot vers le canal préféré.',
+                content: `❌ ${t(locale, 'settings.preferredMoveFailed')}`,
+                allowedMentions: { parse: [] },
             });
             deleteEphemeralAfterDelay(interaction);
             return;
@@ -325,7 +356,8 @@ async function addTrackToQueue(
     const added = queueManager.addTrack(interaction.guildId!, track);
     if (added <= 0) {
         await interaction.editReply({
-            content: 'File d\'attente pleine.',
+            content: t(locale, 'play.queueFull'),
+            allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
@@ -339,34 +371,36 @@ async function addTrackToQueue(
     }
 
     await interaction.editReply({
-        content: `**${track.title}** ajoutee a la file d'attente.`,
+        content: t(locale, 'play.trackAdded', { title: safeContent(track.title) }),
+        allowedMentions: { parse: [] },
     });
     deleteEphemeralAfterDelay(interaction);
 }
 
 function truncateString(str: string, maxLength: number): string {
-    if (str.length <= maxLength) return str;
-    return str.substring(0, maxLength - 3) + '...';
+    return truncate(str, maxLength);
 }
 
 async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
+    const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
     setTimeout(async () => {
         try {
             await interaction.deleteReply();
         } catch (error) {
             // Ignore
         }
-    }, config.audio.ephemeralInfoDeleteDelay);
+    }, delayMs);
 }
 
-export async function autocomplete(interaction: any): Promise<void> {
+export async function autocomplete(interaction: AutocompleteInteraction): Promise<void> {
     const focusedValue = interaction.options.getFocused() as string;
     const query = focusedValue.trim();
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     if (!query) {
         await safeAutocompleteRespond(interaction, [
             {
-                name: '✍️ Commence a ecrire un titre ou colle une URL YouTube',
+                name: `✍️ ${t(locale, 'play.autocomplete.startTyping')}`,
                 value: AUTOCOMPLETE_HINT_START_TYPING,
             },
         ]);
@@ -376,7 +410,7 @@ export async function autocomplete(interaction: any): Promise<void> {
     if (query.length < 2 && !youtubeService.isYouTubeUrl(query)) {
         await safeAutocompleteRespond(interaction, [
             {
-                name: '⌨️ Continue a ecrire pour lancer la recherche',
+                name: `⌨️ ${t(locale, 'play.autocomplete.refine')}`,
                 value: AUTOCOMPLETE_HINT_REFINE,
             },
         ]);
@@ -385,7 +419,7 @@ export async function autocomplete(interaction: any): Promise<void> {
 
     // URL YouTube: l'option par défaut conserve l'URL saisie.
     if (youtubeService.isYouTubeUrl(query)) {
-        const urlOptions = await buildYouTubeUrlAutocompleteOptions(query);
+        const urlOptions = await buildYouTubeUrlAutocompleteOptions(query, locale);
         await safeAutocompleteRespond(interaction, urlOptions);
         return;
     }
@@ -402,7 +436,7 @@ export async function autocomplete(interaction: any): Promise<void> {
     if (state && now - state.lastApiCallAt < AUTOCOMPLETE_DEBOUNCE_MS) {
         const throttledOptions = withHintOption(
             state.lastOptions,
-            '⏳ Pause 1.5s apres la derniere frappe pour affiner',
+            `⏳ ${t(locale, 'play.autocomplete.cooldown')}`,
             AUTOCOMPLETE_HINT_REFINE
         );
         await safeAutocompleteRespond(interaction, throttledOptions);
@@ -420,7 +454,7 @@ export async function autocomplete(interaction: any): Promise<void> {
         const safeOptions = options.length > 0
             ? options
             : [{
-                name: '🔎 Aucun resultat, continue a ecrire pour preciser',
+                name: `🔎 ${t(locale, 'play.autocomplete.noResults')}`,
                 value: AUTOCOMPLETE_HINT_NO_RESULTS,
             }];
 
@@ -439,18 +473,18 @@ export async function autocomplete(interaction: any): Promise<void> {
         log.error('Erreur autocomplete:', error);
         await safeAutocompleteRespond(interaction, [
             {
-                name: '⚠️ Recherche indisponible, reessaie dans un instant',
+                name: `⚠️ ${t(locale, 'error.generic')}`,
                 value: AUTOCOMPLETE_HINT_REFINE,
             },
         ]);
     }
 }
 
-async function buildYouTubeUrlAutocompleteOptions(query: string): Promise<AutocompleteOption[]> {
+async function buildYouTubeUrlAutocompleteOptions(query: string, locale: 'en' | 'fr'): Promise<AutocompleteOption[]> {
     const optionValue = toAutocompleteValue(query);
     const options: AutocompleteOption[] = [
         {
-            name: truncateString('🔗 Garder cette URL (ne remplace pas la saisie)', 100),
+            name: truncateString(`🔗 ${t(locale, 'play.autocomplete.keepUrl')}`, 100),
             value: optionValue,
         },
     ];
@@ -461,7 +495,13 @@ async function buildYouTubeUrlAutocompleteOptions(query: string): Promise<Autoco
             const info = await youtubeService.getVideoInfo(videoId);
             if (info) {
                 options.push({
-                    name: truncateString(`🎵 Titre detecte: ${info.title} • ${formatDuration(info.duration)}`, 100),
+                    name: truncateString(
+                        `🎵 ${t(locale, 'play.autocomplete.detected', {
+                            title: safeContent(info.title),
+                            duration: formatDuration(info.duration),
+                        })}`,
+                        100
+                    ),
                     value: AUTOCOMPLETE_HINT_REFINE,
                 });
                 return options;
@@ -546,7 +586,7 @@ async function safeAutocompleteRespond(
         const fallback = options.length > 0
             ? options
             : [{
-                name: '✍️ Commence a ecrire un titre ou colle une URL YouTube',
+                name: `✍️ ${t('fr', 'play.autocomplete.startTyping')}`,
                 value: AUTOCOMPLETE_HINT_START_TYPING,
             }];
         await interaction.respond(fallback.slice(0, MAX_AUTOCOMPLETE_OPTIONS));

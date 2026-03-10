@@ -1,57 +1,38 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
-import { config } from '../config.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, ensureSameVoiceChannel, ensureVoiceMembership, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('StopCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('stop')
-    .setDescription('Arrête la musique et vide la file d\'attente')
+    .setDescription('Stop playback and clear the queue')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Arrete la musique et vide la file d attente', 'Stop playback and clear the queue'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-    const voiceChannel = member.voice.channel;
+    const locale = await getInteractionLocale(interaction);
 
     log.debug(`Commande stop par ${member.user.tag}`);
 
-    if (!voiceChannel) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans un canal vocal pour utiliser cette commande.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
-        return;
-    }
+    if (!(await ensureCanUseBot(interaction, member))) return;
+    if (!(await ensureVoiceMembership(interaction, member))) return;
 
     const queue = queueManager.getQueue(interaction.guildId!);
-
     if (!queue) {
-        await interaction.reply({
-            content: '❌ Aucune musique en cours de lecture.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.noQueue')}`);
         return;
     }
-
-    if (queue.voiceChannel.id !== voiceChannel.id) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans le même canal vocal que le bot.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
-        return;
-    }
+    if (!(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) return;
 
     const settings = await guildSettingsManager.getSettings(interaction.guildId!);
     const shouldStay = settings.stayConnected || settings.stayConnectedAlways;
@@ -59,28 +40,11 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     if (shouldStay) {
         log.info('Arrêt de la lecture (bot reste connecté)');
         queueManager.stop(interaction.guildId!);
-        await interaction.reply({
-            content: '⏹️ Lecture arrêtée. Le bot reste connecté.',
-            flags: MessageFlags.Ephemeral,
-        });
-    } else {
-        log.info('Arrêt de la lecture et déconnexion');
-        queueManager.deleteQueue(interaction.guildId!);
-        await interaction.reply({
-            content: '⏹️ Lecture arrêtée et bot déconnecté.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `⏹️ ${t(locale, 'stop.stay')}`);
+        return;
     }
 
-    deleteEphemeralAfterDelay(interaction);
-}
-
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch (error) {
-            // Ignorer
-        }
-    }, config.audio.ephemeralInfoDeleteDelay);
+    log.info('Arrêt de la lecture et déconnexion');
+    queueManager.deleteQueue(interaction.guildId!);
+    await replyEphemeral(interaction, `⏹️ ${t(locale, 'stop.leave')}`);
 }

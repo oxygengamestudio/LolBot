@@ -1,72 +1,46 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
-import { config } from '../config.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, ensureSameVoiceChannel, ensureVoiceMembership, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('LeaveCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('leave')
-    .setDescription('Déconnecte le bot du canal vocal')
+    .setDescription('Disconnect the bot from voice')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Deconnecte le bot du canal vocal', 'Disconnect the bot from voice'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-    const voiceChannel = member.voice.channel;
+    const locale = await getInteractionLocale(interaction);
 
     log.debug(`Commande leave par ${member.user.tag}`);
 
-    if (!voiceChannel) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans un canal vocal pour utiliser cette commande.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+    if (!(await ensureCanUseBot(interaction, member))) {
+        return;
+    }
+    if (!(await ensureVoiceMembership(interaction, member))) {
         return;
     }
 
     const queue = queueManager.getQueue(interaction.guildId!);
-
     if (!queue) {
-        await interaction.reply({
-            content: '❌ Le bot n\'est pas connecté.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'leave.notConnected')}`);
         return;
     }
 
-    if (queue.voiceChannel.id !== voiceChannel.id) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans le même canal vocal que le bot.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+    if (!(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) {
         return;
     }
 
     log.info('Déconnexion via /leave');
     queueManager.deleteQueue(interaction.guildId!);
-    await interaction.reply({
-        content: '👋 Bot déconnecté.',
-        flags: MessageFlags.Ephemeral,
-    });
-    deleteEphemeralAfterDelay(interaction);
-}
-
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch (error) {
-            // Ignorer
-        }
-    }, config.audio.ephemeralInfoDeleteDelay);
+    await replyEphemeral(interaction, `👋 ${t(locale, 'leave.disconnected')}`);
 }

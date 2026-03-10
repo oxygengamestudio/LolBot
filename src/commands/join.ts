@@ -1,90 +1,64 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, StageChannel, VoiceChannel } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
-import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
-import { config } from '../config.js';
+import { canJoinVoiceChannel } from '../utils/permissions.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, getInteractionLocale, replyEphemeral, scheduleDeleteReply } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('JoinCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('join')
-    .setDescription('Rejoint le canal vocal')
+    .setDescription('Join the voice channel')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Rejoint le canal vocal', 'Join the voice channel'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-            flags: MessageFlags.Ephemeral,
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-
+    const locale = await getInteractionLocale(interaction);
     log.debug(`Commande join par ${member.user.tag}`);
 
-    // Vérification permissions
-    if (!(await canUseBot(member))) {
-        await interaction.reply({
-            content: '❌ Vous n\'avez pas la permission d\'utiliser ce bot.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+    if (!(await ensureCanUseBot(interaction, member))) {
         return;
     }
 
     const settings = await guildSettingsManager.getSettings(interaction.guildId!);
-
-    // Déterminer le channel à rejoindre
-    let targetChannel = null;
+    let targetChannel: VoiceChannel | StageChannel | null = null;
 
     if (settings.preferredVoiceChannel) {
         const preferredChannel = member.guild.channels.cache.get(settings.preferredVoiceChannel);
-        if (preferredChannel && (preferredChannel.isVoiceBased())) {
-            targetChannel = preferredChannel;
-            log.debug(`Utilisation du preferred channel: ${preferredChannel.name}`);
+        if (preferredChannel?.isVoiceBased()) {
+            targetChannel = preferredChannel as VoiceChannel | StageChannel;
         } else {
             log.warn(`Preferred channel ${settings.preferredVoiceChannel} introuvable ou invalide`);
         }
     }
 
     if (!targetChannel) {
-        const voiceChannel = member.voice.channel;
-        if (!voiceChannel) {
-            await interaction.reply({
-                content: '❌ Vous devez être dans un canal vocal ou configurer un canal préféré.',
-                flags: MessageFlags.Ephemeral,
-            });
-            deleteEphemeralAfterDelay(interaction);
+        if (!member.voice.channel) {
+            await replyEphemeral(interaction, `❌ ${t(locale, 'join.requirePreferredOrVoice')}`);
             return;
         }
-        targetChannel = voiceChannel;
+        targetChannel = member.voice.channel as VoiceChannel | StageChannel;
     }
 
-    // Vérifier si le channel est autorisé
     if (!(await canJoinVoiceChannel(targetChannel, interaction.guildId!))) {
-        await interaction.reply({
-            content: `❌ Je n'ai pas l'autorisation de rejoindre <#${targetChannel.id}>.`,
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${targetChannel.id}>` })}`);
         return;
     }
 
-    // Vérifier si déjà connecté
     const existingQueue = queueManager.getQueue(interaction.guildId!);
-    if (existingQueue && existingQueue.connection) {
-        await interaction.reply({
-            content: `✅ Déjà connecté à <#${existingQueue.voiceChannel.id}>.`,
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+    if (existingQueue?.connection && existingQueue.connection.state.status === 'ready') {
+        await replyEphemeral(interaction, `✅ ${t(locale, 'join.alreadyConnected', { channel: `<#${existingQueue.voiceChannel.id}>` })}`);
         return;
     }
 
-    // Créer la queue sans piste
     const queue = queueManager.createQueue(
         interaction.guildId!,
         interaction.channel as any,
@@ -94,38 +68,21 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     try {
         const connection = await queueManager.joinChannel(queue);
         if (!connection) {
-            await interaction.reply({
-                content: '❌ Impossible de rejoindre le canal vocal.',
-                flags: MessageFlags.Ephemeral,
-            });
-            deleteEphemeralAfterDelay(interaction);
+            await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinFailed')}`);
             queueManager.deleteQueue(interaction.guildId!);
             return;
         }
 
         log.info(`Bot rejoint le canal: ${targetChannel.name}`);
         await interaction.reply({
-            content: `✅ Connecté à <#${targetChannel.id}>.`,
-            flags: MessageFlags.Ephemeral,
+            content: `✅ ${t(locale, 'join.connected', { channel: `<#${targetChannel.id}>` })}`,
+            flags: 64,
+            allowedMentions: { parse: [] },
         });
-        deleteEphemeralAfterDelay(interaction);
+        scheduleDeleteReply(interaction);
     } catch (error) {
         log.error('Erreur lors de la connexion:', error);
-        await interaction.reply({
-            content: '❌ Erreur lors de la connexion au canal vocal.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinFailed')}`);
         queueManager.deleteQueue(interaction.guildId!);
     }
-}
-
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch {
-            // Ignorer
-        }
-    }, config.audio.ephemeralInfoDeleteDelay);
 }

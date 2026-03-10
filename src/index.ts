@@ -14,6 +14,7 @@
     StringSelectMenuInteraction,
     Routes,
 } from 'discord.js';
+import dns from 'node:dns';
 import { config } from './config.js';
 import { commands } from './commands/index.js';
 import { queueManager } from './services/QueueManager.js';
@@ -24,6 +25,7 @@ import { handleLyricsDelete } from './utils/lyrics.js';
 import { canJoinVoiceChannel, canManageSettings } from './utils/permissions.js';
 import {
     buildSettingsMessage,
+    buildLocalePrompt,
     buildSettingsModal,
     buildPreferredChannelPrompt,
     buildRolesPrompt,
@@ -39,12 +41,29 @@ import {
 import { logger } from './utils/Logger.js';
 import { acquireProcessLock } from './utils/processLock.js';
 import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
+import { resolveLocale, t } from './utils/i18n.js';
 import fs from 'fs';
 import { join } from 'path';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
 const log = logger.createModuleLogger('Main');
+
+if (typeof dns.setDefaultResultOrder === 'function') {
+    dns.setDefaultResultOrder('ipv4first');
+}
+
+function isSupportedNodeRuntime(version: string): boolean {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version);
+    if (!match) {
+        return false;
+    }
+
+    const major = Number.parseInt(match[1], 10);
+    const minor = Number.parseInt(match[2], 10);
+
+    return major > 22 || (major === 22 && minor >= 12);
+}
 
 type SettingsPromptInteraction =
     | ButtonInteraction
@@ -186,6 +205,19 @@ const client = new Client({
 });
 
 log.info('Client Discord créé');
+log.info(`Node runtime: ${process.version}`);
+if (typeof dns.getDefaultResultOrder === 'function') {
+    log.info(`DNS result order: ${dns.getDefaultResultOrder()}`);
+}
+if (!isSupportedNodeRuntime(process.version)) {
+    const message = 'Node 22.12.0+ est requis pour @discordjs/voice 0.19.x et DAVE. Mettez a jour le runtime du bot.';
+    if (config.nodeEnv === 'test') {
+        log.warn(message);
+    } else {
+        log.error(message);
+        process.exit(1);
+    }
+}
 
 // Status amusants pour quand le bot n'écoute rien
 const idleStatuses = [
@@ -232,11 +264,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     log.info(`Bot connecté en tant que ${readyClient.user.tag}`);
     log.info(`Présent sur ${readyClient.guilds.cache.size} serveur(s)`);
 
-    // Afficher le lien d'invitation
-    console.log('');
-    console.log('🔗 Lien d\'invitation du bot:');
-    console.log(`   ${getInviteLink()}`);
-    console.log('');
+    log.info(`Lien d'invitation du bot: ${getInviteLink()}`);
 
     // Lister les serveurs
     log.debug('Serveurs connectés:');
@@ -364,12 +392,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         // Essayer de répondre à l'interaction si possible
         if (interaction.isRepliable()) {
-            const errorMessage = '❌ Une erreur est survenue lors de l\'exécution de cette commande.';
+            const locale = await resolveLocale(interaction.guildId, 'locale' in interaction ? interaction.locale : null);
+            const errorMessage = `❌ ${t(locale, 'error.generic')}`;
             try {
                 if (interaction.deferred || interaction.replied) {
-                    await interaction.followUp({ content: errorMessage, flags: MessageFlags.Ephemeral });
+                    await interaction.followUp({
+                        content: errorMessage,
+                        flags: MessageFlags.Ephemeral,
+                        allowedMentions: { parse: [] },
+                    });
                 } else {
-                    await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral });
+                    await interaction.reply({
+                        content: errorMessage,
+                        flags: MessageFlags.Ephemeral,
+                        allowedMentions: { parse: [] },
+                    });
                 }
             } catch (e) {
                 if (!isKnownInteractionResponseError(e)) {
@@ -387,6 +424,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
         oldChannel: oldState.channelId,
         newChannel: newState.channelId,
     });
+    queueManager.handleVoiceStateChange(oldState, newState);
 });
 
 // Mettre à jour le status quand une musique joue
@@ -435,9 +473,11 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
 
     const member = interaction.member as GuildMember;
     if (!(await canManageSettings(member))) {
+        const locale = await resolveLocale(interaction.guildId, interaction.locale);
         await interaction.reply({
-            content: '❌ Vous devez être administrateur pour modifier les paramètres.',
+            content: `❌ ${t(locale, 'error.manageSettings')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
@@ -451,8 +491,9 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
         });
         await updateSettingsMessage(interaction, prompt.messageId, updated);
         await interaction.update({
-            content: '✅ Canal préféré supprimé.',
+            content: `✅ ${t(updated.locale, 'settings.updatedPreferred')}`,
             components: interaction.message.components,
+            allowedMentions: { parse: [] },
         });
         if (interaction.message?.id) {
             refreshSettingsPrompt(interaction, interaction.message.id);
@@ -480,8 +521,9 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
         await updateSettingsMessage(interaction, prompt.messageId, updated);
         const refreshed = buildRolesPrompt(updated, prompt.messageId, interaction.guild?.roles.cache, prompt.page ?? 0);
         await interaction.update({
-            content: `✅ Liste des rôles vidée.\n${refreshed.content}`,
+            content: `✅ ${t(updated.locale, 'settings.updatedRolesCleared')}\n${refreshed.content}`,
             components: refreshed.components,
+            allowedMentions: { parse: [] },
         });
         if (interaction.message?.id) {
             refreshSettingsPrompt(interaction, interaction.message.id);
@@ -490,7 +532,7 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
     }
     if (prompt?.id === SETTINGS_SELECT_IDS.rolesAdd) {
         if (interaction.message?.id) {
-            await interaction.showModal(buildRolesAddModal(interaction.message.id));
+            await interaction.showModal(buildRolesAddModal(interaction.message.id, settings.locale));
             refreshSettingsPrompt(interaction, interaction.message.id);
         }
         return;
@@ -534,10 +576,17 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
             return;
         }
         case SETTINGS_BUTTON_IDS.locale: {
-            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
-                locale: settings.locale === 'fr' ? 'en' : 'fr',
-            });
-            await interaction.update(buildSettingsMessage(updated));
+            if (interaction.message?.id) {
+                const promptMessage = buildLocalePrompt(settings, interaction.message.id);
+                await interaction.reply({
+                    ...promptMessage,
+                    flags: MessageFlags.Ephemeral,
+                    allowedMentions: { parse: [] },
+                });
+                const promptReply = await interaction.fetchReply().catch(() => null);
+                const promptId = promptReply?.id ?? interaction.id;
+                registerSettingsPrompt(interaction, promptId);
+            }
             return;
         }
         case SETTINGS_BUTTON_IDS.stay: {
@@ -578,12 +627,16 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
 
     const member = interaction.member as GuildMember;
     if (!(await canManageSettings(member))) {
+        const locale = await resolveLocale(interaction.guildId, interaction.locale);
         await interaction.reply({
-            content: '❌ Vous devez être administrateur pour modifier les paramètres.',
+            content: `❌ ${t(locale, 'error.manageSettings')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
+
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     const parsed = parseSettingsModalId(interaction.customId);
     if (!parsed || parsed.kind !== 'volume') return;
@@ -592,8 +645,9 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
     const value = Number.parseInt(raw, 10);
     if (!Number.isFinite(value) || value < 0 || value > 200) {
         await interaction.reply({
-            content: '❌ Volume invalide (0-200).',
+            content: `❌ ${t(locale, 'error.invalidVolume')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
@@ -602,8 +656,9 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
     queueManager.setVolume(interaction.guildId, value);
     await updateSettingsMessage(interaction, parsed.messageId, updated);
     await interaction.reply({
-        content: '✅ Paramètres mis à jour.',
+        content: `✅ ${t(updated.locale, 'common.updated')}`,
         flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
     });
 }
 
@@ -614,9 +669,11 @@ async function handleSettingsSelect(
 
     const member = interaction.member as GuildMember;
     if (!(await canManageSettings(member))) {
+        const locale = await resolveLocale(interaction.guildId, interaction.locale);
         await interaction.reply({
-            content: '❌ Vous devez être administrateur pour modifier les paramètres.',
+            content: `❌ ${t(locale, 'error.manageSettings')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
@@ -629,6 +686,17 @@ async function handleSettingsSelect(
     let preferredMoveError: string | null = null;
 
     switch (parsed.id) {
+        case SETTINGS_SELECT_IDS.localeSelect: {
+            if (!interaction.isStringSelectMenu()) return;
+            const selectedLocale = interaction.values[0];
+            if (selectedLocale !== 'fr' && selectedLocale !== 'en') {
+                return;
+            }
+            updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                locale: selectedLocale,
+            });
+            break;
+        }
         case SETTINGS_SELECT_IDS.preferredSelect: {
             if (!interaction.isChannelSelectMenu()) return;
             const channelId = interaction.values[0];
@@ -644,14 +712,14 @@ async function handleSettingsSelect(
                         if (await canJoinVoiceChannel(preferredChannel, interaction.guildId)) {
                             const moved = await queueManager.moveToChannel(queue, preferredChannel);
                             if (!moved) {
-                                preferredMoveError = '❌ Impossible de déplacer le bot vers le canal préféré.';
+                                preferredMoveError = `❌ ${t(settings.locale, 'settings.preferredMoveFailed')}`;
                             }
                         } else {
-                            preferredMoveError = `❌ Je n'ai pas l'autorisation de rejoindre <#${preferredChannel.id}>.`;
+                            preferredMoveError = `❌ ${t(settings.locale, 'error.voiceJoinDenied', { channel: `<#${preferredChannel.id}>` })}`;
                         }
                     }
                 } else {
-                    preferredMoveError = '❌ Canal préféré introuvable ou invalide.';
+                    preferredMoveError = `❌ ${t(settings.locale, 'settings.preferredInvalid')}`;
                 }
             }
             break;
@@ -770,7 +838,9 @@ async function handleSettingsSelect(
     await updateSettingsMessage(interaction, parsed.messageId, updated);
 
     let prompt;
-    if (parsed.id === SETTINGS_SELECT_IDS.preferredSelect || parsed.id === SETTINGS_SELECT_IDS.preferredClear) {
+    if (parsed.id === SETTINGS_SELECT_IDS.localeSelect) {
+        prompt = buildLocalePrompt(updated, parsed.messageId);
+    } else if (parsed.id === SETTINGS_SELECT_IDS.preferredSelect || parsed.id === SETTINGS_SELECT_IDS.preferredClear) {
         prompt = buildPreferredChannelPrompt(updated, parsed.messageId);
     } else if (parsed.id === SETTINGS_SELECT_IDS.voiceMode || parsed.id === SETTINGS_SELECT_IDS.voiceList) {
         prompt = buildVoiceChannelsPrompt(updated, parsed.messageId);
@@ -779,13 +849,15 @@ async function handleSettingsSelect(
     }
 
     await interaction.update({
-        content: `✅ Paramètres mis à jour.\n${prompt.content}`,
+        content: `✅ ${t(updated.locale, 'common.updated')}\n${prompt.content}`,
         components: prompt.components,
+        allowedMentions: { parse: [] },
     });
     if (preferredMoveError) {
         await interaction.followUp({
             content: preferredMoveError,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
     }
     if (interaction.message?.id) {
@@ -799,15 +871,18 @@ async function handleRolesAddModal(interaction: ModalSubmitInteraction): Promise
 
     const member = interaction.member as GuildMember;
     if (!(await canManageSettings(member))) {
+        const locale = await resolveLocale(interaction.guildId, interaction.locale);
         await interaction.reply({
-            content: '❌ Vous devez être administrateur pour modifier les paramètres.',
+            content: `❌ ${t(locale, 'error.manageSettings')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
 
     const messageId = parseRolesAddModalId(interaction.customId);
     if (!messageId) return;
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     const raw = interaction.fields.getTextInputValue('roles');
     const tokens = raw
@@ -819,8 +894,9 @@ async function handleRolesAddModal(interaction: ModalSubmitInteraction): Promise
     const guildRoles = interaction.guild?.roles.cache;
     if (!guildRoles) {
         await interaction.reply({
-            content: '❌ Impossible de lire les rôles du serveur.',
+            content: `❌ ${t(locale, 'settings.roleReadFailed')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
@@ -840,8 +916,9 @@ async function handleRolesAddModal(interaction: ModalSubmitInteraction): Promise
 
         if (matches.size > 1) {
             await interaction.reply({
-                content: `❌ Plusieurs rôles correspondent à "${token}". Utilise une mention ou l'ID.` ,
+                content: `❌ ${t(locale, 'settings.roleAmbiguous', { value: token })}`,
                 flags: MessageFlags.Ephemeral,
+                allowedMentions: { parse: [] },
             });
             return;
         }
@@ -853,16 +930,18 @@ async function handleRolesAddModal(interaction: ModalSubmitInteraction): Promise
         }
 
         await interaction.reply({
-            content: `❌ Rôle introuvable: "${token}".`,
+            content: `❌ ${t(locale, 'settings.roleNotFound', { value: token })}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
 
     if (roleIds.size === 0) {
         await interaction.reply({
-            content: '❌ Aucun rôle valide trouvé.',
+            content: `❌ ${t(locale, 'settings.noValidRole')}`,
             flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
         });
         return;
     }
@@ -885,9 +964,10 @@ async function handleRolesAddModal(interaction: ModalSubmitInteraction): Promise
     await updateSettingsMessage(interaction, messageId, updated);
     const prompt = buildRolesPrompt(updated, messageId, interaction.guild?.roles.cache);
     await interaction.reply({
-        content: `✅ Rôle(s) ajouté(s).\n${prompt.content}`,
+        content: `✅ ${t(updated.locale, 'settings.rolesAdded')}\n${prompt.content}`,
         components: prompt.components,
         flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
     });
     const promptReply = await interaction.fetchReply().catch(() => null);
     const promptId = promptReply?.id ?? interaction.id;
@@ -1034,12 +1114,7 @@ process.on('SIGTERM', () => {
     void gracefulShutdown('SIGTERM');
 });
 
-// Afficher les dépendances requises
-console.log('');
-console.log('📦 Dépendances requises:');
-console.log('   - FFmpeg (https://ffmpeg.org/)');
-console.log('   - yt-dlp (https://github.com/yt-dlp/yt-dlp)');
-console.log('');
+log.info('Dependances requises: FFmpeg (https://ffmpeg.org/) et yt-dlp (https://github.com/yt-dlp/yt-dlp)');
 
 // Connexion du bot
 log.info('Démarrage du bot...');

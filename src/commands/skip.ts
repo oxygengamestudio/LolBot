@@ -1,90 +1,51 @@
-﻿import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
-import { config } from '../config.js';
+import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
+import { ensureCanUseBot, ensureSameVoiceChannel, ensureVoiceMembership, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
+import { safeContent } from '../utils/text.js';
 
 const log = logger.createModuleLogger('SkipCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('skip')
-    .setDescription('Passe à la musique suivante')
+    .setDescription('Skip the current track')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Passe a la musique suivante', 'Skip the current track'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
-        await interaction.reply({
-            content: '❌ Cette commande est disponible uniquement sur un serveur.',
-        });
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
         return;
     }
 
     const member = interaction.member as GuildMember;
-    const voiceChannel = member.voice.channel;
+    const locale = await getInteractionLocale(interaction);
 
     log.debug(`Commande skip par ${member.user.tag}`);
 
-    if (!voiceChannel) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans un canal vocal pour utiliser cette commande.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
-        return;
-    }
+    if (!(await ensureCanUseBot(interaction, member))) return;
+    if (!(await ensureVoiceMembership(interaction, member))) return;
 
     const queue = queueManager.getQueue(interaction.guildId!);
-
     if (!queue) {
-        await interaction.reply({
-            content: '❌ Aucune musique en cours de lecture.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.noQueue')}`);
+        return;
+    }
+    if (!(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) return;
+
+    const skippedTrack = safeContent(queue.currentTrack?.title ?? '');
+    const nextTrack = queue.tracks[0] ? safeContent(queue.tracks[0].title) : null;
+
+    log.info(`Skip: ${queue.currentTrack?.title}`);
+    if (!queueManager.skip(interaction.guildId!)) {
+        await replyEphemeral(interaction, `❌ ${t(locale, 'skip.failed')}`);
         return;
     }
 
-    if (queue.voiceChannel.id !== voiceChannel.id) {
-        await interaction.reply({
-            content: '❌ Vous devez être dans le même canal vocal que le bot.',
-            flags: MessageFlags.Ephemeral,
-        });
-        deleteEphemeralAfterDelay(interaction);
-        return;
-    }
-
-    const skippedTrack = queue.currentTrack?.title;
-    const nextTrack = queue.tracks[0];
-
-    log.info(`Skip: ${skippedTrack}`);
-    const success = queueManager.skip(interaction.guildId!);
-
-    if (success) {
-        let message = `⏭️ Piste passée: **${skippedTrack}**`;
-        if (nextTrack) {
-            message += `\n▶️ Prochaine piste: **${nextTrack.title}**`;
-        } else {
-            message += '\n📋 File d\'attente terminée.';
-        }
-        await interaction.reply({
-            content: message,
-            flags: MessageFlags.Ephemeral,
-        });
-    } else {
-        await interaction.reply({
-            content: '❌ Impossible de passer à la piste suivante.',
-            flags: MessageFlags.Ephemeral,
-        });
-    }
-    deleteEphemeralAfterDelay(interaction);
+    let message = `⏭️ ${t(locale, 'skip.success', { title: skippedTrack })}`;
+    message += nextTrack
+        ? `\n▶️ ${t(locale, 'skip.next', { title: nextTrack })}`
+        : `\n📋 ${t(locale, 'skip.empty')}`;
+    await replyEphemeral(interaction, message);
 }
-
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
-    setTimeout(async () => {
-        try {
-            await interaction.deleteReply();
-        } catch (error) {
-            // Ignorer
-        }
-    }, config.audio.ephemeralInfoDeleteDelay);
-}
-

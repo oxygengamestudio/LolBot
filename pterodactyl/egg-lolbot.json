@@ -1,0 +1,133 @@
+{
+  "_comment": "DO NOT EDIT: FILE GENERATED MANUALLY FOR LOLBOT PTERODACTYL DEPLOYMENT",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-03-10T17:25:57+00:00",
+  "name": "LolBot",
+  "author": "codex@openai.com",
+  "description": "Prebuilt Discord music bot image for Pterodactyl. Secrets are injected through panel variables and persistent data is stored under DATA_DIR.",
+  "features": null,
+  "docker_images": {
+    "luxxsy/lolbot-v1:latest": "luxxsy/lolbot-v1:latest",
+    "luxxsy/lolbot-v1:20260310-secure": "luxxsy/lolbot-v1:20260310-secure"
+  },
+  "file_denylist": [],
+  "startup": "mkdir -p \"$DATA_DIR\" && node /opt/lolbot/dist/index.js",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\":\"Bot connecté en tant que\"}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\nset -euo pipefail\nmkdir -p /mnt/server/data\nprintf 'LolBot is bundled inside the selected Docker image. No source download is required.\\n'",
+      "container": "debian:bookworm-slim",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "Discord Token",
+      "description": "Discord bot token.",
+      "env_variable": "DISCORD_TOKEN",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Discord Client ID",
+      "description": "Discord application client ID.",
+      "env_variable": "DISCORD_CLIENT_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:32",
+      "field_type": "text"
+    },
+    {
+      "name": "Discord Guild ID",
+      "description": "Optional guild ID for fast slash command registration.",
+      "env_variable": "DISCORD_GUILD_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:32",
+      "field_type": "text"
+    },
+    {
+      "name": "Command Scope",
+      "description": "Slash command scope: auto, guild, or global.",
+      "env_variable": "DISCORD_COMMAND_SCOPE",
+      "default_value": "auto",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:auto,guild,global",
+      "field_type": "text"
+    },
+    {
+      "name": "Bot Owner ID",
+      "description": "Optional Discord user ID with owner-level bypass.",
+      "env_variable": "BOT_OWNER_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:32",
+      "field_type": "text"
+    },
+    {
+      "name": "Google API Key",
+      "description": "YouTube Data API key.",
+      "env_variable": "GOOGLE_API_KEY",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Genius Client ID",
+      "description": "Optional Genius OAuth client ID.",
+      "env_variable": "GENIUS_CLIENT_ID",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:255",
+      "field_type": "text"
+    },
+    {
+      "name": "Genius Client Secret",
+      "description": "Optional Genius OAuth client secret.",
+      "env_variable": "GENIUS_CLIENT_SECRET",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:255",
+      "field_type": "text"
+    },
+    {
+      "name": "Data Directory",
+      "description": "Persistent data directory inside the Pterodactyl volume.",
+      "env_variable": "DATA_DIR",
+      "default_value": "/home/container/data",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:255",
+      "field_type": "text"
+    },
+    {
+      "name": "Log Level",
+      "description": "Log verbosity.",
+      "env_variable": "LOG_LEVEL",
+      "default_value": "INFO",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:NONE,ERROR,WARN,INFO,DEBUG,TRACE",
+      "field_type": "text"
+    }
+  ]
+}
