@@ -8,12 +8,10 @@
   "name": "LolBot",
   "author": "codex@openai.com",
   "description": "Prebuilt Discord music bot image for Pterodactyl. Secrets are injected through panel variables and persistent data is stored under DATA_DIR.",
-  "features": null,
+  "features": [],
   "docker_images": {
-    "luxxsy/lolbot-v1:latest": "luxxsy/lolbot-v1:latest",
-    "luxxsy/lolbot-v1:20260310-secure": "luxxsy/lolbot-v1:20260310-secure"
+    "ghcr.io/oxygengamestudio/lolbot:preprod": "ghcr.io/oxygengamestudio/lolbot:preprod"
   },
-  "file_denylist": [],
   "startup": "mkdir -p \"$DATA_DIR\" && node /opt/lolbot/dist/index.js",
   "config": {
     "files": "{}",
@@ -81,12 +79,12 @@
     },
     {
       "name": "Google API Key",
-      "description": "YouTube Data API key.",
+      "description": "Optional YouTube Data API key. If empty or quota-limited, the bot falls back to yt-dlp.",
       "env_variable": "GOOGLE_API_KEY",
       "default_value": "",
       "user_viewable": true,
       "user_editable": true,
-      "rules": "required|string|max:200",
+      "rules": "nullable|string|max:4096",
       "field_type": "text"
     },
     {

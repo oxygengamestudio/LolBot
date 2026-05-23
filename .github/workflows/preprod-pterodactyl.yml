@@ -1,0 +1,112 @@
+name: Preprod Docker Pterodactyl
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: lolbot-preprod-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck, test, and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: |
+          if compgen -G "test/*.test.ts" > /dev/null; then
+            npm test
+          else
+            echo "No test/*.test.ts files found. Skipping tests."
+          fi
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: Build and push GHCR image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image }}:preprod
+            ${{ steps.image.outputs.image }}:${{ github.sha }}
+
+  restart:
+    name: Restart Pterodactyl preprod
+    runs-on: ubuntu-latest
+    needs: docker
+
+    steps:
+      - name: Restart server through Pterodactyl API
+        env:
+          PTERO_URL: ${{ secrets.PTERO_URL }}
+          PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
+          PTERO_SERVER_ID: ${{ secrets.PTERO_SERVER_ID }}
+        run: |
+          if [ -z "$PTERO_SERVER_ID" ]; then
+            echo "PTERO_SERVER_ID is not set. Skipping Pterodactyl restart."
+            exit 0
+          fi
+
+          test -n "$PTERO_URL"
+          test -n "$PTERO_CLIENT_API_KEY"
+          server_identifier="${PTERO_SERVER_ID%%-*}"
+
+          curl --fail-with-body \
+            --request POST \
+            "${PTERO_URL%/}/api/client/servers/${server_identifier}/power" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --header "Content-Type: application/json" \
+            --data '{"signal":"restart"}'

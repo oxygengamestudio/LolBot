@@ -8,6 +8,8 @@ dist/
 .env
 .env.*
 .env.local
+.env.preprod
+.env.preprod.local
 .env.*.local
 !.env.example
 .envrc

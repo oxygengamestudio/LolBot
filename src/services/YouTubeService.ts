@@ -1,6 +1,9 @@
 import { config } from '../config.js';
 import type { PlaylistInfo, SearchResult, Track, YouTubeVideoInfo } from '../types/index.js';
 import { httpRequest } from '../utils/httpClient.js';
+import { spawn } from 'child_process';
+import { existsSync } from 'fs';
+import { join } from 'path';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 
@@ -52,6 +55,19 @@ export class YouTubeService {
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
 
     async search(query: string, maxResults = 10): Promise<SearchResult[]> {
+        if (!this.apiKey) {
+            return this.searchWithYtdlp(query, maxResults);
+        }
+
+        try {
+            return await this.searchWithGoogle(query, maxResults);
+        } catch (error) {
+            console.warn('YouTube Data API search failed, falling back to yt-dlp:', this.formatError(error));
+            return this.searchWithYtdlp(query, maxResults);
+        }
+    }
+
+    private async searchWithGoogle(query: string, maxResults = 10): Promise<SearchResult[]> {
         const effectiveMaxResults = Math.max(1, Math.min(maxResults, 25));
         const expandedMaxResults = Math.max(effectiveMaxResults, Math.min(effectiveMaxResults * 3, 25));
         const params = new URLSearchParams({
@@ -59,7 +75,7 @@ export class YouTubeService {
             q: this.buildSearchQuery(query),
             type: 'video',
             maxResults: expandedMaxResults.toString(),
-            key: this.apiKey,
+            key: this.apiKey!,
             videoCategoryId: '10',
         });
 
@@ -81,7 +97,7 @@ export class YouTubeService {
         const detailsParams = new URLSearchParams({
             part: 'contentDetails,snippet',
             id: videoIds,
-            key: this.apiKey,
+            key: this.apiKey!,
         });
         const detailsUrl = `${YOUTUBE_API_BASE}/videos?${detailsParams.toString()}`;
         const detailsData = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(detailsUrl);
@@ -137,10 +153,23 @@ export class YouTubeService {
     }
 
     async getVideoInfo(videoId: string): Promise<YouTubeVideoInfo | null> {
+        if (!this.apiKey) {
+            return this.getVideoInfoWithYtdlp(videoId);
+        }
+
+        try {
+            return await this.getVideoInfoWithGoogle(videoId);
+        } catch (error) {
+            console.warn('YouTube Data API video lookup failed, falling back to yt-dlp:', this.formatError(error));
+            return this.getVideoInfoWithYtdlp(videoId);
+        }
+    }
+
+    private async getVideoInfoWithGoogle(videoId: string): Promise<YouTubeVideoInfo | null> {
         const params = new URLSearchParams({
             part: 'snippet,contentDetails',
             id: videoId,
-            key: this.apiKey,
+            key: this.apiKey!,
         });
 
         const url = `${YOUTUBE_API_BASE}/videos?${params.toString()}`;
@@ -159,10 +188,27 @@ export class YouTubeService {
     }
 
     async getPlaylistTracks(playlistId: string, requestedBy: string, requestedById: string): Promise<PlaylistInfo | null> {
+        if (!this.apiKey) {
+            return this.getPlaylistTracksWithYtdlp(playlistId, requestedBy, requestedById);
+        }
+
+        try {
+            return await this.getPlaylistTracksWithGoogle(playlistId, requestedBy, requestedById);
+        } catch (error) {
+            console.warn('YouTube Data API playlist lookup failed, falling back to yt-dlp:', this.formatError(error));
+            return this.getPlaylistTracksWithYtdlp(playlistId, requestedBy, requestedById);
+        }
+    }
+
+    private async getPlaylistTracksWithGoogle(
+        playlistId: string,
+        requestedBy: string,
+        requestedById: string
+    ): Promise<PlaylistInfo | null> {
         const playlistParams = new URLSearchParams({
             part: 'snippet',
             id: playlistId,
-            key: this.apiKey,
+            key: this.apiKey!,
         });
         const playlistUrl = `${YOUTUBE_API_BASE}/playlists?${playlistParams.toString()}`;
         const playlistData = await this.fetchJson<YouTubeListResponse<{ snippet?: { title?: string } }>>(playlistUrl);
@@ -175,7 +221,7 @@ export class YouTubeService {
             part: 'snippet',
             playlistId,
             maxResults: config.audio.maxPlaylistTracks.toString(),
-            key: this.apiKey,
+            key: this.apiKey!,
         });
         const itemsUrl = `${YOUTUBE_API_BASE}/playlistItems?${itemsParams.toString()}`;
         const itemsData = await this.fetchJson<YouTubeListResponse<PlaylistItemApi>>(itemsUrl);
@@ -194,7 +240,7 @@ export class YouTubeService {
         const detailsParams = new URLSearchParams({
             part: 'contentDetails',
             id: videoIds.join(','),
-            key: this.apiKey,
+            key: this.apiKey!,
         });
         const detailsUrl = `${YOUTUBE_API_BASE}/videos?${detailsParams.toString()}`;
         const detailsData = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(detailsUrl);
@@ -227,6 +273,124 @@ export class YouTubeService {
             title: this.decodeHtmlEntities(playlist.snippet.title),
             itemCount: tracks.length,
             tracks,
+        };
+    }
+
+    private async searchWithYtdlp(query: string, maxResults: number): Promise<SearchResult[]> {
+        try {
+            const payload = await this.runYtdlpJson([
+                '--no-warnings',
+                '--skip-download',
+                '--flat-playlist',
+                '--dump-single-json',
+                `ytsearch${Math.max(1, maxResults)}:${query}`,
+            ]);
+
+            const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+            return entries
+                .map((entry: any) => this.searchResultFromYtdlpEntry(entry))
+                .filter((entry: SearchResult | null): entry is SearchResult => entry !== null)
+                .slice(0, maxResults);
+        } catch (error) {
+            console.warn('yt-dlp search fallback failed:', this.formatError(error));
+            return [];
+        }
+    }
+
+    private async getVideoInfoWithYtdlp(videoId: string): Promise<YouTubeVideoInfo | null> {
+        try {
+            const payload = await this.runYtdlpJson([
+                '--no-warnings',
+                '--skip-download',
+                '--no-playlist',
+                '--dump-single-json',
+                `https://www.youtube.com/watch?v=${videoId}`,
+            ]);
+
+            const id = this.normalizeVideoId(payload?.id ?? videoId);
+            if (!id) {
+                return null;
+            }
+
+            return {
+                id,
+                title: this.decodeHtmlEntities(String(payload?.title ?? id)),
+                duration: this.coerceDurationSeconds(payload?.duration),
+                thumbnail: this.getYtdlpThumbnail(payload),
+            };
+        } catch (error) {
+            console.warn('yt-dlp video lookup fallback failed:', this.formatError(error));
+            return null;
+        }
+    }
+
+    private async getPlaylistTracksWithYtdlp(
+        playlistId: string,
+        requestedBy: string,
+        requestedById: string
+    ): Promise<PlaylistInfo | null> {
+        try {
+            const payload = await this.runYtdlpJson([
+                '--no-warnings',
+                '--skip-download',
+                '--flat-playlist',
+                '--playlist-end',
+                config.audio.maxPlaylistTracks.toString(),
+                '--dump-single-json',
+                `https://www.youtube.com/playlist?list=${playlistId}`,
+            ]);
+
+            const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+            const tracks: Track[] = entries
+                .map((entry: any) => this.trackFromYtdlpEntry(entry, requestedBy, requestedById))
+                .filter((track: Track | null): track is Track => track !== null)
+                .slice(0, config.audio.maxPlaylistTracks);
+
+            if (tracks.length === 0) {
+                return null;
+            }
+
+            return {
+                id: playlistId,
+                title: this.decodeHtmlEntities(String(payload?.title ?? playlistId)),
+                itemCount: tracks.length,
+                tracks,
+            };
+        } catch (error) {
+            console.warn('yt-dlp playlist fallback failed:', this.formatError(error));
+            return null;
+        }
+    }
+
+    private searchResultFromYtdlpEntry(entry: any): SearchResult | null {
+        const id = this.normalizeVideoId(entry?.id ?? entry?.url);
+        if (!id) {
+            return null;
+        }
+
+        return {
+            id,
+            title: this.decodeHtmlEntities(String(entry?.title ?? id)),
+            duration: this.formatDurationFromSeconds(this.coerceDurationSeconds(entry?.duration)),
+            thumbnail: this.getYtdlpThumbnail(entry),
+            channelTitle: String(entry?.channel ?? entry?.uploader ?? ''),
+        };
+    }
+
+    private trackFromYtdlpEntry(entry: any, requestedBy: string, requestedById: string): Track | null {
+        const id = this.normalizeVideoId(entry?.id ?? entry?.url);
+        if (!id) {
+            return null;
+        }
+
+        return {
+            id,
+            title: this.decodeHtmlEntities(String(entry?.title ?? id)),
+            url: `https://www.youtube.com/watch?v=${id}`,
+            duration: this.coerceDurationSeconds(entry?.duration),
+            thumbnail: this.getYtdlpThumbnail(entry),
+            requestedBy,
+            requestedById,
         };
     }
 
@@ -298,6 +462,117 @@ export class YouTubeService {
     private looksLikeVerticalClipTitle(title: string): boolean {
         const normalized = this.normalizeSearchText(title);
         return /\b(short|clip|edit|meme|status)\b/i.test(normalized);
+    }
+
+    private getYtdlpPath(): string {
+        const envYtdlp = process.env.YTDLP_PATH;
+        if (envYtdlp) {
+            return envYtdlp;
+        }
+
+        const localYtdlpPath = join(config.paths.data, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+        return existsSync(localYtdlpPath) ? localYtdlpPath : 'yt-dlp';
+    }
+
+    private runYtdlpJson(args: string[]): Promise<any> {
+        return this.runYtdlpText(args).then((payload) => {
+            const trimmed = payload.trim();
+            if (!trimmed) {
+                throw new Error('yt-dlp returned no JSON payload');
+            }
+
+            try {
+                return JSON.parse(trimmed);
+            } catch {
+                throw new Error('yt-dlp returned invalid JSON');
+            }
+        });
+    }
+
+    private runYtdlpText(args: string[]): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const ytdlp = spawn(this.getYtdlpPath(), args, {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                windowsHide: true,
+            });
+
+            let stdout = '';
+            let stderr = '';
+
+            ytdlp.stdout?.on('data', (data) => {
+                stdout += data.toString();
+            });
+
+            ytdlp.stderr?.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            ytdlp.on('error', reject);
+            ytdlp.on('close', (code) => {
+                if (code !== 0) {
+                    reject(new Error(`yt-dlp exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
+                    return;
+                }
+
+                resolve(stdout);
+            });
+        });
+    }
+
+    private normalizeVideoId(value: unknown): string | null {
+        if (typeof value !== 'string') {
+            return null;
+        }
+
+        const extracted = this.extractVideoId(value);
+        if (extracted) {
+            return extracted;
+        }
+
+        return /^[\w-]{11}$/.test(value) ? value : null;
+    }
+
+    private coerceDurationSeconds(value: unknown): number {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return Math.max(0, Math.floor(value));
+        }
+
+        if (typeof value === 'string') {
+            const parsed = Number.parseFloat(value);
+            if (Number.isFinite(parsed)) {
+                return Math.max(0, Math.floor(parsed));
+            }
+        }
+
+        return 0;
+    }
+
+    private formatDurationFromSeconds(totalSeconds: number): string {
+        const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+        const hours = Math.floor(safeSeconds / 3600);
+        const minutes = Math.floor((safeSeconds % 3600) / 60);
+        const seconds = safeSeconds % 60;
+
+        if (hours > 0) {
+            return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+
+    private getYtdlpThumbnail(entry: any): string {
+        if (typeof entry?.thumbnail === 'string') {
+            return entry.thumbnail;
+        }
+
+        if (Array.isArray(entry?.thumbnails) && entry.thumbnails.length > 0) {
+            const thumbnail = entry.thumbnails
+                .filter((candidate: any) => typeof candidate?.url === 'string')
+                .sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0];
+            return thumbnail?.url ?? '';
+        }
+
+        return '';
     }
 
     private parseDuration(duration: string): string {
@@ -381,6 +656,14 @@ export class YouTubeService {
         });
 
         return JSON.parse(response.body as string) as T;
+    }
+
+    private formatError(error: unknown): string {
+        if (error instanceof Error) {
+            return error.message;
+        }
+
+        return String(error);
     }
 }
 

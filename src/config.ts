@@ -2,7 +2,11 @@ import { config as dotenvConfig } from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, isAbsolute, join } from 'path';
 
-dotenvConfig();
+if (process.env.BOT_ENV_FILE) {
+    dotenvConfig({ path: process.env.BOT_ENV_FILE, override: false });
+}
+
+dotenvConfig({ override: false });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -20,7 +24,7 @@ export interface AppConfig {
         commandScope: CommandScope;
     };
     youtube: {
-        apiKey: string;
+        apiKey?: string;
     };
     genius: {
         accessToken?: string;
@@ -166,7 +170,7 @@ const discordToken = getRequiredEnv('DISCORD_TOKEN');
 const discordClientId = getRequiredEnv('DISCORD_CLIENT_ID', ['CLIENT_ID']);
 const discordGuildId = getOptionalEnv('DISCORD_GUILD_ID', ['GUILD_ID']);
 const discordCommandScope = normalizeCommandScope();
-const googleApiKey = getRequiredEnv('GOOGLE_API_KEY', ['YOUTUBE_API_KEY']);
+const googleApiKey = getOptionalEnv('GOOGLE_API_KEY', ['YOUTUBE_API_KEY']);
 const dataPath = resolvePathEnv('DATA_DIR', join(rootPath, 'data'));
 const cachePath = resolvePathEnv('CACHE_DIR', join(dataPath, 'cache'));
 const guildsPath = resolvePathEnv('GUILDS_DIR', join(dataPath, 'guild'));

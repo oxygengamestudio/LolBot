@@ -1,9 +1,6 @@
 name: Production
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
@@ -12,25 +9,29 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate repository variable
+      - name: Resolve image name
+        id: image
         run: |
-          if [ -z "${{ vars.DOCKER_IMAGE }}" ]; then
-            echo "Repository variable DOCKER_IMAGE is required"
-            exit 1
+          image="${{ vars.DOCKER_IMAGE }}"
+          if [ -z "$image" ]; then
+            image="ghcr.io/${GITHUB_REPOSITORY,,}"
           fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -38,8 +39,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ vars.DOCKER_IMAGE }}:latest
-            ${{ vars.DOCKER_IMAGE }}:${{ github.sha }}
+            ${{ steps.image.outputs.image }}:latest
+            ${{ steps.image.outputs.image }}:${{ github.sha }}
 
   deploy_prod:
     name: Deploy to Production VPS

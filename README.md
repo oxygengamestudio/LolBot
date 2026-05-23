@@ -21,7 +21,7 @@ Use `.env.example` as template for local and preprod runs.
 | `DISCORD_GUILD_ID` | No | Test guild ID for instant slash command sync. |
 | `DISCORD_COMMAND_SCOPE` | No | Slash registration scope: `auto` (default), `guild`, or `global`. |
 | `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. No owner is hardcoded in the image. |
-| `GOOGLE_API_KEY` | Yes | Google/YouTube API key. |
+| `GOOGLE_API_KEY` | No | Optional Google/YouTube API key. If missing or quota-limited, the bot falls back to `yt-dlp`. |
 | `GENIUS_CLIENT_ID` | No | Genius OAuth client ID. |
 | `GENIUS_CLIENT_SECRET` | No | Genius OAuth client secret. |
 | `DATA_DIR` | No | Base path for persistent bot data. Default: `./data` locally, `/home/container/data` in Pterodactyl. |
@@ -43,6 +43,16 @@ Scope behavior:
 
 When a fallback is used, the app logs a deprecation warning.
 
+## Local Preprod on Windows
+
+Create `.env.preprod.local` from `.env.example`, fill the preprod Discord values locally, then run:
+
+```bat
+run-local-preprod.bat
+```
+
+The script checks Node.js/npm, installs dependencies when `node_modules` is missing, sets `BOT_ENV_FILE=.env.preprod.local`, and chooses the best startup command from `package.json`.
+
 ## Preprod Start (without GitHub)
 
 Use VSCode Remote-SSH on your preprod host, then:
@@ -62,12 +72,12 @@ Optional slash command registration:
 npm run register
 ```
 
-## Production Deployment (push main)
+## Production Deployment (manual)
 
-A push on `main` triggers `.github/workflows/prod.yml`:
+Manual dispatch of `.github/workflows/prod.yml`:
 
 1. Build Docker image from this repo.
-2. Push to Docker Hub with tags:
+2. Push to GHCR with tags:
    - `latest`
    - `${GITHUB_SHA}`
 3. SSH into VPS and run in `/opt/discord-bot`:
@@ -78,12 +88,10 @@ A push on `main` triggers `.github/workflows/prod.yml`:
 
 Repository variable:
 
-- `DOCKER_IMAGE` (example: `yourdockerhubuser/lolbot`)
+- `DOCKER_IMAGE` (optional, defaults to `ghcr.io/oxygengamestudio/lolbot`)
 
 Repository secrets:
 
-- `DOCKERHUB_USERNAME`
-- `DOCKERHUB_TOKEN`
 - `PROD_SSH_HOST`
 - `PROD_SSH_PORT`
 - `PROD_SSH_USER`
@@ -116,9 +124,11 @@ Inject secrets and config through environment variables in the panel. Do not sto
 
 This repository now ships a dedicated image and egg for panel deployment:
 
-- Docker image: `luxxsy/lolbot-v1:20260310-secure` (or `latest`)
+- Docker image: `ghcr.io/oxygengamestudio/lolbot:preprod`
 - Egg export: `pterodactyl/egg-lolbot.json`
 - Startup command: `mkdir -p "$DATA_DIR" && node /opt/lolbot/dist/index.js`
+
+See `PTERODACTYL.md` for the preprod workflow, GitHub Secrets, and restart API setup.
 
 The bot code is bundled inside the image under `/opt/lolbot`, while persistent runtime data goes through `DATA_DIR` (default `/home/container/data` in the egg). The image runs as a non-root user and does not copy `.env` into the build context.
 
