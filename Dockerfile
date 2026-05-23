@@ -14,12 +14,14 @@ LABEL org.opencontainers.image.source="https://github.com/oxygengamestudio/LolBo
     org.opencontainers.image.description="LolBot Discord music bot preprod image"
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG BOT_BUILD_SHA=local
 ARG YTDLP_VERSION=2026.03.03
 ARG YTDLP_SHA256=cc706b94cde1cf92cc155e3632aa290ab5f3809ada8c56c23311335508decdf9
 
 ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
     DATA_DIR=/home/container/data \
+    BOT_BUILD_SHA=${BOT_BUILD_SHA} \
     YTDLP_AUTO_DOWNLOAD=false
 
 RUN apt-get update \

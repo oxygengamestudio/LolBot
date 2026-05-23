@@ -84,6 +84,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            BOT_BUILD_SHA=${{ github.sha }}
           tags: |
             ${{ steps.image.outputs.image }}:preprod
             ${{ steps.image.outputs.image }}:${{ github.sha }}
