@@ -20,7 +20,7 @@ The image contains the built bot, Node.js, FFmpeg, and `yt-dlp`. Runtime secrets
 After the workflow has run successfully, the package page will be under the GitHub organization packages:
 
 ```text
-https://github.com/orgs/oxygengamestudio/packages/container/package/lolbot
+https://github.com/users/oxygengamestudio/packages/container/package/lolbot
 ```
 
 ## Private GHCR access from Raynor
@@ -59,6 +59,14 @@ docker pull ghcr.io/oxygengamestudio/lolbot:preprod
 ```
 
 Keep the egg Docker image set to `ghcr.io/oxygengamestudio/lolbot:preprod`. GitHub Actions overwrites that tag on each successful push to `main`, then calls the Pterodactyl restart API. Wings should pull the configured image during server boot; if it keeps an older cached image, check the Wings logs and trigger a server reinstall or pull the image manually on the node.
+
+If the Pterodactyl console shows this error, Wings has not loaded valid GHCR credentials yet:
+
+```text
+failed to pull "ghcr.io/oxygengamestudio/lolbot:preprod" image ... unauthorized
+```
+
+Fix it in `/etc/pterodactyl/config.yml`; do not create a second top-level `docker:` block if one already exists. Add only the `registries:` part under the existing `docker:` block, then run `sudo systemctl restart wings`.
 
 ## Pterodactyl server settings
 
