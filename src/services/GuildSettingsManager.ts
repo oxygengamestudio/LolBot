@@ -53,6 +53,7 @@ class GuildSettingsManager {
             rolePermissionMode: 'allow_all',
             allowedRoles: [],
             blockedRoles: [],
+            sponsorBlockEnabled: false,
         };
     }
 
@@ -104,6 +105,10 @@ class GuildSettingsManager {
                 typeof settings.crossfadeEnabled === 'boolean'
                     ? settings.crossfadeEnabled
                     : defaults.crossfadeEnabled,
+            sponsorBlockEnabled:
+                typeof settings.sponsorBlockEnabled === 'boolean'
+                    ? settings.sponsorBlockEnabled
+                    : defaults.sponsorBlockEnabled,
             preferredVoiceChannel:
                 typeof settings.preferredVoiceChannel === 'string' && /^\d{17,20}$/.test(settings.preferredVoiceChannel)
                     ? settings.preferredVoiceChannel

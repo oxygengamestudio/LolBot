@@ -15,6 +15,8 @@ export interface Track {
     url: string;
     duration: number; // en secondes
     thumbnail: string;
+    channelTitle?: string;
+    channelId?: string;
     requestedBy: string;
     requestedById: string;
 }
@@ -25,6 +27,9 @@ export interface SearchResult {
     duration: string;
     thumbnail: string;
     channelTitle: string;
+    channelId?: string;
+    durationSeconds?: number;
+    isOfficial?: boolean;
 }
 
 export interface PlaylistInfo {
@@ -53,6 +58,10 @@ export interface GuildQueue {
     pausedAt: number | null;
     totalPausedTime: number;
     autoPausedByEmptyChannel: boolean;
+    isReconnecting: boolean;
+    reconnectAttempts: number;
+    shouldKeepConnection: boolean;
+    isManualDisconnect: boolean;
     crossfadeInProgress: boolean;
     crossfadeTargetTrackId: string | null;
     lastStartMetrics: {
@@ -82,6 +91,8 @@ export interface YouTubeVideoInfo {
     title: string;
     duration: number;
     thumbnail: string;
+    channelTitle?: string;
+    channelId?: string;
 }
 
 export interface CommandDefinition {
@@ -105,6 +116,7 @@ export interface GuildSettings {
     stayConnectedAlways: boolean;
     pauseOnEmptyChannelWhenAlwaysConnected: boolean;
     crossfadeEnabled: boolean;
+    sponsorBlockEnabled: boolean;
     preferredVoiceChannel: string | null;
     voiceChannelMode: VoiceChannelMode;
     allowedVoiceChannels: string[];

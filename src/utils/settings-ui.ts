@@ -23,6 +23,7 @@ export const SETTINGS_BUTTON_IDS = {
     always: 'settings_always',
     pauseOnEmpty: 'settings_pause_on_empty',
     crossfade: 'settings_crossfade',
+    sponsor: 'settings_sponsor',
     preferred: 'settings_preferred',
     voice: 'settings_voice',
     roles: 'settings_roles',
@@ -65,6 +66,7 @@ export function buildSettingsMessage(settings: GuildSettings): {
         `🔗 ${t(locale, 'settings.alwaysConnected')}: ${booleanLabel(locale, settings.stayConnectedAlways)}`,
         `⏸️ ${t(locale, 'settings.pauseOnEmpty')}: ${booleanLabel(locale, settings.pauseOnEmptyChannelWhenAlwaysConnected)}`,
         `🎚️ ${t(locale, 'settings.crossfade')}: ${settings.crossfadeEnabled ? `${t(locale, 'settings.value.enabled')} (3s)` : t(locale, 'settings.value.disabled')}`,
+        `🎶 SponsorBlock: ${booleanLabel(locale, settings.sponsorBlockEnabled)}`,
         `🎙️ ${t(locale, 'settings.preferredChannel')}: ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : t(locale, 'settings.channel.none')}`,
         `🚪 ${t(locale, 'settings.voiceChannels')}: ${formatModeLabel(locale, settings.voiceChannelMode, settings.allowedVoiceChannels.length, settings.blockedVoiceChannels.length)}`,
         `👥 ${t(locale, 'settings.roles')}: ${formatModeLabel(locale, settings.rolePermissionMode, settings.allowedRoles.length, settings.blockedRoles.length)}`,
@@ -117,7 +119,11 @@ export function buildSettingsMessage(settings: GuildSettings): {
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.crossfade)
             .setEmoji('🎚️')
-            .setStyle(settings.crossfadeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
+            .setStyle(settings.crossfadeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.sponsor)
+            .setEmoji('🎶')
+            .setStyle(settings.sponsorBlockEnabled ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row1, row2, row3] };

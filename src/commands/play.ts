@@ -1,13 +1,18 @@
 ﻿import {
+    ActionRowBuilder,
     SlashCommandBuilder,
     AutocompleteInteraction,
     ChatInputCommandInteraction,
     GuildMember,
     MessageFlags,
     StageChannel,
+    StringSelectMenuBuilder,
+    StringSelectMenuInteraction,
+    StringSelectMenuOptionBuilder,
     TextChannel,
     VoiceChannel,
 } from 'discord.js';
+import { randomUUID } from 'crypto';
 import { youtubeService } from '../services/YouTubeService.js';
 import { queueManager } from '../services/QueueManager.js';
 import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
@@ -15,7 +20,7 @@ import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
 import { isKnownInteractionResponseError } from '../utils/discordApiErrors.js';
-import type { Track } from '../types/index.js';
+import type { SearchResult, Track } from '../types/index.js';
 import { commandDescriptionLocalizations, resolveLocale, t } from '../utils/i18n.js';
 import { safeContent, truncate } from '../utils/text.js';
 
@@ -26,15 +31,30 @@ const AUTOCOMPLETE_HINT_START_TYPING = '__hint_start_typing__';
 const AUTOCOMPLETE_HINT_REFINE = '__hint_refine_query__';
 const AUTOCOMPLETE_HINT_NO_RESULTS = '__hint_no_results__';
 const MAX_AUTOCOMPLETE_OPTIONS = 25;
+const PLAY_SELECTION_PREFIX = 'play_select';
+const PLAY_SELECTION_TTL_MS = 60_000;
 
 type AutocompleteOption = { name: string; value: string };
+type PlayInteraction = ChatInputCommandInteraction | StringSelectMenuInteraction;
 type AutocompleteState = {
     lastApiCallAt: number;
     lastQuery: string;
     lastOptions: AutocompleteOption[];
 };
+type PendingPlaySelection = {
+    createdAt: number;
+    guildId: string;
+    userId: string;
+    textChannelId: string;
+    voiceChannelId: string;
+    requestedBy: string;
+    requestedById: string;
+    query: string;
+    results: SearchResult[];
+};
 
 const autocompleteState = new Map<string, AutocompleteState>();
+const pendingSelections = new Map<string, PendingPlaySelection>();
 
 export const data = new SlashCommandBuilder()
     .setName('play')
@@ -160,6 +180,81 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         });
         deleteEphemeralAfterDelay(interaction);
     }
+}
+
+export async function handleSelection(interaction: StringSelectMenuInteraction): Promise<void> {
+    const selectionId = parseSelectionId(interaction.customId);
+    const payload = selectionId ? pendingSelections.get(selectionId) : null;
+    if (!selectionId || !payload) {
+        await interaction.update({
+            content: 'Cette sélection a expiré. Relance `/play`.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    if (interaction.user.id !== payload.userId || interaction.guildId !== payload.guildId) {
+        await interaction.reply({
+            content: 'Cette sélection ne vous appartient pas.',
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    const index = Number.parseInt(interaction.values?.[0] ?? '', 10);
+    if (!Number.isInteger(index) || index < 0 || index >= payload.results.length) {
+        await interaction.update({
+            content: 'Sélection invalide.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    const guild = interaction.guild;
+    const member = interaction.member as GuildMember;
+    const textChannel = guild?.channels.cache.get(payload.textChannelId) as TextChannel | undefined;
+    const voiceChannel = guild?.channels.cache.get(payload.voiceChannelId);
+    if (!guild || !textChannel || !voiceChannel?.isVoiceBased()) {
+        pendingSelections.delete(selectionId);
+        await interaction.update({
+            content: 'Salon introuvable. Relance `/play`.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    if (!(await canJoinVoiceChannel(voiceChannel, guild.id))) {
+        await interaction.update({
+            content: `Je n'ai pas l'autorisation de rejoindre <#${voiceChannel.id}>.`,
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    const result = payload.results[index];
+    const track = await youtubeService.createTrackFromSearch(result, payload.requestedBy, payload.requestedById);
+    pendingSelections.delete(selectionId);
+
+    await interaction.update({
+        content: `Ajout de **${safeContent(track.title)}**...`,
+        components: [],
+        allowedMentions: { parse: [] },
+    });
+
+    const locale = await resolveLocale(guild.id, interaction.locale);
+    await addTrackToQueue(interaction, track, voiceChannel as VoiceChannel | StageChannel, textChannel, locale);
+}
+
+function parseSelectionId(customId: string): string | null {
+    if (!customId.startsWith(`${PLAY_SELECTION_PREFIX}:`)) {
+        return null;
+    }
+    return customId.split(':', 2)[1] ?? null;
 }
 
 async function handleYouTubeUrl(
@@ -297,7 +392,11 @@ async function handleSearchAuto(
     });
 
     log.debug(`Recherche YouTube (auto): ${query}`);
-    const results = await youtubeService.search(query, config.audio.searchResults);
+    const rankedResults = await youtubeService.searchWithRanking(query, config.audio.searchResults);
+    const results = rankedResults.map((result) => {
+        const { score: _score, ...searchResult } = result;
+        return searchResult;
+    });
 
     if (results.length === 0) {
         log.debug('Aucun resultat (auto)');
@@ -309,7 +408,51 @@ async function handleSearchAuto(
         return;
     }
 
-    const selectedResult = results[0];
+    if (!youtubeService.shouldAutoSelect(rankedResults, query) || !rankedResults[0]) {
+        const selectionId = randomUUID();
+        const candidates = results.slice(0, Math.min(5, results.length));
+        const select = new StringSelectMenuBuilder()
+            .setCustomId(`${PLAY_SELECTION_PREFIX}:${selectionId}`)
+            .setPlaceholder('Choisissez un résultat')
+            .setMinValues(1)
+            .setMaxValues(1)
+            .addOptions(
+                candidates.map((result, index) =>
+                    new StringSelectMenuOptionBuilder()
+                        .setLabel(truncateString(`${index + 1}. ${result.title}`, 100))
+                        .setDescription(truncateString(`${result.duration} • ${result.channelTitle ?? 'source inconnue'}`, 100))
+                        .setValue(String(index))
+                )
+            );
+
+        pendingSelections.set(selectionId, {
+            createdAt: Date.now(),
+            guildId: interaction.guildId!,
+            userId: interaction.user.id,
+            textChannelId: interaction.channelId,
+            voiceChannelId: voiceChannel.id,
+            requestedBy: member.displayName,
+            requestedById: member.id,
+            query,
+            results: candidates,
+        });
+
+        setTimeout(() => {
+            const payload = pendingSelections.get(selectionId);
+            if (payload && Date.now() - payload.createdAt >= PLAY_SELECTION_TTL_MS) {
+                pendingSelections.delete(selectionId);
+            }
+        }, PLAY_SELECTION_TTL_MS + 1_000);
+
+        await interaction.editReply({
+            content: `Recherche "${safeContent(query)}" ambiguë. Choisis une piste dans les ${candidates.length} résultats :`,
+            components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    const selectedResult = rankedResults[0];
     log.info(`Auto-selectionne: ${selectedResult.title}`);
 
     const track = await youtubeService.createTrackFromSearch(
@@ -322,7 +465,7 @@ async function handleSearchAuto(
 }
 
 async function addTrackToQueue(
-    interaction: ChatInputCommandInteraction,
+    interaction: PlayInteraction,
     track: Track,
     voiceChannel: VoiceChannel | StageChannel,
     textChannel: TextChannel,
@@ -381,7 +524,7 @@ function truncateString(str: string, maxLength: number): string {
     return truncate(str, maxLength);
 }
 
-async function deleteEphemeralAfterDelay(interaction: ChatInputCommandInteraction): Promise<void> {
+async function deleteEphemeralAfterDelay(interaction: PlayInteraction): Promise<void> {
     const delayMs = Math.max(1, config.audio.ephemeralInfoDeleteDelay);
     setTimeout(async () => {
         try {

@@ -393,7 +393,7 @@ class NowPlayingManager {
                         queueManager.stop(guildId);
                         await this.deleteNowPlaying(queue);
                     } else {
-                        queueManager.deleteQueue(guildId);
+                        queueManager.deleteQueue(guildId, true);
                     }
                 }
                 await interaction.reply({

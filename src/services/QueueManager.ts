@@ -17,6 +17,7 @@ import type { VoiceChannel, StageChannel, TextChannel, VoiceState } from 'discor
 import { EventEmitter } from 'events';
 import type { GuildQueue, Track } from '../types/index.js';
 import { audioWrapper } from '../audio/AudioWrapper.js';
+import { mediaCacheManager } from '../audio/MediaCacheManager.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
@@ -90,6 +91,10 @@ class QueueManager extends EventEmitter {
             pausedAt: null,
             totalPausedTime: 0,
             autoPausedByEmptyChannel: false,
+            isReconnecting: false,
+            reconnectAttempts: 0,
+            shouldKeepConnection: false,
+            isManualDisconnect: false,
             crossfadeInProgress: false,
             crossfadeTargetTrackId: null,
             lastStartMetrics: null,
@@ -103,12 +108,15 @@ class QueueManager extends EventEmitter {
     /**
      * Supprime la file d'attente d'un serveur
      */
-    deleteQueue(guildId: string): void {
+    deleteQueue(guildId: string, manualDisconnect: boolean = false): void {
         log.debug(`Suppression de queue pour guild: ${guildId}`);
         const queue = this.queues.get(guildId);
         this.stopVoiceChannelMonitor(guildId);
         this.stopCrossfadeMonitor(guildId);
         if (queue) {
+            queue.isManualDisconnect = manualDisconnect;
+            queue.isReconnecting = false;
+            queue.reconnectAttempts = 0;
             this.teardownActiveResource(guildId);
             this.clearGuildWarmup(guildId);
 
@@ -143,6 +151,7 @@ class QueueManager extends EventEmitter {
             this.resourceSwapInProgress.delete(guildId);
             this.clearRetiredResources(guildId);
             void audioWrapper.cleanupGuildTemp(guildId);
+            void this.pruneCache();
         } else {
             log.warn(`Tentative de suppression d'une queue inexistante: ${guildId}`);
         }
@@ -173,14 +182,15 @@ class QueueManager extends EventEmitter {
 
             try {
                 log.trace(`Appel de joinVoiceChannel (tentative ${attempt}/${maxAttempts})...`);
-                const connection = joinVoiceChannel({
+                const joinOptions: Parameters<typeof joinVoiceChannel>[0] & { daveEncryption?: boolean } = {
                     channelId: queue.voiceChannel.id,
                     guildId: queue.guildId,
                     adapterCreator: queue.voiceChannel.guild.voiceAdapterCreator,
                     debug: true,
                     daveEncryption: true,
                     selfDeaf: true,
-                });
+                };
+                const connection = joinVoiceChannel(joinOptions);
 
                 queue.connection = connection;
                 this.attachConnectionListeners(queue, connection);
@@ -199,6 +209,10 @@ class QueueManager extends EventEmitter {
                 }
 
                 this.startVoiceChannelMonitor(queue);
+                queue.shouldKeepConnection = true;
+                queue.isManualDisconnect = false;
+                queue.isReconnecting = false;
+                queue.reconnectAttempts = 0;
                 log.info(`Connexion vocale établie avec succès en ${attempt} tentative(s)!`);
                 return connection;
             } catch (error) {
@@ -386,8 +400,13 @@ class QueueManager extends EventEmitter {
             if (!activeQueue || activeQueue.connection !== connection) {
                 return;
             }
+            if (activeQueue.isManualDisconnect) {
+                log.trace('Déconnexion manuelle détectée, aucun reconnect');
+                return;
+            }
 
             log.warn('Connexion vocale déconnectée, tentative de récupération...');
+            const resumeOffset = activeQueue.currentTrack ? this.getCurrentTime(queue.guildId) : 0;
             try {
                 await Promise.race([
                     entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
@@ -397,9 +416,9 @@ class QueueManager extends EventEmitter {
                 log.info('Reconnexion de Discord en cours...');
             } catch (error) {
                 log.warn('Récupération simple échouée, tentative de reconnexion complète', error);
-                const reconnected = await this.joinChannel(activeQueue);
+                const reconnected = await this.reconnectWithBackoff(activeQueue, resumeOffset);
                 if (!reconnected) {
-                    this.deleteQueue(queue.guildId);
+                    this.deleteQueue(queue.guildId, false);
                 }
             }
         });
@@ -415,8 +434,13 @@ class QueueManager extends EventEmitter {
                 return;
             }
 
-            log.info('Connexion vocale détruite');
-            this.deleteQueue(queue.guildId);
+            log.info('Connexion vocale détruite involontairement');
+            void this.reconnectWithBackoff(activeQueue, activeQueue.currentTrack ? this.getCurrentTime(queue.guildId) : 0)
+                .then((reconnected) => {
+                    if (!reconnected) {
+                        this.deleteQueue(queue.guildId, false);
+                    }
+                });
         });
     }
 
@@ -431,6 +455,89 @@ class QueueManager extends EventEmitter {
         } catch {
             // Ignore.
         }
+    }
+
+    private async reconnectWithBackoff(queue: GuildQueue, resumeOffset: number): Promise<boolean> {
+        if (queue.isManualDisconnect || queue.isReconnecting) {
+            return false;
+        }
+
+        queue.isReconnecting = true;
+        queue.connection = null;
+
+        const hasPlayableWork = !!queue.currentTrack || queue.tracks.length > 0 || queue.shouldKeepConnection;
+        if (!hasPlayableWork) {
+            queue.isReconnecting = false;
+            return false;
+        }
+
+        try {
+            for (let attempt = 1; attempt <= config.audio.voiceReconnectMaxAttempts; attempt += 1) {
+                if (attempt > 1) {
+                    const delayMs = Math.min(
+                        config.audio.voiceReconnectMaxDelayMs,
+                        config.audio.voiceReconnectBaseDelayMs * 2 ** (attempt - 2)
+                    );
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                }
+
+                if (queue.isManualDisconnect || !this.queues.has(queue.guildId)) {
+                    return false;
+                }
+
+                queue.reconnectAttempts = attempt;
+                const connection = await this.joinChannel(queue);
+                if (!connection) {
+                    log.warn(`Tentative de reconnexion échouée (#${attempt}/${config.audio.voiceReconnectMaxAttempts})`);
+                    continue;
+                }
+
+                queue.isReconnecting = false;
+                queue.reconnectAttempts = 0;
+
+                if (queue.currentTrack) {
+                    return this.resumeCurrentTrack(queue, resumeOffset);
+                }
+                if (queue.tracks.length > 0) {
+                    return this.playNext(queue.guildId);
+                }
+                return true;
+            }
+        } finally {
+            queue.isReconnecting = false;
+        }
+
+        return false;
+    }
+
+    private async resumeCurrentTrack(queue: GuildQueue, resumeOffset: number): Promise<boolean> {
+        if (!queue.currentTrack || !queue.player) {
+            return false;
+        }
+
+        const settings = await guildSettingsManager.getSettings(queue.guildId);
+        const resource = await audioWrapper.createResource(
+            queue.guildId,
+            queue.currentTrack,
+            Math.max(0, resumeOffset),
+            settings.sponsorBlockEnabled
+        );
+        if (!resource) {
+            return false;
+        }
+
+        if (resource.volume) {
+            resource.volume.setVolume(queue.volume / 100);
+        }
+
+        queue.startedAt = Date.now() - Math.max(0, resumeOffset) * 1000;
+        queue.pausedAt = null;
+        queue.totalPausedTime = 0;
+        queue.isPaused = false;
+        queue.isStopping = false;
+        await this.replaceActiveResource(queue, resource);
+        this.startCrossfadeMonitor(queue);
+        return true;
     }
 
     /**
@@ -450,6 +557,7 @@ class QueueManager extends EventEmitter {
 
 
         queue.tracks.push(track);
+        queue.isManualDisconnect = false;
         this.emit('trackAdded', queue, track);
 
         log.info(`Piste ajoutée à la queue (total: ${queue.tracks.length})`);
@@ -479,6 +587,7 @@ class QueueManager extends EventEmitter {
         const tracksToAdd = tracks.slice(0, availableSlots);
 
         queue.tracks.push(...tracksToAdd);
+        queue.isManualDisconnect = false;
         this.emit('tracksAdded', queue, tracksToAdd);
 
         log.info(`${tracksToAdd.length} pistes ajoutées à la queue (total: ${queue.tracks.length})`);
@@ -530,6 +639,7 @@ class QueueManager extends EventEmitter {
             log.info('File d\'attente vide');
             queue.currentTrack = null;
             queue.isPlaying = false;
+            queue.shouldKeepConnection = false;
             queue.autoPausedByEmptyChannel = false;
             queue.crossfadeInProgress = false;
             queue.crossfadeTargetTrackId = null;
@@ -542,7 +652,7 @@ class QueueManager extends EventEmitter {
             const settings = await guildSettingsManager.getSettings(guildId);
             if (!settings.stayConnected && !settings.stayConnectedAlways) {
                 log.info('Déconnexion (queue vide, stay-connected désactivé)');
-                this.deleteQueue(guildId);
+                this.deleteQueue(guildId, false);
             }
 
             return false;
@@ -556,6 +666,8 @@ class QueueManager extends EventEmitter {
         queue.currentTrack = track;
         queue.totalPausedTime = 0;
         queue.isStopping = false;
+        queue.isManualDisconnect = false;
+        queue.shouldKeepConnection = true;
         queue.crossfadeInProgress = false;
         queue.crossfadeTargetTrackId = null;
         queue.autoPausedByEmptyChannel = false;
@@ -603,7 +715,8 @@ class QueueManager extends EventEmitter {
             }
 
             const resourceStartedAt = Date.now();
-            resource = await audioWrapper.createResource(guildId, track);
+            const settings = await guildSettingsManager.getSettings(guildId);
+            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
             const resourceMs = Date.now() - resourceStartedAt;
             log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
             queue.lastStartMetrics = {
@@ -617,7 +730,8 @@ class QueueManager extends EventEmitter {
             connection = queue.connection;
             joinMs = 0;
             const resourceStartedAt = Date.now();
-            resource = await audioWrapper.createResource(guildId, track);
+            const settings = await guildSettingsManager.getSettings(guildId);
+            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
             const resourceMs = Date.now() - resourceStartedAt;
             log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
             queue.lastStartMetrics = {
@@ -683,6 +797,7 @@ class QueueManager extends EventEmitter {
         }
 
         queue.voiceChannel = voiceChannel;
+        queue.isManualDisconnect = false;
 
         if (queue.connection && queue.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             try {
@@ -810,11 +925,13 @@ class QueueManager extends EventEmitter {
         queue.pausedAt = null;
         queue.totalPausedTime = 0;
         const previousTrack = queue.currentTrack;
+        queue.currentTrack = null;
 
         if (previousTrack) {
             log.info(`Piste terminee: ${previousTrack.title}`);
             audioWrapper.clearFromCache(queue.guildId, previousTrack.id);
             this.clearLyrics(queue, previousTrack.id);
+            void this.pruneCache();
         }
 
         this.emit('trackEnd', queue, previousTrack);
@@ -883,7 +1000,13 @@ class QueueManager extends EventEmitter {
 
             log.info(`Seek vers ${clamped}s (piste: ${queue.currentTrack.title})`);
 
-            const resource = await audioWrapper.createResource(guildId, queue.currentTrack, clamped);
+            const settings = await guildSettingsManager.getSettings(guildId);
+            const resource = await audioWrapper.createResource(
+                guildId,
+                queue.currentTrack,
+                clamped,
+                settings.sponsorBlockEnabled
+            );
             if (!resource) {
                 log.error('Seek: impossible de créer la ressource audio');
                 return false;
@@ -918,6 +1041,8 @@ class QueueManager extends EventEmitter {
         }
 
         const trackCount = queue.tracks.length;
+        queue.isManualDisconnect = true;
+        queue.shouldKeepConnection = false;
         queue.isStopping = true;
         queue.tracks = [];
         queue.currentTrack = null;
@@ -940,6 +1065,7 @@ class QueueManager extends EventEmitter {
         }
 
         this.clearLyrics(queue);
+        void this.pruneCache();
         this.emit('queueStopped', queue);
         log.info(`Lecture arretee, ${trackCount} pistes supprimees de la queue`);
         setTimeout(() => {
@@ -991,6 +1117,7 @@ class QueueManager extends EventEmitter {
             log.info(`Piste supprimee: ${removed.title}`);
         }
         this.refreshWarmup(queue);
+        void this.pruneCache();
         return removed;
     }
 
@@ -1011,6 +1138,7 @@ class QueueManager extends EventEmitter {
         queue.tracks.splice(safeStart, count);
         log.info(`Suppression de ${count} piste(s) de la queue`);
         this.refreshWarmup(queue);
+        void this.pruneCache();
         return count;
     }
 
@@ -1027,6 +1155,7 @@ class QueueManager extends EventEmitter {
         queue.tracks = [];
         log.info(`File d'attente videe (${count} piste(s) supprimee(s))`);
         this.refreshWarmup(queue);
+        void this.pruneCache();
         return count;
     }
 
@@ -1103,6 +1232,23 @@ class QueueManager extends EventEmitter {
      */
     hasQueue(guildId: string): boolean {
         return this.queues.has(guildId);
+    }
+
+    private getActiveTrackIds(): Set<string> {
+        const ids = new Set<string>();
+        for (const queue of this.queues.values()) {
+            if (queue.currentTrack) {
+                ids.add(queue.currentTrack.id);
+            }
+            for (const track of queue.tracks) {
+                ids.add(track.id);
+            }
+        }
+        return ids;
+    }
+
+    private async pruneCache(): Promise<void> {
+        await mediaCacheManager.clearUnused(this.getActiveTrackIds());
     }
 
     private bumpTransitionNonce(guildId: string): number {
@@ -1354,6 +1500,7 @@ class QueueManager extends EventEmitter {
 
             audioWrapper.clearFromCache(guildId, currentTrack.id);
             this.clearLyrics(queue, currentTrack.id);
+            void this.pruneCache();
             this.emit('trackEnd', queue, currentTrack);
 
             await this.replaceActiveResource(queue, resource);

@@ -45,6 +45,6 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
 
     log.info('Arrêt de la lecture et déconnexion');
-    queueManager.deleteQueue(interaction.guildId!);
+    queueManager.deleteQueue(interaction.guildId!, true);
     await replyEphemeral(interaction, `⏹️ ${t(locale, 'stop.leave')}`);
 }

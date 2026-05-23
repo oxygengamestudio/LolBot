@@ -6,6 +6,20 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
+const OFFICIAL_KEYWORDS = [
+    'official music video',
+    'official lyric video',
+    'official audio',
+    'official video',
+    'lyric video',
+    'vevo',
+];
+const QUERY_STOP_WORDS = new Set(['a', 'an', 'the', 'de', 'du', 'des', 'et', 'feat', 'featuring', 'with']);
+const VERSION_TOKENS = new Set(['cover', 'remix', 'live', 'karaoke', 'reaction', 'spedup', 'nightcore']);
+
+export interface RankedSearchResult extends SearchResult {
+    score: number;
+}
 
 interface YouTubeThumbnailSet {
     default?: { url?: string };
@@ -17,6 +31,7 @@ interface SearchApiItem {
     snippet?: {
         title?: string;
         channelTitle?: string;
+        channelId?: string;
         thumbnails?: YouTubeThumbnailSet;
     };
 }
@@ -26,6 +41,7 @@ interface VideoApiItem {
     snippet?: {
         title?: string;
         channelTitle?: string;
+        channelId?: string;
         thumbnails?: YouTubeThumbnailSet;
     };
     contentDetails?: {
@@ -55,15 +71,53 @@ export class YouTubeService {
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
 
     async search(query: string, maxResults = 10): Promise<SearchResult[]> {
+        const ranked = await this.searchWithRanking(query, maxResults);
+        return ranked.map((result) => {
+            const { score: _score, ...searchResult } = result;
+            return searchResult;
+        });
+    }
+
+    async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
+        const rawResults = await this.searchRaw(query, maxResults);
+        return this.rankSearchResults(query, rawResults)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, maxResults);
+    }
+
+    shouldAutoSelect(results: RankedSearchResult[], query: string): boolean {
+        if (results.length === 0) {
+            return false;
+        }
+        if (results.length === 1) {
+            return true;
+        }
+
+        const queryTokens = this.extractRankingTokens(query);
+        const hasSpecificVersionToken = queryTokens.some((token) => VERSION_TOKENS.has(token));
+        const [first, second] = results;
+        const top = first?.score ?? 0;
+        const secondScore = second?.score ?? 0;
+        const fullText = this.normalizeRankingText(`${first?.title ?? ''} ${first?.channelTitle ?? ''}`);
+        const hasTitleMatch = queryTokens.every((token) => fullText.includes(token));
+
+        if (hasSpecificVersionToken) {
+            return top >= 110 && top - secondScore >= 50;
+        }
+
+        return top >= 120 && hasTitleMatch && top - secondScore >= 140;
+    }
+
+    private async searchRaw(query: string, maxResults = 10): Promise<SearchResult[]> {
         if (!this.apiKey) {
-            return this.searchWithYtdlp(query, maxResults);
+            return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
         }
 
         try {
             return await this.searchWithGoogle(query, maxResults);
         } catch (error) {
             console.warn('YouTube Data API search failed, falling back to yt-dlp:', this.formatError(error));
-            return this.searchWithYtdlp(query, maxResults);
+            return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
         }
     }
 
@@ -111,10 +165,12 @@ export class YouTubeService {
                 id: item.id,
                 title: this.decodeHtmlEntities(item.snippet.title ?? 'Unknown title'),
                 duration: this.parseDuration(item.contentDetails.duration ?? 'PT0S'),
+                durationSeconds: this.parseDurationToSeconds(item.contentDetails.duration ?? 'PT0S'),
                 thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url || '',
                 channelTitle: item.snippet.channelTitle ?? 'Unknown channel',
+                channelId: item.snippet.channelId,
             }))
-            .slice(0, effectiveMaxResults);
+            .slice(0, expandedMaxResults);
     }
 
     isYouTubeUrl(url: string): boolean {
@@ -184,6 +240,8 @@ export class YouTubeService {
             title: this.decodeHtmlEntities(item.snippet.title ?? 'Unknown title'),
             duration: this.parseDurationToSeconds(item.contentDetails.duration),
             thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url || '',
+            channelTitle: this.decodeHtmlEntities(item.snippet.channelTitle ?? ''),
+            channelId: item.snippet.channelId,
         };
     }
 
@@ -372,8 +430,10 @@ export class YouTubeService {
             id,
             title: this.decodeHtmlEntities(String(entry?.title ?? id)),
             duration: this.formatDurationFromSeconds(this.coerceDurationSeconds(entry?.duration)),
+            durationSeconds: this.coerceDurationSeconds(entry?.duration),
             thumbnail: this.getYtdlpThumbnail(entry),
             channelTitle: String(entry?.channel ?? entry?.uploader ?? ''),
+            channelId: typeof entry?.channel_id === 'string' ? entry.channel_id : undefined,
         };
     }
 
@@ -389,6 +449,8 @@ export class YouTubeService {
             url: `https://www.youtube.com/watch?v=${id}`,
             duration: this.coerceDurationSeconds(entry?.duration),
             thumbnail: this.getYtdlpThumbnail(entry),
+            channelTitle: String(entry?.channel ?? entry?.uploader ?? ''),
+            channelId: typeof entry?.channel_id === 'string' ? entry.channel_id : undefined,
             requestedBy,
             requestedById,
         };
@@ -401,6 +463,8 @@ export class YouTubeService {
             url: `https://www.youtube.com/watch?v=${result.id}`,
             duration: this.parseDurationToSeconds(result.duration),
             thumbnail: result.thumbnail,
+            channelTitle: result.channelTitle,
+            channelId: result.channelId,
             requestedBy,
             requestedById,
         };
@@ -423,9 +487,96 @@ export class YouTubeService {
             url: `https://www.youtube.com/watch?v=${videoId}`,
             duration: info.duration,
             thumbnail: info.thumbnail,
+            channelTitle: info.channelTitle,
+            channelId: info.channelId,
             requestedBy,
             requestedById,
         };
+    }
+
+    private rankSearchResults(query: string, results: SearchResult[]): RankedSearchResult[] {
+        const tokens = this.extractRankingTokens(query);
+        const explicit = {
+            cover: tokens.includes('cover'),
+            remix: tokens.includes('remix'),
+            live: tokens.includes('live'),
+            nightcore: tokens.includes('nightcore'),
+            karaoke: tokens.includes('karaoke'),
+            reaction: tokens.includes('reaction'),
+            spedup: tokens.includes('spedup') || tokens.includes('sped'),
+        };
+
+        return results.map((result) => ({
+            ...result,
+            score: this.scoreSearchResult(result, tokens, explicit),
+        }));
+    }
+
+    private scoreSearchResult(
+        result: SearchResult,
+        queryTokens: string[],
+        explicit: {
+            cover: boolean;
+            remix: boolean;
+            live: boolean;
+            nightcore: boolean;
+            karaoke: boolean;
+            reaction: boolean;
+            spedup: boolean;
+        }
+    ): number {
+        const title = this.normalizeRankingText(result.title);
+        const channel = this.normalizeRankingText(result.channelTitle ?? '');
+        const fullText = `${title} ${channel}`;
+        const durationSeconds = result.durationSeconds ?? this.parseDurationToSeconds(result.duration);
+        let score = 20;
+
+        for (const keyword of OFFICIAL_KEYWORDS) {
+            if (title.includes(keyword)) {
+                score += keyword.includes('lyric') ? 130 : 170;
+            }
+        }
+
+        if (channel.includes('vevo')) score += 130;
+        if (channel.includes('official')) score += 90;
+        if (title.includes('vevo')) score += 90;
+        if (title.includes('official')) score += 70;
+
+        const matchedTokens = queryTokens.filter((token) => fullText.includes(token));
+        score += matchedTokens.length * 28;
+
+        if (fullText.includes('cover') && !explicit.cover) score -= 130;
+        if (fullText.includes('remix') && !explicit.remix) score -= 110;
+        if (fullText.includes('live') && !explicit.live) score -= 90;
+        if (fullText.includes('nightcore') && !explicit.nightcore) score -= 120;
+        if (fullText.includes('karaoke') && !explicit.karaoke) score -= 110;
+        if (fullText.includes('reaction') && !explicit.reaction) score -= 120;
+        if ((fullText.includes('sped up') || fullText.includes('spedup')) && !explicit.spedup) score -= 100;
+
+        if (durationSeconds > 0 && durationSeconds <= 20) score -= 160;
+        else if (durationSeconds > 0 && durationSeconds <= 45) score -= 70;
+        else if (durationSeconds > 0 && durationSeconds <= 75) score -= 30;
+
+        if (this.hasShortsMarker(fullText)) score -= 120;
+
+        return score;
+    }
+
+    private extractRankingTokens(query: string): string[] {
+        return this.normalizeRankingText(query)
+            .split(/\s+/)
+            .map((token) => token === 'sped' || token === 'spedup' ? 'spedup' : token)
+            .filter((token) => token.length > 1 && !QUERY_STOP_WORDS.has(token));
+    }
+
+    private normalizeRankingText(text: string): string {
+        return text
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/\p{Diacritic}/gu, '')
+            .replace(/[^a-z0-9\s]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
     }
 
     private buildSearchQuery(query: string): string {

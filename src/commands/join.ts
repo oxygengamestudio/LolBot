@@ -69,7 +69,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         const connection = await queueManager.joinChannel(queue);
         if (!connection) {
             await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinFailed')}`);
-            queueManager.deleteQueue(interaction.guildId!);
+            queueManager.deleteQueue(interaction.guildId!, true);
             return;
         }
 
@@ -83,6 +83,6 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     } catch (error) {
         log.error('Erreur lors de la connexion:', error);
         await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinFailed')}`);
-        queueManager.deleteQueue(interaction.guildId!);
+        queueManager.deleteQueue(interaction.guildId!, true);
     }
 }

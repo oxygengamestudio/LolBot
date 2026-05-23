@@ -44,6 +44,7 @@ import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/di
 import { resolveLocale, t } from './utils/i18n.js';
 import fs from 'fs';
 import { join } from 'path';
+import { handleSelection as handlePlaySelection } from './commands/play.js';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
@@ -303,6 +304,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             if (command?.autocomplete) {
                 await command.autocomplete(interaction);
             }
+            return;
+        }
+
+        if (interaction.isStringSelectMenu() && interaction.customId.startsWith('play_select:')) {
+            await handlePlaySelection(interaction);
             return;
         }
 
@@ -613,6 +619,13 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
         case SETTINGS_BUTTON_IDS.crossfade: {
             const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
                 crossfadeEnabled: !settings.crossfadeEnabled,
+            });
+            await interaction.update(buildSettingsMessage(updated));
+            return;
+        }
+        case SETTINGS_BUTTON_IDS.sponsor: {
+            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                sponsorBlockEnabled: !settings.sponsorBlockEnabled,
             });
             await interaction.update(buildSettingsMessage(updated));
             return;
@@ -1092,7 +1105,7 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
 
     const guildIds = Array.from(queueManager.getAllQueues().keys());
     for (const guildId of guildIds) {
-        queueManager.deleteQueue(guildId);
+        queueManager.deleteQueue(guildId, true);
     }
 
     try {

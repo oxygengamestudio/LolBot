@@ -48,28 +48,6 @@ export async function canJoinVoiceChannel(
     voiceChannel: VoiceChannel | StageChannel,
     guildId: string
 ): Promise<boolean> {
-    const botMember = voiceChannel.guild.members.me;
-    if (!botMember) {
-        log.warn(`Bot member introuvable pour guild ${guildId}`);
-        return false;
-    }
-
-    const botPerms = voiceChannel.permissionsFor(botMember);
-    if (!botPerms) {
-        log.warn(`Permissions introuvables pour le canal ${voiceChannel.id}`);
-        return false;
-    }
-
-    const hasVoicePermissions = botPerms.has([
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.Connect,
-        PermissionFlagsBits.Speak,
-    ]);
-    if (!hasVoicePermissions) {
-        log.debug(`Permissions vocales insuffisantes sur ${voiceChannel.id}`);
-        return false;
-    }
-
     const settings = await guildSettingsManager.getSettings(guildId);
 
     if (settings.voiceChannelMode === 'allow_all') {

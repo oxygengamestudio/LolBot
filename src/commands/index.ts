@@ -11,9 +11,8 @@ import * as lyrics from './lyrics.js';
 import * as clear from './clear.js';
 import * as stats from './stats.js';
 import * as seek from './seek.js';
-import type { CommandDefinition } from '../types/index.js';
 
-export const commands: CommandDefinition[] = [
+export const commands = [
     { data: play.data, execute: play.execute, autocomplete: play.autocomplete },
     { data: stop.data, execute: stop.execute },
     { data: pause.data, execute: pause.execute },

@@ -43,6 +43,13 @@ export interface AppConfig {
     audio: {
         bufferSize: number;
         cacheAhead: number;
+        cacheMaxMb: number;
+        cacheMaxAgeHours: number;
+        ytDlpTimeoutMs: number;
+        ffmpegTimeoutMs: number;
+        voiceReconnectMaxAttempts: number;
+        voiceReconnectBaseDelayMs: number;
+        voiceReconnectMaxDelayMs: number;
         updateInterval: number;
         ephemeralInfoDeleteDelay: number;
         ephemeralInteractiveDeleteDelay: number;
@@ -202,7 +209,14 @@ export const config: AppConfig = {
     },
     audio: {
         bufferSize: 5,
-        cacheAhead: 3,
+        cacheAhead: 5,
+        cacheMaxMb: 1536,
+        cacheMaxAgeHours: 24,
+        ytDlpTimeoutMs: 20_000,
+        ffmpegTimeoutMs: 12_000,
+        voiceReconnectMaxAttempts: 4,
+        voiceReconnectBaseDelayMs: 1_000,
+        voiceReconnectMaxDelayMs: 8_000,
         updateInterval: 5000,
         ephemeralInfoDeleteDelay: 5000,
         ephemeralInteractiveDeleteDelay: 30000,

@@ -41,6 +41,6 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
 
     log.info('Déconnexion via /leave');
-    queueManager.deleteQueue(interaction.guildId!);
+    queueManager.deleteQueue(interaction.guildId!, true);
     await replyEphemeral(interaction, `👋 ${t(locale, 'leave.disconnected')}`);
 }

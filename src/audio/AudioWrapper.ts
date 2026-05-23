@@ -11,6 +11,8 @@ import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
 import { downloadFile } from '../utils/httpClient.js';
 import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
+import { mediaCacheManager } from './MediaCacheManager.js';
+import { sponsorBlockService } from './SponsorBlockService.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
 
@@ -73,6 +75,11 @@ interface ResourceMetadata {
 interface WarmResourceEntry {
     warmedAt: number;
     expiresAt: number;
+}
+
+interface SponsorSegment {
+    start: number;
+    end: number;
 }
 
 export class AudioWrapper extends EventEmitter {
@@ -518,7 +525,12 @@ export class AudioWrapper extends EventEmitter {
      * Crée une ressource audio à partir d'une piste
      * Utilise yt-dlp pour obtenir le stream audio
      */
-    async createResource(guildId: string, track: Track, startSeconds: number = 0): Promise<AudioResource | null> {
+    async createResource(
+        guildId: string,
+        track: Track,
+        startSeconds: number = 0,
+        sponsorBlockEnabled = false
+    ): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
         log.trace('Track ID:', track.id);
 
@@ -529,6 +541,16 @@ export class AudioWrapper extends EventEmitter {
         }
 
         try {
+            const sponsorSegments = await sponsorBlockService.getSegments(track.id, sponsorBlockEnabled);
+            const cachedFile = await mediaCacheManager.getTrackPath(track.id);
+            if (cachedFile) {
+                const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, startSeconds, sponsorSegments);
+                if (resource) {
+                    this.lastSourceModeByGuild.set(guildId, 'direct');
+                    return resource;
+                }
+            }
+
             const cacheKey = this.getScopedTrackKey(guildId, track.id);
             const cached = this.cache.get(cacheKey);
             if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
@@ -537,7 +559,8 @@ export class AudioWrapper extends EventEmitter {
                     guildId,
                     track,
                     cached.streamUrl,
-                    startSeconds
+                    startSeconds,
+                    sponsorSegments
                 );
                 if (directResource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
@@ -546,10 +569,15 @@ export class AudioWrapper extends EventEmitter {
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
             }
 
-            // Utiliser yt-dlp pour streamer directement
-            log.debug('Utilisation de yt-dlp pour le streaming audio...');
-            const resource = await this.createResourceWithYtdlp(guildId, track, startSeconds);
-            this.lastSourceModeByGuild.set(guildId, resource ? 'ytdlp' : 'unknown');
+            const streamUrl = await mediaCacheManager.getStreamUrl(track.id);
+            if (!streamUrl) {
+                log.error('Impossible de résoudre une URL audio directe pour cette piste');
+                this.lastSourceModeByGuild.set(guildId, 'unknown');
+                return null;
+            }
+
+            const resource = await this.createResourceWithDirectUrl(guildId, track, streamUrl, startSeconds, sponsorSegments);
+            this.lastSourceModeByGuild.set(guildId, resource ? 'direct' : 'unknown');
             return resource;
         } catch (error) {
             log.error(`Erreur lors de la création de la ressource:`, error);
@@ -827,9 +855,11 @@ export class AudioWrapper extends EventEmitter {
         guildId: string,
         track: Track,
         directUrl: string,
-        startSeconds: number
+        startSeconds: number,
+        sponsorSegments: SponsorSegment[] = []
     ): Promise<AudioResource | null> {
         const runDir = await this.createRunDirectory(guildId);
+        const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
         const ffmpegArgs = [
             '-loglevel', 'warning',
             '-reconnect', '1',
@@ -841,6 +871,7 @@ export class AudioWrapper extends EventEmitter {
             '-f', 's16le',
             '-ar', '48000',
             '-ac', '2',
+            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
             'pipe:1',
         ];
 
@@ -933,6 +964,67 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return resource;
+    }
+
+    private buildAudioFilters(startSeconds: number, sponsorSegments: SponsorSegment[]): string[] {
+        const filters: string[] = [];
+        const normalizedStart = Math.max(0, startSeconds);
+        const shiftedSegments = this.shiftSponsorSegments(sponsorSegments, normalizedStart);
+        const sponsorFilter = this.buildSponsorFilter(shiftedSegments);
+        if (sponsorFilter) {
+            filters.push(`aselect='${sponsorFilter}'`);
+        }
+
+        if (filters.length > 0) {
+            filters.push('asetpts=N/SR/TB');
+        }
+
+        return filters;
+    }
+
+    private buildSponsorFilter(segments: SponsorSegment[]): string | null {
+        const normalized = this.normalizeSponsorSegments(segments);
+        if (normalized.length === 0) {
+            return null;
+        }
+
+        return `not((${normalized.map((segment) => `between(t,${segment.start},${segment.end})`).join('+')}))`;
+    }
+
+    private shiftSponsorSegments(segments: SponsorSegment[], startSeconds: number): SponsorSegment[] {
+        if (startSeconds <= 0) {
+            return segments;
+        }
+
+        return segments
+            .map((segment) => ({
+                start: Math.max(0, segment.start - startSeconds),
+                end: segment.end - startSeconds,
+            }))
+            .filter((segment) => segment.end > segment.start + 0.3);
+    }
+
+    private normalizeSponsorSegments(segments: SponsorSegment[]): SponsorSegment[] {
+        const cleaned = segments
+            .filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end))
+            .map((segment) => ({
+                start: Math.max(0, Number.parseFloat(segment.start.toFixed(3))),
+                end: Math.max(0, Number.parseFloat(segment.end.toFixed(3))),
+            }))
+            .filter((segment) => segment.end > segment.start + 0.3)
+            .sort((a, b) => a.start - b.start);
+
+        const merged: SponsorSegment[] = [];
+        for (const segment of cleaned) {
+            const last = merged[merged.length - 1];
+            if (!last || segment.start > last.end + 0.3) {
+                merged.push({ ...segment });
+            } else {
+                last.end = Math.max(last.end, segment.end);
+            }
+        }
+
+        return merged;
     }
 
     /**
@@ -1499,6 +1591,7 @@ export class AudioWrapper extends EventEmitter {
         try {
             const toPreload = tracks.slice(0, config.audio.cacheAhead);
             log.debug(`Pré-vérification de ${toPreload.length} piste(s)...`);
+            mediaCacheManager.preloadTracks(toPreload);
 
             for (const track of toPreload) {
                 const cacheKey = this.getScopedTrackKey(guildId, track.id);
@@ -1587,6 +1680,7 @@ export class AudioWrapper extends EventEmitter {
         this.warmupInFlight.clear();
         this.preloadingGuilds.clear();
         this.lastSourceModeByGuild.clear();
+        mediaCacheManager.clearAll();
         log.info(`Cache vidé: ${size} entrée(s) supprimée(s), warmup vidé: ${warmSize}, warmup in-flight: ${inFlightSize}`);
     }
 
