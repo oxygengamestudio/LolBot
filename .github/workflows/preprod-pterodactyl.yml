@@ -102,6 +102,8 @@ jobs:
           PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
           PTERO_SERVER_ID: ${{ secrets.PTERO_SERVER_ID }}
         run: |
+          set -euo pipefail
+
           if [ -z "$PTERO_SERVER_ID" ]; then
             echo "PTERO_SERVER_ID is not set. Skipping Pterodactyl restart."
             exit 0
@@ -109,12 +111,48 @@ jobs:
 
           test -n "$PTERO_URL"
           test -n "$PTERO_CLIENT_API_KEY"
-          server_identifier="${PTERO_SERVER_ID%%-*}"
 
-          curl --fail-with-body \
+          api_base="${PTERO_URL%/}/api/client"
+          server_identifier="$PTERO_SERVER_ID"
+
+          if [[ "$PTERO_SERVER_ID" == *-* ]]; then
+            servers_json="$(mktemp)"
+            if curl --silent --show-error --fail-with-body \
+              "${api_base}" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --output "$servers_json"; then
+              resolved_identifier="$(jq -r --arg uuid "$PTERO_SERVER_ID" '
+                .data[]
+                | select(.attributes.uuid == $uuid or .attributes.identifier == $uuid)
+                | .attributes.identifier
+              ' "$servers_json" | head -n 1)"
+              if [ -n "$resolved_identifier" ] && [ "$resolved_identifier" != "null" ]; then
+                server_identifier="$resolved_identifier"
+              else
+                server_identifier="${PTERO_SERVER_ID%%-*}"
+              fi
+            else
+              server_identifier="${PTERO_SERVER_ID%%-*}"
+            fi
+          fi
+
+          response_body="$(mktemp)"
+          status_code="$(curl --silent --show-error \
             --request POST \
-            "${PTERO_URL%/}/api/client/servers/${server_identifier}/power" \
+            "${api_base}/servers/${server_identifier}/power" \
             --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
             --header "Accept: Application/vnd.pterodactyl.v1+json" \
             --header "Content-Type: application/json" \
-            --data '{"signal":"restart"}'
+            --data '{"signal":"restart"}' \
+            --output "$response_body" \
+            --write-out "%{http_code}")"
+
+          if [ "$status_code" = "204" ]; then
+            echo "Pterodactyl restart signal sent."
+            exit 0
+          fi
+
+          echo "Pterodactyl restart failed with HTTP ${status_code}."
+          cat "$response_body"
+          exit 1
