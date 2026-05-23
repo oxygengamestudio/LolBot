@@ -23,6 +23,43 @@ After the workflow has run successfully, the package page will be under the GitH
 https://github.com/orgs/oxygengamestudio/packages/container/package/lolbot
 ```
 
+## Private GHCR access from Raynor
+
+If the GitHub repository or package stays private, Wings on `raynor.zerandia.fr` must authenticate to `ghcr.io` before it can pull `ghcr.io/oxygengamestudio/lolbot:preprod`.
+
+Create a GitHub personal access token for the node with package read access. For a private package linked to a private repository, use a token that can read packages and the private repository. Do not use a Discord token, Pterodactyl API key, or a token pasted in chat for this.
+
+On `raynor.zerandia.fr`, add this under the existing `docker:` section in `/etc/pterodactyl/config.yml`:
+
+```yaml
+docker:
+  registries:
+    ghcr.io:
+      username: "oxygengamestudio"
+      password: "<GHCR_READ_PACKAGES_PAT>"
+```
+
+The same snippet is available in:
+
+```text
+pterodactyl/wings-ghcr-private.example.yml
+```
+
+Then restart Wings:
+
+```bash
+sudo systemctl restart wings
+```
+
+To verify the node can pull the private image:
+
+```bash
+echo '<GHCR_READ_PACKAGES_PAT>' | docker login ghcr.io -u oxygengamestudio --password-stdin
+docker pull ghcr.io/oxygengamestudio/lolbot:preprod
+```
+
+Keep the egg Docker image set to `ghcr.io/oxygengamestudio/lolbot:preprod`. GitHub Actions overwrites that tag on each successful push to `main`, then calls the Pterodactyl restart API. Wings should pull the configured image during server boot; if it keeps an older cached image, check the Wings logs and trigger a server reinstall or pull the image manually on the node.
+
 ## Pterodactyl server settings
 
 Import the egg template:

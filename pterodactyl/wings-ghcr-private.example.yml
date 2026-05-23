@@ -1,0 +1,5 @@
+docker:
+  registries:
+    ghcr.io:
+      username: "oxygengamestudio"
+      password: "<GHCR_READ_PACKAGES_PAT>"

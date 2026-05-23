@@ -10,6 +10,9 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:24-bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/oxygengamestudio/LolBot" \
+    org.opencontainers.image.description="LolBot Discord music bot preprod image"
+
 ARG DEBIAN_FRONTEND=noninteractive
 ARG YTDLP_VERSION=2026.03.03
 ARG YTDLP_SHA256=cc706b94cde1cf92cc155e3632aa290ab5f3809ada8c56c23311335508decdf9
