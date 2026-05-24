@@ -244,6 +244,7 @@ export class MediaCacheManager {
             '-i', streamUrl,
             '-vn',
             '-acodec', 'libopus',
+            '-b:a', '128k',
             '-f', 'ogg',
             '-ar', '48000',
             '-ac', '2',
@@ -389,7 +390,7 @@ export class MediaCacheManager {
             setTimeout(() => {
                 child.kill();
                 finish(false);
-            }, config.audio.ffmpegTimeoutMs);
+            }, config.audio.cacheDownloadTimeoutMs);
         });
     }
 

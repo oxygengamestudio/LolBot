@@ -47,6 +47,7 @@ export interface AppConfig {
         cacheMaxAgeHours: number;
         ytDlpTimeoutMs: number;
         ffmpegTimeoutMs: number;
+        cacheDownloadTimeoutMs: number;
         voiceReconnectMaxAttempts: number;
         voiceReconnectBaseDelayMs: number;
         voiceReconnectMaxDelayMs: number;
@@ -214,6 +215,7 @@ export const config: AppConfig = {
         cacheMaxAgeHours: 24,
         ytDlpTimeoutMs: 20_000,
         ffmpegTimeoutMs: 12_000,
+        cacheDownloadTimeoutMs: 180_000,
         voiceReconnectMaxAttempts: 4,
         voiceReconnectBaseDelayMs: 1_000,
         voiceReconnectMaxDelayMs: 8_000,

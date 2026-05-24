@@ -541,7 +541,7 @@ export class AudioWrapper extends EventEmitter {
         }
 
         try {
-            const sponsorSegments = await sponsorBlockService.getSegments(track.id, sponsorBlockEnabled);
+            const sponsorSegments = await this.getSponsorSegmentsFast(track.id, sponsorBlockEnabled);
             const cachedFile = await mediaCacheManager.getTrackPath(track.id);
             if (cachedFile) {
                 const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, startSeconds, sponsorSegments);
@@ -569,22 +569,9 @@ export class AudioWrapper extends EventEmitter {
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
             }
 
-            const streamUrl = (await this.resolveDirectStreamUrl(guildId, track))
-                ?? (await mediaCacheManager.getStreamUrl(track.id));
-            if (!streamUrl) {
-                log.warn('Impossible de résoudre une URL audio directe, fallback yt-dlp streaming');
-                const fallback = await this.createResourceWithYtdlp(guildId, track, startSeconds);
-                this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
-                return fallback;
-            }
-
-            const resource = await this.createResourceWithDirectUrl(guildId, track, streamUrl, startSeconds, sponsorSegments);
-            if (resource) {
-                this.lastSourceModeByGuild.set(guildId, 'direct');
-                return resource;
-            }
-
-            log.warn('URL audio directe inutilisable, fallback yt-dlp streaming');
+            void this.warmTrack(guildId, track).catch(() => undefined);
+            mediaCacheManager.preloadTracks([track]);
+            log.debug('Aucun media pre-resolu disponible, demarrage streaming yt-dlp immediat');
             const fallback = await this.createResourceWithYtdlp(guildId, track, startSeconds);
             this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
             return fallback;
@@ -592,6 +579,20 @@ export class AudioWrapper extends EventEmitter {
             log.error(`Erreur lors de la création de la ressource:`, error);
             return null;
         }
+    }
+
+    private async getSponsorSegmentsFast(videoId: string, enabled: boolean): Promise<SponsorSegment[]> {
+        if (!enabled) {
+            return [];
+        }
+
+        return Promise.race([
+            sponsorBlockService.getSegments(videoId, enabled),
+            new Promise<SponsorSegment[]>((resolve) => {
+                const timer = setTimeout(() => resolve([]), 750);
+                timer.unref?.();
+            }),
+        ]);
     }
 
     async createCrossfadeResource(
@@ -1104,10 +1105,6 @@ export class AudioWrapper extends EventEmitter {
         // Arguments FFmpeg pour transcoder en PCM
         const ffmpegArgs = [
             '-loglevel', 'warning',
-            '-fflags', 'nobuffer',
-            '-flags', 'low_delay',
-            '-probesize', '32k',
-            '-analyzeduration', '0',
             '-i', 'pipe:0', // Input depuis stdin (yt-dlp)
             '-vn', // Pas de video
             '-f', 's16le', // Format PCM

@@ -51,6 +51,9 @@ interface VideoApiItem {
     contentDetails?: {
         duration?: string;
     };
+    statistics?: {
+        viewCount?: string;
+    };
 }
 
 interface PlaylistItemApi {
@@ -86,7 +89,7 @@ export class YouTubeService {
         const normalizedQuery = this.normalizeSearchInput(query);
         const rawResults = await this.searchRawVariants(normalizedQuery, maxResults);
         return this.rankSearchResults(normalizedQuery, rawResults)
-            .sort((a, b) => b.score - a.score)
+            .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
             .slice(0, maxResults);
     }
 
@@ -189,7 +192,7 @@ export class YouTubeService {
         }
 
         const detailsParams = new URLSearchParams({
-            part: 'contentDetails,snippet',
+            part: 'contentDetails,snippet,statistics',
             id: videoIds,
             key: this.apiKey!,
         });
@@ -209,6 +212,7 @@ export class YouTubeService {
                 thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url || '',
                 channelTitle: item.snippet.channelTitle ?? 'Unknown channel',
                 channelId: item.snippet.channelId,
+                viewCount: this.coerceViewCount(item.statistics?.viewCount),
             }))
             .slice(0, expandedMaxResults);
     }
@@ -474,6 +478,7 @@ export class YouTubeService {
             thumbnail: this.getYtdlpThumbnail(entry),
             channelTitle: String(entry?.channel ?? entry?.uploader ?? ''),
             channelId: typeof entry?.channel_id === 'string' ? entry.channel_id : undefined,
+            viewCount: this.coerceViewCount(entry?.view_count),
         };
     }
 
@@ -549,7 +554,7 @@ export class YouTubeService {
         return results.map((result) => ({
             ...result,
             score: this.scoreSearchResult(result, tokens, explicit),
-        }));
+        })).sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)));
     }
 
     private scoreSearchResult(
@@ -594,6 +599,12 @@ export class YouTubeService {
         const missingTokens = queryTokens.filter((token) => !fullText.includes(token) && !VERSION_TOKENS.has(token));
         score += matchedTokens.length * 28;
         score -= missingTokens.length * 140;
+
+        const viewCount = result.viewCount ?? 0;
+        if (viewCount > 0) {
+            score += Math.min(170, Math.log10(viewCount + 1) * 19);
+            score += Math.min(120, viewCount / 10_000_000);
+        }
 
         if (fullText.includes('cover') && !explicit.cover) score -= 260;
         if (fullText.includes('remix') && !explicit.remix) score -= 110;
@@ -755,6 +766,16 @@ export class YouTubeService {
         }
 
         return 0;
+    }
+
+    private coerceViewCount(value: unknown): number | undefined {
+        const parsed = typeof value === 'number'
+            ? value
+            : typeof value === 'string'
+                ? Number.parseInt(value, 10)
+                : NaN;
+
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
     }
 
     private formatDurationFromSeconds(totalSeconds: number): string {
