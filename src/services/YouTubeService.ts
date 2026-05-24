@@ -11,11 +11,13 @@ const OFFICIAL_KEYWORDS = [
     'official lyric video',
     'official audio',
     'official video',
+    'clip officiel',
+    'video officielle',
     'lyric video',
     'vevo',
 ];
 const QUERY_STOP_WORDS = new Set(['a', 'an', 'the', 'de', 'du', 'des', 'et', 'feat', 'featuring', 'with']);
-const VERSION_TOKENS = new Set(['cover', 'remix', 'live', 'karaoke', 'reaction', 'spedup', 'nightcore']);
+const VERSION_TOKENS = new Set(['cover', 'remix', 'live', 'karaoke', 'instrumental', 'instru', 'reaction', 'spedup', 'nightcore']);
 const COMMON_QUERY_TYPOS = new Map<string, string>([
     ['lvoe', 'love'],
     ['lvo', 'love'],
@@ -547,6 +549,7 @@ export class YouTubeService {
             live: tokens.includes('live'),
             nightcore: tokens.includes('nightcore'),
             karaoke: tokens.includes('karaoke'),
+            instrumental: tokens.includes('instrumental') || tokens.includes('instru'),
             reaction: tokens.includes('reaction'),
             spedup: tokens.includes('spedup') || tokens.includes('sped'),
         };
@@ -566,6 +569,7 @@ export class YouTubeService {
             live: boolean;
             nightcore: boolean;
             karaoke: boolean;
+            instrumental: boolean;
             reaction: boolean;
             spedup: boolean;
         }
@@ -610,7 +614,9 @@ export class YouTubeService {
         if (fullText.includes('remix') && !explicit.remix) score -= 110;
         if (fullText.includes('live') && !explicit.live) score -= 90;
         if (fullText.includes('nightcore') && !explicit.nightcore) score -= 120;
-        if (fullText.includes('karaoke') && !explicit.karaoke) score -= 110;
+        if (fullText.includes('karaoke') && !explicit.karaoke) score -= 380;
+        if ((fullText.includes('instrumental') || fullText.includes('instru')) && !explicit.instrumental) score -= 300;
+        if ((fullText.includes('vocals only') || fullText.includes('lyrics only')) && !explicit.instrumental) score -= 220;
         if (fullText.includes('reaction') && !explicit.reaction) score -= 120;
         if ((fullText.includes('sped up') || fullText.includes('spedup')) && !explicit.spedup) score -= 100;
 

@@ -94,8 +94,8 @@ export class AudioWrapper extends EventEmitter {
     private warmupInFlight: Map<string, Promise<void>> = new Map();
     private lastSourceModeByGuild: Map<string, 'direct' | 'ytdlp' | 'unknown'> = new Map();
     private readonly discordOpusBitrateKbps = 128;
-    private readonly streamReadyWaitMs = 6_000;
-    private readonly directStreamReadyWaitMs = 4_000;
+    private readonly streamReadyWaitMs = 1_000;
+    private readonly directStreamReadyWaitMs = 1_000;
     private readonly crossfadeReadyWaitMs = 4_000;
     private readonly warmResourceTtlMs = 90_000;
     private warnedUnsafeYtdlpExtraArgsIgnored = false;
@@ -589,6 +589,23 @@ export class AudioWrapper extends EventEmitter {
                 }
             }
 
+            if (effectiveStartSeconds > startSeconds + 3) {
+                const seekableUrl = await this.resolveDirectStreamUrlQuick(guildId, track, 5_000);
+                if (seekableUrl) {
+                    const directResource = await this.createResourceWithDirectUrl(
+                        guildId,
+                        track,
+                        seekableUrl,
+                        effectiveStartSeconds,
+                        sponsorSegments
+                    );
+                    if (directResource) {
+                        this.lastSourceModeByGuild.set(guildId, 'direct');
+                        return directResource;
+                    }
+                }
+            }
+
             log.debug('Aucun media pre-resolu disponible, demarrage streaming yt-dlp immediat');
             const fallback = await this.createResourceWithYtdlp(guildId, track, effectiveStartSeconds, sponsorSegments);
             this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
@@ -826,6 +843,11 @@ export class AudioWrapper extends EventEmitter {
             return afterWarm.streamUrl;
         }
 
+        const quickUrl = await this.resolveDirectStreamUrlQuick(guildId, track, 8_000);
+        if (quickUrl) {
+            return quickUrl;
+        }
+
         const includeCookies = this.hasCookieEnv();
         let infoResult = await this.fetchYtdlpInfo(guildId, track.url, includeCookies).catch(() => ({ info: null, ytdlpErrors: '' }));
         if (!infoResult.info && includeCookies && this.isCookieCopyError(infoResult.ytdlpErrors)) {
@@ -845,6 +867,36 @@ export class AudioWrapper extends EventEmitter {
             timestamp: Date.now(),
         });
         return directUrl;
+    }
+
+    private async resolveDirectStreamUrlQuick(guildId: string, track: Track, timeoutMs: number): Promise<string | null> {
+        const cacheKey = this.getScopedTrackKey(guildId, track.id);
+        const cached = this.cache.get(cacheKey);
+        if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
+            return cached.streamUrl;
+        }
+
+        const includeCookies = this.hasCookieEnv();
+        const attempts = includeCookies ? [true, false] : [false];
+        for (const attemptCookies of attempts) {
+            const result = await this.fetchDirectStreamUrl(guildId, track.url, attemptCookies, timeoutMs);
+            if (result.url) {
+                this.cache.set(cacheKey, {
+                    guildId,
+                    trackId: track.id,
+                    resource: null,
+                    streamUrl: result.url,
+                    timestamp: Date.now(),
+                });
+                return result.url;
+            }
+
+            if (!attemptCookies || !this.isCookieCopyError(result.ytdlpErrors)) {
+                break;
+            }
+        }
+
+        return null;
     }
 
     private isLikelyDirectStreamUrl(url: string): boolean {
@@ -1427,12 +1479,14 @@ export class AudioWrapper extends EventEmitter {
         const warmup = (async () => {
             const startedAt = Date.now();
             const includeCookies = this.hasCookieEnv();
-            let infoResult = await this.fetchYtdlpInfo(guildId, track.url, includeCookies).catch(() => ({ info: null, ytdlpErrors: '' }));
-            if (!infoResult.info && includeCookies && this.isCookieCopyError(infoResult.ytdlpErrors)) {
-                infoResult = await this.fetchYtdlpInfo(guildId, track.url, false).catch(() => ({ info: null, ytdlpErrors: '' }));
+            let streamResult = await this.fetchDirectStreamUrl(guildId, track.url, includeCookies, 8_000)
+                .catch(() => ({ url: null, ytdlpErrors: '' }));
+            if (!streamResult.url && includeCookies && this.isCookieCopyError(streamResult.ytdlpErrors)) {
+                streamResult = await this.fetchDirectStreamUrl(guildId, track.url, false, 8_000)
+                    .catch(() => ({ url: null, ytdlpErrors: '' }));
             }
 
-            const directUrl = infoResult.info ? this.extractBestAudioUrl(infoResult.info) : null;
+            const directUrl = streamResult.url;
             const existingCache = this.cache.get(cacheKey);
             this.cache.set(cacheKey, {
                 guildId,
@@ -1459,6 +1513,81 @@ export class AudioWrapper extends EventEmitter {
 
         this.warmupInFlight.set(cacheKey, warmup);
         await warmup;
+    }
+
+    private async fetchDirectStreamUrl(
+        guildId: string,
+        url: string,
+        includeCookies: boolean,
+        timeoutMs: number
+    ): Promise<{ url: string | null; ytdlpErrors: string }> {
+        const runDir = await this.createRunDirectory(guildId);
+        const extraArgs = this.getYtdlpExtraArgs(includeCookies);
+        const ytdlpArgs = [
+            ...extraArgs,
+            '--no-warnings',
+            '--no-playlist',
+            '--paths', `temp:${runDir}`,
+            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '--get-url',
+            url,
+        ];
+
+        return new Promise((resolve) => {
+            let stdout = '';
+            let stderr = '';
+            let settled = false;
+
+            const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                windowsHide: true,
+                env: this.getSpawnEnv(runDir),
+                cwd: runDir,
+            });
+
+            const finish = (resultUrl: string | null, errors: string = stderr) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                void this.cleanupRunDirectory(runDir);
+                resolve({ url: resultUrl, ytdlpErrors: errors });
+            };
+
+            const timer = setTimeout(() => {
+                if (!ytdlp.killed) {
+                    ytdlp.kill();
+                }
+                finish(null, stderr || `yt-dlp get-url timeout after ${timeoutMs}ms`);
+            }, timeoutMs);
+            timer.unref?.();
+
+            ytdlp.stdout?.on('data', (data) => {
+                stdout += data.toString();
+            });
+
+            ytdlp.stderr?.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            ytdlp.on('error', (error) => {
+                finish(null, `${stderr}\n${error.message}`.trim());
+            });
+
+            ytdlp.on('close', (code) => {
+                if (code !== 0) {
+                    finish(null, stderr);
+                    return;
+                }
+
+                const directUrl = stdout
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .find((line) => this.isLikelyDirectStreamUrl(line));
+                finish(directUrl ?? null, stderr);
+            });
+        });
     }
 
     isTrackWarm(guildId: string, trackId: string): boolean {
