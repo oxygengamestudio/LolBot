@@ -16,6 +16,10 @@ const OFFICIAL_KEYWORDS = [
 ];
 const QUERY_STOP_WORDS = new Set(['a', 'an', 'the', 'de', 'du', 'des', 'et', 'feat', 'featuring', 'with']);
 const VERSION_TOKENS = new Set(['cover', 'remix', 'live', 'karaoke', 'reaction', 'spedup', 'nightcore']);
+const COMMON_QUERY_TYPOS = new Map<string, string>([
+    ['lvoe', 'love'],
+    ['lvo', 'love'],
+]);
 
 export interface RankedSearchResult extends SearchResult {
     score: number;
@@ -79,8 +83,9 @@ export class YouTubeService {
     }
 
     async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
-        const rawResults = await this.searchRaw(query, maxResults);
-        return this.rankSearchResults(query, rawResults)
+        const normalizedQuery = this.normalizeSearchInput(query);
+        const rawResults = await this.searchRawVariants(normalizedQuery, maxResults);
+        return this.rankSearchResults(normalizedQuery, rawResults)
             .sort((a, b) => b.score - a.score)
             .slice(0, maxResults);
     }
@@ -119,6 +124,41 @@ export class YouTubeService {
             console.warn('YouTube Data API search failed, falling back to yt-dlp:', this.formatError(error));
             return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
         }
+    }
+
+    private async searchRawVariants(query: string, maxResults = 10): Promise<SearchResult[]> {
+        const variants = this.buildSearchVariants(query);
+        const resultSets = await Promise.all(
+            variants.map((variant) => this.searchRaw(variant, maxResults).catch(() => [] as SearchResult[]))
+        );
+        const unique = new Map<string, SearchResult>();
+
+        for (const results of resultSets) {
+            for (const result of results) {
+                if (!unique.has(result.id)) {
+                    unique.set(result.id, result);
+                }
+            }
+        }
+
+        return Array.from(unique.values());
+    }
+
+    private buildSearchVariants(query: string): string[] {
+        const trimmed = query.trim();
+        if (!trimmed) {
+            return [trimmed];
+        }
+
+        const variants = [
+            trimmed,
+            `"${trimmed}" official music video`,
+            `${trimmed} official music video`,
+            `${trimmed} official lyric video`,
+            `${trimmed} vevo`,
+        ];
+
+        return Array.from(new Set(variants));
     }
 
     private async searchWithGoogle(query: string, maxResults = 10): Promise<SearchResult[]> {
@@ -529,7 +569,15 @@ export class YouTubeService {
         const channel = this.normalizeRankingText(result.channelTitle ?? '');
         const fullText = `${title} ${channel}`;
         const durationSeconds = result.durationSeconds ?? this.parseDurationToSeconds(result.duration);
+        const queryPhrase = queryTokens.filter((token) => !VERSION_TOKENS.has(token)).join(' ');
         let score = 20;
+
+        if (queryPhrase.length > 0 && title.includes(queryPhrase)) {
+            score += 260;
+        }
+        if (queryPhrase.length > 0 && fullText.includes(queryPhrase)) {
+            score += 90;
+        }
 
         for (const keyword of OFFICIAL_KEYWORDS) {
             if (title.includes(keyword)) {
@@ -543,9 +591,11 @@ export class YouTubeService {
         if (title.includes('official')) score += 70;
 
         const matchedTokens = queryTokens.filter((token) => fullText.includes(token));
+        const missingTokens = queryTokens.filter((token) => !fullText.includes(token) && !VERSION_TOKENS.has(token));
         score += matchedTokens.length * 28;
+        score -= missingTokens.length * 140;
 
-        if (fullText.includes('cover') && !explicit.cover) score -= 130;
+        if (fullText.includes('cover') && !explicit.cover) score -= 260;
         if (fullText.includes('remix') && !explicit.remix) score -= 110;
         if (fullText.includes('live') && !explicit.live) score -= 90;
         if (fullText.includes('nightcore') && !explicit.nightcore) score -= 120;
@@ -565,8 +615,17 @@ export class YouTubeService {
     private extractRankingTokens(query: string): string[] {
         return this.normalizeRankingText(query)
             .split(/\s+/)
+            .map((token) => COMMON_QUERY_TYPOS.get(token) ?? token)
             .map((token) => token === 'sped' || token === 'spedup' ? 'spedup' : token)
             .filter((token) => token.length > 1 && !QUERY_STOP_WORDS.has(token));
+    }
+
+    private normalizeSearchInput(query: string): string {
+        const tokens = this.normalizeRankingText(query)
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((token) => COMMON_QUERY_TYPOS.get(token) ?? token);
+        return tokens.join(' ') || query.trim();
     }
 
     private normalizeRankingText(text: string): string {

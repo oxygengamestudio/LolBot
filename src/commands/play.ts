@@ -1,18 +1,14 @@
 ﻿import {
-    ActionRowBuilder,
     SlashCommandBuilder,
     AutocompleteInteraction,
     ChatInputCommandInteraction,
     GuildMember,
     MessageFlags,
     StageChannel,
-    StringSelectMenuBuilder,
     StringSelectMenuInteraction,
-    StringSelectMenuOptionBuilder,
     TextChannel,
     VoiceChannel,
 } from 'discord.js';
-import { randomUUID } from 'crypto';
 import { youtubeService } from '../services/YouTubeService.js';
 import { queueManager } from '../services/QueueManager.js';
 import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
@@ -32,7 +28,6 @@ const AUTOCOMPLETE_HINT_REFINE = '__hint_refine_query__';
 const AUTOCOMPLETE_HINT_NO_RESULTS = '__hint_no_results__';
 const MAX_AUTOCOMPLETE_OPTIONS = 25;
 const PLAY_SELECTION_PREFIX = 'play_select';
-const PLAY_SELECTION_TTL_MS = 60_000;
 
 type AutocompleteOption = { name: string; value: string };
 type PlayInteraction = ChatInputCommandInteraction | StringSelectMenuInteraction;
@@ -405,50 +400,6 @@ async function handleSearchAuto(
             allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
-        return;
-    }
-
-    if (!youtubeService.shouldAutoSelect(rankedResults, query) || !rankedResults[0]) {
-        const selectionId = randomUUID();
-        const candidates = results.slice(0, Math.min(5, results.length));
-        const select = new StringSelectMenuBuilder()
-            .setCustomId(`${PLAY_SELECTION_PREFIX}:${selectionId}`)
-            .setPlaceholder('Choisissez un résultat')
-            .setMinValues(1)
-            .setMaxValues(1)
-            .addOptions(
-                candidates.map((result, index) =>
-                    new StringSelectMenuOptionBuilder()
-                        .setLabel(truncateString(`${index + 1}. ${result.title}`, 100))
-                        .setDescription(truncateString(`${result.duration} • ${result.channelTitle ?? 'source inconnue'}`, 100))
-                        .setValue(String(index))
-                )
-            );
-
-        pendingSelections.set(selectionId, {
-            createdAt: Date.now(),
-            guildId: interaction.guildId!,
-            userId: interaction.user.id,
-            textChannelId: interaction.channelId,
-            voiceChannelId: voiceChannel.id,
-            requestedBy: member.displayName,
-            requestedById: member.id,
-            query,
-            results: candidates,
-        });
-
-        setTimeout(() => {
-            const payload = pendingSelections.get(selectionId);
-            if (payload && Date.now() - payload.createdAt >= PLAY_SELECTION_TTL_MS) {
-                pendingSelections.delete(selectionId);
-            }
-        }, PLAY_SELECTION_TTL_MS + 1_000);
-
-        await interaction.editReply({
-            content: `Recherche "${safeContent(query)}" ambiguë. Choisis une piste dans les ${candidates.length} résultats :`,
-            components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
-            allowedMentions: { parse: [] },
-        });
         return;
     }
 

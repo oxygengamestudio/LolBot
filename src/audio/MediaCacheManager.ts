@@ -276,7 +276,7 @@ export class MediaCacheManager {
 
     private async resolveStreamUrl(videoId: string): Promise<string | null> {
         const selectors = [
-            'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+            'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             'bestaudio/best',
         ];
 

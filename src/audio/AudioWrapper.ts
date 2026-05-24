@@ -569,16 +569,25 @@ export class AudioWrapper extends EventEmitter {
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
             }
 
-            const streamUrl = await mediaCacheManager.getStreamUrl(track.id);
+            const streamUrl = (await this.resolveDirectStreamUrl(guildId, track))
+                ?? (await mediaCacheManager.getStreamUrl(track.id));
             if (!streamUrl) {
-                log.error('Impossible de résoudre une URL audio directe pour cette piste');
-                this.lastSourceModeByGuild.set(guildId, 'unknown');
-                return null;
+                log.warn('Impossible de résoudre une URL audio directe, fallback yt-dlp streaming');
+                const fallback = await this.createResourceWithYtdlp(guildId, track, startSeconds);
+                this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
+                return fallback;
             }
 
             const resource = await this.createResourceWithDirectUrl(guildId, track, streamUrl, startSeconds, sponsorSegments);
-            this.lastSourceModeByGuild.set(guildId, resource ? 'direct' : 'unknown');
-            return resource;
+            if (resource) {
+                this.lastSourceModeByGuild.set(guildId, 'direct');
+                return resource;
+            }
+
+            log.warn('URL audio directe inutilisable, fallback yt-dlp streaming');
+            const fallback = await this.createResourceWithYtdlp(guildId, track, startSeconds);
+            this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
+            return fallback;
         } catch (error) {
             log.error(`Erreur lors de la création de la ressource:`, error);
             return null;
@@ -860,11 +869,12 @@ export class AudioWrapper extends EventEmitter {
     ): Promise<AudioResource | null> {
         const runDir = await this.createRunDirectory(guildId);
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
+        const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
+            ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
+            : [];
         const ffmpegArgs = [
             '-loglevel', 'warning',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '2',
+            ...inputReconnectArgs,
             ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
             '-i', directUrl,
             '-vn',
@@ -1076,7 +1086,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-warnings',
             '--no-playlist',
             '--paths', `temp:${runDir}`,
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '-o', '-', // Output vers stdout
             '--quiet',
             track.url,
@@ -1450,7 +1460,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-playlist',
             '--paths', `temp:${runDir}`,
             '--skip-download',
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '--dump-single-json',
             url,
         ];
