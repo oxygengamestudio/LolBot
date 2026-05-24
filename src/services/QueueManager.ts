@@ -681,12 +681,7 @@ class QueueManager extends EventEmitter {
 
         const warmHit = audioWrapper.isTrackWarm(guildId, track.id);
         log.debug(`warmup_${warmHit ? 'hit' : 'miss'}: ${track.title}`);
-        const warmStartedAt = Date.now();
-        const warmupPromise = warmHit
-            ? Promise.resolve<number | null>(0)
-            : audioWrapper.warmTrack(guildId, track)
-                .then(() => Date.now() - warmStartedAt)
-                .catch(() => null);
+        const warmupPromise = Promise.resolve<number | null>(warmHit ? 0 : null);
 
         let joinMs: number | null = null;
         const warmupMs: number | null = warmHit ? 0 : null;
@@ -1379,7 +1374,8 @@ class QueueManager extends EventEmitter {
         }
 
         this.warmedTrackByGuild.set(queue.guildId, nextTrack.id);
-        void audioWrapper.preloadTracks(queue.guildId, [nextTrack]);
+        const cacheCandidates = queue.tracks.slice(1, config.audio.cacheAhead + 1);
+        void audioWrapper.preloadTracks(queue.guildId, cacheCandidates);
         void audioWrapper.warmTrack(queue.guildId, nextTrack);
     }
 

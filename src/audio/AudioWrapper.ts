@@ -542,9 +542,14 @@ export class AudioWrapper extends EventEmitter {
 
         try {
             const sponsorSegments = await this.getSponsorSegmentsFast(track.id, sponsorBlockEnabled);
+            const effectiveStartSeconds = this.getSponsorAdjustedStart(startSeconds, sponsorSegments);
+            if (effectiveStartSeconds > startSeconds + 0.25) {
+                log.info(`SponsorBlock: saut du debut non musical jusqu'a ${effectiveStartSeconds.toFixed(1)}s`);
+            }
+
             const cachedFile = await mediaCacheManager.getTrackPath(track.id);
             if (cachedFile) {
-                const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, startSeconds, sponsorSegments);
+                const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, effectiveStartSeconds, sponsorSegments);
                 if (resource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
                     return resource;
@@ -559,7 +564,7 @@ export class AudioWrapper extends EventEmitter {
                     guildId,
                     track,
                     cached.streamUrl,
-                    startSeconds,
+                    effectiveStartSeconds,
                     sponsorSegments
                 );
                 if (directResource) {
@@ -569,10 +574,23 @@ export class AudioWrapper extends EventEmitter {
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
             }
 
-            void this.warmTrack(guildId, track).catch(() => undefined);
-            mediaCacheManager.preloadTracks([track]);
+            const warmDirectUrl = await this.waitForWarmDirectUrl(guildId, track, 1_500);
+            if (warmDirectUrl) {
+                const directResource = await this.createResourceWithDirectUrl(
+                    guildId,
+                    track,
+                    warmDirectUrl,
+                    effectiveStartSeconds,
+                    sponsorSegments
+                );
+                if (directResource) {
+                    this.lastSourceModeByGuild.set(guildId, 'direct');
+                    return directResource;
+                }
+            }
+
             log.debug('Aucun media pre-resolu disponible, demarrage streaming yt-dlp immediat');
-            const fallback = await this.createResourceWithYtdlp(guildId, track, startSeconds);
+            const fallback = await this.createResourceWithYtdlp(guildId, track, effectiveStartSeconds, sponsorSegments);
             this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
             return fallback;
         } catch (error) {
@@ -589,10 +607,46 @@ export class AudioWrapper extends EventEmitter {
         return Promise.race([
             sponsorBlockService.getSegments(videoId, enabled),
             new Promise<SponsorSegment[]>((resolve) => {
-                const timer = setTimeout(() => resolve([]), 750);
+                const timer = setTimeout(() => resolve([]), 2_500);
                 timer.unref?.();
             }),
         ]);
+    }
+
+    private async waitForWarmDirectUrl(guildId: string, track: Track, timeoutMs: number): Promise<string | null> {
+        const cacheKey = this.getScopedTrackKey(guildId, track.id);
+        if (!this.warmupInFlight.has(cacheKey)) {
+            return null;
+        }
+
+        await Promise.race([
+            this.warmupInFlight.get(cacheKey),
+            new Promise<void>((resolve) => {
+                const timer = setTimeout(resolve, timeoutMs);
+                timer.unref?.();
+            }),
+        ]);
+
+        const warmed = this.cache.get(cacheKey);
+        return warmed?.streamUrl && this.isLikelyDirectStreamUrl(warmed.streamUrl) ? warmed.streamUrl : null;
+    }
+
+    private getSponsorAdjustedStart(startSeconds: number, sponsorSegments: SponsorSegment[]): number {
+        let adjustedStart = Math.max(0, startSeconds);
+        const segments = this.normalizeSponsorSegments(sponsorSegments);
+
+        for (const segment of segments) {
+            if (segment.start <= adjustedStart + 1 && segment.end > adjustedStart + 0.3) {
+                adjustedStart = segment.end;
+                continue;
+            }
+
+            if (segment.start > adjustedStart + 1) {
+                break;
+            }
+        }
+
+        return adjustedStart;
     }
 
     async createCrossfadeResource(
@@ -1044,18 +1098,19 @@ export class AudioWrapper extends EventEmitter {
     private async createResourceWithYtdlp(
         guildId: string,
         track: Track,
-        startSeconds: number = 0
+        startSeconds: number = 0,
+        sponsorSegments: SponsorSegment[] = []
     ): Promise<AudioResource | null> {
         try {
             const includeCookies = this.hasCookieEnv();
-            const primary = await this.createResourceWithYtdlpArgs(guildId, track, includeCookies, startSeconds);
+            const primary = await this.createResourceWithYtdlpArgs(guildId, track, includeCookies, startSeconds, sponsorSegments);
             if (primary.resource) {
                 return primary.resource;
             }
 
             if (includeCookies && this.isCookieCopyError(primary.ytdlpErrors)) {
                 log.warn('yt-dlp cookies from browser failed, retrying without cookies');
-                const fallback = await this.createResourceWithYtdlpArgs(guildId, track, false, startSeconds);
+                const fallback = await this.createResourceWithYtdlpArgs(guildId, track, false, startSeconds, sponsorSegments);
                 return fallback.resource;
             }
 
@@ -1073,7 +1128,8 @@ export class AudioWrapper extends EventEmitter {
         guildId: string,
         track: Track,
         includeCookies: boolean,
-        startSeconds: number
+        startSeconds: number,
+        sponsorSegments: SponsorSegment[]
     ): Promise<{ resource: AudioResource | null; ytdlpErrors: string }> {
         log.debug(`Creation du stream avec yt-dlp (${includeCookies ? 'cookies' : 'no-cookies'})...`);
         log.trace('URL:', sanitizeUrlForLogs(track.url));
@@ -1102,11 +1158,14 @@ export class AudioWrapper extends EventEmitter {
             cwd: runDir,
         });
 
+        const filteredSponsorSegments = sponsorSegments.filter((segment) => segment.end > startSeconds + 0.3);
+        const filters = this.buildAudioFilters(0, filteredSponsorSegments);
         // Arguments FFmpeg pour transcoder en PCM
         const ffmpegArgs = [
             '-loglevel', 'warning',
             '-i', 'pipe:0', // Input depuis stdin (yt-dlp)
             '-vn', // Pas de video
+            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
             '-f', 's16le', // Format PCM
             '-ar', '48000', // Sample rate 48kHz
             '-ac', '2', // Stereo

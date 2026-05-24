@@ -16,7 +16,6 @@ LABEL org.opencontainers.image.source="https://github.com/oxygengamestudio/LolBo
 ARG DEBIAN_FRONTEND=noninteractive
 ARG BOT_BUILD_SHA=local
 ARG YTDLP_VERSION=2026.03.03
-ARG YTDLP_SHA256=cc706b94cde1cf92cc155e3632aa290ab5f3809ada8c56c23311335508decdf9
 
 ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
@@ -25,9 +24,10 @@ ENV NODE_ENV=production \
     YTDLP_AUTO_DOWNLOAD=false
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg tini \
-    && curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp_linux" -o /usr/local/bin/yt-dlp \
-    && echo "${YTDLP_SHA256}  /usr/local/bin/yt-dlp" | sha256sum -c - \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 python3-venv tini \
+    && python3 -m venv /opt/yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp==${YTDLP_VERSION}" \
+    && printf '%s\n' '#!/bin/sh' 'exec /opt/yt-dlp/bin/python -m yt_dlp "$@"' > /usr/local/bin/yt-dlp \
     && chmod 0755 /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
 
