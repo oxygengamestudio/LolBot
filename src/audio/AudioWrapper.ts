@@ -93,7 +93,7 @@ export class AudioWrapper extends EventEmitter {
     private warmTracks: Map<string, WarmResourceEntry> = new Map();
     private warmupInFlight: Map<string, Promise<void>> = new Map();
     private lastSourceModeByGuild: Map<string, 'direct' | 'ytdlp' | 'unknown'> = new Map();
-    private readonly discordOpusBitrateKbps = 128;
+    private readonly discordOpusBitrateKbps = 96;
     private readonly streamReadyWaitMs = 1_000;
     private readonly directStreamReadyWaitMs = 1_000;
     private readonly crossfadeReadyWaitMs = 4_000;
@@ -1617,6 +1617,13 @@ export class AudioWrapper extends EventEmitter {
 
             ytdlp.stdout?.on('data', (data) => {
                 stdout += data.toString();
+                const directUrl = this.findDirectStreamUrl(stdout);
+                if (directUrl) {
+                    if (!ytdlp.killed) {
+                        ytdlp.kill();
+                    }
+                    finish(directUrl);
+                }
             });
 
             ytdlp.stderr?.on('data', (data) => {
@@ -1633,13 +1640,17 @@ export class AudioWrapper extends EventEmitter {
                     return;
                 }
 
-                const directUrl = stdout
-                    .split(/\r?\n/)
-                    .map((line) => line.trim())
-                    .find((line) => this.isLikelyDirectStreamUrl(line));
+                const directUrl = this.findDirectStreamUrl(stdout);
                 finish(directUrl ?? null, stderr);
             });
         });
+    }
+
+    private findDirectStreamUrl(output: string): string | null {
+        return output
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .find((line) => this.isLikelyDirectStreamUrl(line)) ?? null;
     }
 
     isTrackWarm(guildId: string, trackId: string): boolean {

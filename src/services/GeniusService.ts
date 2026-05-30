@@ -283,7 +283,6 @@ class GeniusService {
             if (!a || !b) return;
             variants.add(`${a} ${b}`);
             variants.add(`${b} ${a}`);
-            variants.add(a);
             variants.add(b);
         };
 

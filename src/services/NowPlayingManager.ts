@@ -10,7 +10,7 @@ import {
 } from 'discord.js';
 import { queueManager } from './QueueManager.js';
 import { queueViewManager } from './QueueViewManager.js';
-import { sendLyrics } from '../utils/lyrics.js';
+import { buildTrackLyricsQuery, sendLyrics } from '../utils/lyrics.js';
 import { config } from '../config.js';
 import { resolveLocale, t } from '../utils/i18n.js';
 import { logger } from '../utils/Logger.js';
@@ -418,7 +418,7 @@ class NowPlayingManager {
                     this.deleteEphemeralAfterDelay(interaction);
                     break;
                 }
-                await sendLyrics(interaction, queue.currentTrack.title, queue);
+                await sendLyrics(interaction, buildTrackLyricsQuery(queue.currentTrack), queue);
                 break;
         }
     }
