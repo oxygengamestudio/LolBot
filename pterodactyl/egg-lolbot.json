@@ -7,9 +7,10 @@
   "exported_at": "2026-03-10T17:25:57+00:00",
   "name": "LolBot",
   "author": "codex@openai.com",
-  "description": "Prebuilt Discord music bot image for Pterodactyl. Secrets are injected through panel variables and persistent data is stored under DATA_DIR.",
+  "description": "Prebuilt Discord music bot image for Pterodactyl. Select the prod or preprod image tag per server. Secrets are injected through panel variables and persistent data is stored under DATA_DIR.",
   "features": [],
   "docker_images": {
+    "ghcr.io/oxygengamestudio/lolbot:prod": "ghcr.io/oxygengamestudio/lolbot:prod",
     "ghcr.io/oxygengamestudio/lolbot:preprod": "ghcr.io/oxygengamestudio/lolbot:preprod"
   },
   "startup": "mkdir -p \"$DATA_DIR\" && node /opt/lolbot/dist/index.js",

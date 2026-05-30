@@ -1,6 +1,6 @@
 # LolBot
 
-Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, Docker Compose, GitHub Actions et Pterodactyl.
+Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, GitHub Actions et Pterodactyl.
 
 ## Requirements
 
@@ -72,51 +72,21 @@ Optional slash command registration:
 npm run register
 ```
 
-## Production Deployment (manual)
+## GitHub Deployment
 
-Manual dispatch of `.github/workflows/prod.yml`:
+The deployment split is branch-based:
 
-1. Build Docker image from this repo.
-2. Push to GHCR with tags:
-   - `latest`
-   - `${GITHUB_SHA}`
-3. SSH into VPS and run in `/opt/discord-bot`:
-   - `docker compose pull`
-   - `docker compose up -d --remove-orphans`
+- Push to `main`: build the prod image, push `ghcr.io/oxygengamestudio/lolbot:prod` and `:latest`, then restart the prod Pterodactyl server.
+- Push to `pre-prod`: build the preprod image, push `ghcr.io/oxygengamestudio/lolbot:preprod`, then restart the preprod Pterodactyl server.
 
 ### GitHub repository configuration
 
-Repository variable:
-
-- `DOCKER_IMAGE` (optional, defaults to `ghcr.io/oxygengamestudio/lolbot`)
-
 Repository secrets:
 
-- `PROD_SSH_HOST`
-- `PROD_SSH_PORT`
-- `PROD_SSH_USER`
-- `PROD_SSH_PRIVATE_KEY`
-
-### VPS prerequisites
-
-In `/opt/discord-bot`:
-
-- `docker-compose.yml` from this repository
-- a local `.env` file with runtime variables and `DOCKER_IMAGE`
-- Docker + Docker Compose installed
-
-## Docker Compose (prod)
-
-```bash
-docker compose pull
-docker compose up -d --remove-orphans
-```
-
-The compose file uses:
-
-- image: `${DOCKER_IMAGE}:latest`
-- env_file: `.env`
-- persistent volume: `./data:/app/data`
+- `PTERO_URL`
+- `PTERO_CLIENT_API_KEY`
+- `PTERO_SERVER_ID` for preprod
+- `PTERO_PROD_SERVER_ID` for prod
 
 ## Pterodactyl
 
@@ -124,11 +94,12 @@ Inject secrets and config through environment variables in the panel. Do not sto
 
 This repository now ships a dedicated image and egg for panel deployment:
 
-- Docker image: `ghcr.io/oxygengamestudio/lolbot:preprod`
+- Prod Docker image: `ghcr.io/oxygengamestudio/lolbot:prod`
+- Preprod Docker image: `ghcr.io/oxygengamestudio/lolbot:preprod`
 - Egg export: `pterodactyl/egg-lolbot.json`
 - Startup command: `mkdir -p "$DATA_DIR" && node /opt/lolbot/dist/index.js`
 
-See `PTERODACTYL.md` for the preprod workflow, GitHub Secrets, and restart API setup.
+See `PTERODACTYL.md` for the prod/preprod workflows, GitHub Secrets, and restart API setup.
 
 The bot code is bundled inside the image under `/opt/lolbot`, while persistent runtime data goes through `DATA_DIR` (default `/home/container/data` in the egg). The image runs as a non-root user and does not copy `.env` into the build context.
 

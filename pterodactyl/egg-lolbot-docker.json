@@ -7,12 +7,13 @@
   "exported_at": "2026-05-23T00:00:00+00:00",
   "name": "LolBot Docker",
   "author": "admin@oxygengamestudio.com",
-  "description": "Discord music bot running from the prebuilt GHCR Docker image.",
+  "description": "Discord music bot running from the prebuilt GHCR Docker image. Select the prod or preprod tag per server.",
   "features": [],
   "docker_images": {
+    "ghcr.io/oxygengamestudio/lolbot:prod": "ghcr.io/oxygengamestudio/lolbot:prod",
     "ghcr.io/oxygengamestudio/lolbot:preprod": "ghcr.io/oxygengamestudio/lolbot:preprod"
   },
-  "startup": "node /app/dist/index.js",
+  "startup": "mkdir -p \"$DATA_DIR\" && node /opt/lolbot/dist/index.js",
   "config": {
     "files": "{}",
     "startup": "{}",

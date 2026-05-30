@@ -3,14 +3,11 @@ name: Preprod Docker Pterodactyl
 on:
   push:
     branches:
-      - main
+      - pre-prod
     paths-ignore:
       - '**/*.md'
       - 'pterodactyl/**'
   workflow_dispatch:
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
   contents: read
@@ -24,13 +21,14 @@ jobs:
   test:
     name: Typecheck, test, and build
     runs-on: ubuntu-latest
+    if: github.ref_name == 'pre-prod'
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -61,7 +59,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve image name
         id: image

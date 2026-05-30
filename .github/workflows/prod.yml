@@ -1,26 +1,70 @@
-name: Production
+name: Production Docker Pterodactyl
 
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'pterodactyl/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: lolbot-prod-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build_push:
-    name: Build and Push Docker Image
+  test:
+    name: Typecheck, test, and build
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    if: github.ref_name == 'main'
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: |
+          if compgen -G "test/*.test.ts" > /dev/null; then
+            npm test
+          else
+            echo "No test/*.test.ts files found. Skipping tests."
+          fi
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    name: Build and push GHCR image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
 
       - name: Resolve image name
         id: image
         run: |
-          image="${{ vars.DOCKER_IMAGE }}"
-          if [ -z "$image" ]; then
-            image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Setup Docker Buildx
@@ -38,24 +82,76 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            BOT_BUILD_SHA=${{ github.sha }}
           tags: |
+            ${{ steps.image.outputs.image }}:prod
             ${{ steps.image.outputs.image }}:latest
             ${{ steps.image.outputs.image }}:${{ github.sha }}
 
-  deploy_prod:
-    name: Deploy to Production VPS
+  restart:
+    name: Restart Pterodactyl prod
     runs-on: ubuntu-latest
-    needs: build_push
+    needs: docker
+
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.2
-        with:
-          host: ${{ secrets.PROD_SSH_HOST }}
-          port: ${{ secrets.PROD_SSH_PORT }}
-          username: ${{ secrets.PROD_SSH_USER }}
-          key: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
-          script: |
-            set -e
-            cd /opt/discord-bot
-            docker compose pull
-            docker compose up -d --remove-orphans
+      - name: Restart server through Pterodactyl API
+        env:
+          PTERO_URL: ${{ secrets.PTERO_URL }}
+          PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
+          PTERO_SERVER_ID: ${{ secrets.PTERO_PROD_SERVER_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PTERO_SERVER_ID" ]; then
+            echo "PTERO_PROD_SERVER_ID is not set. Skipping Pterodactyl restart."
+            exit 0
+          fi
+
+          test -n "$PTERO_URL"
+          test -n "$PTERO_CLIENT_API_KEY"
+
+          api_base="${PTERO_URL%/}/api/client"
+          server_identifier="$PTERO_SERVER_ID"
+
+          if [[ "$PTERO_SERVER_ID" == *-* ]]; then
+            servers_json="$(mktemp)"
+            if curl --silent --show-error --fail-with-body \
+              "${api_base}" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --output "$servers_json"; then
+              resolved_identifier="$(jq -r --arg uuid "$PTERO_SERVER_ID" '
+                .data[]
+                | select(.attributes.uuid == $uuid or .attributes.identifier == $uuid)
+                | .attributes.identifier
+              ' "$servers_json" | head -n 1)"
+              if [ -n "$resolved_identifier" ] && [ "$resolved_identifier" != "null" ]; then
+                server_identifier="$resolved_identifier"
+              else
+                server_identifier="${PTERO_SERVER_ID%%-*}"
+              fi
+            else
+              server_identifier="${PTERO_SERVER_ID%%-*}"
+            fi
+          fi
+
+          response_body="$(mktemp)"
+          status_code="$(curl --silent --show-error \
+            --request POST \
+            "${api_base}/servers/${server_identifier}/power" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --header "Content-Type: application/json" \
+            --data '{"signal":"restart"}' \
+            --output "$response_body" \
+            --write-out "%{http_code}")"
+
+          if [ "$status_code" = "204" ]; then
+            echo "Pterodactyl restart signal sent."
+            exit 0
+          fi
+
+          echo "Pterodactyl restart failed with HTTP ${status_code}."
+          cat "$response_body"
+          exit 1
