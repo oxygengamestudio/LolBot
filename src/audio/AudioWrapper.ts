@@ -574,7 +574,8 @@ export class AudioWrapper extends EventEmitter {
                 log.debug('Fallback yt-dlp: stream direct invalide/expiré');
             }
 
-            const warmDirectUrl = await this.waitForWarmDirectUrl(guildId, track, 1_500);
+            const shouldPreferDirectUrl = track.sourceType === 'url' || effectiveStartSeconds > startSeconds + 3;
+            const warmDirectUrl = await this.waitForWarmDirectUrl(guildId, track, shouldPreferDirectUrl ? 8_000 : 1_500);
             if (warmDirectUrl) {
                 const directResource = await this.createResourceWithDirectUrl(
                     guildId,
@@ -589,8 +590,8 @@ export class AudioWrapper extends EventEmitter {
                 }
             }
 
-            if (effectiveStartSeconds > startSeconds + 3) {
-                const seekableUrl = await this.resolveDirectStreamUrlQuick(guildId, track, 5_000);
+            if (shouldPreferDirectUrl && !this.warmupInFlight.has(cacheKey)) {
+                const seekableUrl = await this.resolveDirectStreamUrlQuick(guildId, track, track.sourceType === 'url' ? 10_000 : 6_000);
                 if (seekableUrl) {
                     const directResource = await this.createResourceWithDirectUrl(
                         guildId,
@@ -874,6 +875,25 @@ export class AudioWrapper extends EventEmitter {
         const cached = this.cache.get(cacheKey);
         if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
             return cached.streamUrl;
+        }
+
+        const inFlight = this.warmupInFlight.get(cacheKey);
+        if (inFlight) {
+            await Promise.race([
+                inFlight,
+                new Promise<void>((resolve) => {
+                    const timer = setTimeout(resolve, timeoutMs);
+                    timer.unref?.();
+                }),
+            ]);
+
+            const warmed = this.cache.get(cacheKey);
+            if (warmed?.streamUrl && this.isLikelyDirectStreamUrl(warmed.streamUrl)) {
+                return warmed.streamUrl;
+            }
+            if (this.warmupInFlight.has(cacheKey)) {
+                return null;
+            }
         }
 
         const includeCookies = this.hasCookieEnv();

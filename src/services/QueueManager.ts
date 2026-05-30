@@ -832,15 +832,24 @@ class QueueManager extends EventEmitter {
 
         const clamped = Math.max(0, Math.min(200, volume));
         queue.volume = clamped;
+        let applied = false;
+
+        const activeResource = this.activeResources.get(guildId);
+        if (activeResource?.volume) {
+            activeResource.volume.setVolume(clamped / 100);
+            applied = true;
+        }
 
         const state = queue.player?.state;
         if (state?.status === AudioPlayerStatus.Playing || state?.status === AudioPlayerStatus.Paused) {
             const resource = (state as AudioPlayerPlayingState | AudioPlayerPausedState).resource;
             if (resource?.volume) {
                 resource.volume.setVolume(clamped / 100);
+                applied = true;
             }
         }
 
+        log.debug(`Volume ${applied ? 'applique' : 'memorise'}: ${clamped}%`);
         return true;
     }
 

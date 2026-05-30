@@ -17,6 +17,7 @@ export interface Track {
     thumbnail: string;
     channelTitle?: string;
     channelId?: string;
+    sourceType?: 'url' | 'search' | 'playlist';
     requestedBy: string;
     requestedById: string;
 }

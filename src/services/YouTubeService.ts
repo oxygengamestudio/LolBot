@@ -367,6 +367,7 @@ export class YouTubeService {
                     url: `https://www.youtube.com/watch?v=${videoId}`,
                     duration: durationMap.get(videoId) ?? 0,
                     thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url || '',
+                    sourceType: 'playlist',
                     requestedBy,
                     requestedById,
                 };
@@ -498,6 +499,7 @@ export class YouTubeService {
             thumbnail: this.getYtdlpThumbnail(entry),
             channelTitle: String(entry?.channel ?? entry?.uploader ?? ''),
             channelId: typeof entry?.channel_id === 'string' ? entry.channel_id : undefined,
+            sourceType: 'playlist',
             requestedBy,
             requestedById,
         };
@@ -512,6 +514,7 @@ export class YouTubeService {
             thumbnail: result.thumbnail,
             channelTitle: result.channelTitle,
             channelId: result.channelId,
+            sourceType: 'search',
             requestedBy,
             requestedById,
         };
@@ -536,6 +539,7 @@ export class YouTubeService {
             thumbnail: info.thumbnail,
             channelTitle: info.channelTitle,
             channelId: info.channelId,
+            sourceType: 'url',
             requestedBy,
             requestedById,
         };

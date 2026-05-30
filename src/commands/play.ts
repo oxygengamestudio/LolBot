@@ -511,10 +511,8 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
         return;
     }
 
-    // URL YouTube: l'option par défaut conserve l'URL saisie.
     if (youtubeService.isYouTubeUrl(query)) {
-        const urlOptions = await buildYouTubeUrlAutocompleteOptions(query, locale);
-        await safeAutocompleteRespond(interaction, urlOptions);
+        await safeAutocompleteRespond(interaction, [], true);
         return;
     }
 
@@ -674,10 +672,11 @@ function getAutocompleteKey(interaction: {
 
 async function safeAutocompleteRespond(
     interaction: { respond: (options: Array<{ name: string; value: string }>) => Promise<void> },
-    options: Array<{ name: string; value: string }>
+    options: Array<{ name: string; value: string }>,
+    allowEmpty = false
 ): Promise<void> {
     try {
-        const fallback = options.length > 0
+        const fallback = options.length > 0 || allowEmpty
             ? options
             : [{
                 name: `✍️ ${t('fr', 'play.autocomplete.startTyping')}`,

