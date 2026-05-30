@@ -70,6 +70,7 @@ interface ResourceMetadata {
     trackId: string;
     teardown: () => void;
     createdAt: number;
+    startSeconds: number;
 }
 
 interface WarmResourceEntry {
@@ -827,6 +828,7 @@ export class AudioWrapper extends EventEmitter {
                 trackId: nextTrack.id,
                 teardown: () => teardown('crossfade resource teardown requested'),
                 createdAt: Date.now(),
+                startSeconds: 0,
             },
         });
 
@@ -1138,6 +1140,7 @@ export class AudioWrapper extends EventEmitter {
                 trackId: track.id,
                 teardown: () => teardown('direct resource teardown requested'),
                 createdAt: Date.now(),
+                startSeconds,
             },
         });
 
@@ -1498,6 +1501,7 @@ export class AudioWrapper extends EventEmitter {
                 trackId: track.id,
                 teardown: () => teardown('resource teardown requested'),
                 createdAt: Date.now(),
+                startSeconds,
             },
         });
 

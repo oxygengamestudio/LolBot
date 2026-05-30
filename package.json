@@ -1,6 +1,6 @@
 {
   "name": "lolbot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Bot Discord de musique bilingue avec pipeline vocal durci",
   "main": "dist/index.js",
   "type": "module",
