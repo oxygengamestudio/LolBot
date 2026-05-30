@@ -85,8 +85,10 @@ Repository secrets:
 
 - `PTERO_URL`
 - `PTERO_CLIENT_API_KEY`
-- `PTERO_SERVER_ID` for preprod
 - `PTERO_PROD_SERVER_ID` for prod
+- `PTERO_PREPROD_SERVER_ID` for preprod
+
+The old `PTERO_SERVER_ID` secret is no longer used and can be deleted once `PTERO_PREPROD_SERVER_ID` exists.
 
 ## Pterodactyl
 

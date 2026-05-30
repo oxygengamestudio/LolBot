@@ -98,12 +98,12 @@ jobs:
         env:
           PTERO_URL: ${{ secrets.PTERO_URL }}
           PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
-          PTERO_SERVER_ID: ${{ secrets.PTERO_SERVER_ID }}
+          PTERO_TARGET_SERVER_ID: ${{ secrets.PTERO_PREPROD_SERVER_ID }}
         run: |
           set -euo pipefail
 
-          if [ -z "$PTERO_SERVER_ID" ]; then
-            echo "PTERO_SERVER_ID is not set. Skipping Pterodactyl restart."
+          if [ -z "$PTERO_TARGET_SERVER_ID" ]; then
+            echo "PTERO_PREPROD_SERVER_ID is not set. Skipping Pterodactyl restart."
             exit 0
           fi
 
@@ -111,16 +111,16 @@ jobs:
           test -n "$PTERO_CLIENT_API_KEY"
 
           api_base="${PTERO_URL%/}/api/client"
-          server_identifier="$PTERO_SERVER_ID"
+          server_identifier="$PTERO_TARGET_SERVER_ID"
 
-          if [[ "$PTERO_SERVER_ID" == *-* ]]; then
+          if [[ "$PTERO_TARGET_SERVER_ID" == *-* ]]; then
             servers_json="$(mktemp)"
             if curl --silent --show-error --fail-with-body \
               "${api_base}" \
               --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
               --header "Accept: Application/vnd.pterodactyl.v1+json" \
               --output "$servers_json"; then
-              resolved_identifier="$(jq -r --arg uuid "$PTERO_SERVER_ID" '
+              resolved_identifier="$(jq -r --arg uuid "$PTERO_TARGET_SERVER_ID" '
                 .data[]
                 | select(.attributes.uuid == $uuid or .attributes.identifier == $uuid)
                 | .attributes.identifier
@@ -128,10 +128,10 @@ jobs:
               if [ -n "$resolved_identifier" ] && [ "$resolved_identifier" != "null" ]; then
                 server_identifier="$resolved_identifier"
               else
-                server_identifier="${PTERO_SERVER_ID%%-*}"
+                server_identifier="${PTERO_TARGET_SERVER_ID%%-*}"
               fi
             else
-              server_identifier="${PTERO_SERVER_ID%%-*}"
+              server_identifier="${PTERO_TARGET_SERVER_ID%%-*}"
             fi
           fi
 

@@ -7,7 +7,7 @@ This repository is set up for Pterodactyl-first prod and preprod deployments wit
 | Branch | Workflow | Image tag | Pterodactyl server secret |
 | --- | --- | --- | --- |
 | `main` | `.github/workflows/prod.yml` | `ghcr.io/oxygengamestudio/lolbot:prod` and `:latest` | `PTERO_PROD_SERVER_ID` |
-| `pre-prod` | `.github/workflows/preprod-pterodactyl.yml` | `ghcr.io/oxygengamestudio/lolbot:preprod` | `PTERO_SERVER_ID` |
+| `pre-prod` | `.github/workflows/preprod-pterodactyl.yml` | `ghcr.io/oxygengamestudio/lolbot:preprod` | `PTERO_PREPROD_SERVER_ID` |
 
 Both workflows use the same Pterodactyl panel URL and client API key. Only the target server ID changes.
 
@@ -140,11 +140,13 @@ Set these repository secrets:
 ```text
 PTERO_URL=https://raynor.zerandia.fr
 PTERO_CLIENT_API_KEY=<new regenerated client API key>
-PTERO_SERVER_ID=<preprod full server UUID or short identifier>
 PTERO_PROD_SERVER_ID=<prod full server UUID or short identifier>
+PTERO_PREPROD_SERVER_ID=<preprod full server UUID or short identifier>
 ```
 
 No Docker Hub secret is required for these workflows.
+
+Delete the legacy `PTERO_SERVER_ID` repository secret after `PTERO_PREPROD_SERVER_ID` is created. The workflows no longer read it.
 
 The restart step calls:
 
@@ -153,7 +155,7 @@ POST /api/client/servers/{server}/power
 {"signal":"restart"}
 ```
 
-If `PTERO_SERVER_ID` or `PTERO_PROD_SERVER_ID` is a full UUID, the workflow automatically uses the short identifier before calling the Client API.
+If `PTERO_PROD_SERVER_ID` or `PTERO_PREPROD_SERVER_ID` is a full UUID, the workflow automatically uses the short identifier before calling the Client API.
 
 ## systemctl
 
