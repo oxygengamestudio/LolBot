@@ -32,6 +32,7 @@ export interface SearchResult {
     channelId?: string;
     durationSeconds?: number;
     viewCount?: number;
+    sourceRank?: number;
     isOfficial?: boolean;
 }
 

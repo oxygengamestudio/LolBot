@@ -42,6 +42,9 @@ class QueueManager extends EventEmitter {
     private readonly crossfadePrepareLeadSeconds = 1.5;
     private readonly pipelineTeardownWaitMs = 120;
     private readonly retiredResourceRetentionMs = 10_000;
+    private readonly voiceDebugLogs = ['1', 'true', 'yes', 'on'].includes(
+        (process.env.VOICE_DEBUG_LOGS ?? '').toLowerCase()
+    );
 
     constructor() {
         super();
@@ -439,9 +442,11 @@ class QueueManager extends EventEmitter {
             });
         });
 
-        connection.on('debug', (message) => {
-            log.trace(`[voice] ${message}`);
-        });
+        if (this.voiceDebugLogs) {
+            connection.on('debug', (message) => {
+                log.trace(`[voice] ${message}`);
+            });
+        }
 
         connection.on('error', (error) => {
             log.error('Erreur de connexion vocale:', error);

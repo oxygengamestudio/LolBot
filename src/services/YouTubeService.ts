@@ -82,6 +82,8 @@ export class YouTubeService {
     private readonly allowedDomains = ['googleapis.com', 'youtube.com', 'youtube-nocookie.com', 'youtu.be'] as const;
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
     private youtubeApiBackoffUntil = 0;
+    private readonly searchCache = new Map<string, { expiresAt: number; results: SearchResult[] }>();
+    private readonly searchCacheTtlMs = 3 * 60 * 1000;
 
     async search(query: string, maxResults = 10): Promise<SearchResult[]> {
         const ranked = await this.searchWithRanking(query, maxResults);
@@ -93,30 +95,11 @@ export class YouTubeService {
 
     async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
         const normalizedQuery = this.normalizeSearchInput(query);
-        const rawResults = await this.searchRawVariants(normalizedQuery, maxResults);
-        let ranked = this.rankSearchResults(normalizedQuery, rawResults)
+        const rawResults = await this.searchIndependent(normalizedQuery, maxResults);
+        return this.rankSearchResults(normalizedQuery, rawResults)
             .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
             .filter((result) => result.score >= 0)
             .slice(0, maxResults);
-
-        if (this.apiKey && ranked.length < Math.min(3, maxResults)) {
-            const fallbackResults = await this.searchRawVariants(normalizedQuery, maxResults, true);
-            if (fallbackResults.length > 0) {
-                const unique = new Map<string, SearchResult>();
-                for (const result of [...rawResults, ...fallbackResults]) {
-                    if (!unique.has(result.id)) {
-                        unique.set(result.id, result);
-                    }
-                }
-
-                ranked = this.rankSearchResults(normalizedQuery, Array.from(unique.values()))
-                    .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
-                    .filter((result) => result.score >= 0)
-                    .slice(0, maxResults);
-            }
-        }
-
-        return ranked;
     }
 
     shouldAutoSelect(results: RankedSearchResult[], query: string): boolean {
@@ -140,6 +123,290 @@ export class YouTubeService {
         }
 
         return top >= 120 && hasTitleMatch && top - secondScore >= 140;
+    }
+
+    private async searchIndependent(query: string, maxResults = 10): Promise<SearchResult[]> {
+        const cacheKey = `${query}:${maxResults}`;
+        const cached = this.searchCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+            return cached.results;
+        }
+
+        const unique = new Map<string, SearchResult>();
+        const webLimit = Math.min(Math.max(maxResults * 2, maxResults), 20);
+        const webResults = await this.searchWithYouTubeWeb(query, webLimit).catch((error) => {
+            console.warn('YouTube web search failed, falling back to yt-dlp:', this.formatError(error));
+            return [] as SearchResult[];
+        });
+        this.appendUniqueSearchResults(unique, webResults);
+
+        if (unique.size < Math.min(maxResults, 5)) {
+            const ytdlpResults = await this.searchWithYtdlp(query, Math.min(Math.max(maxResults, 10), 15))
+                .catch(() => [] as SearchResult[]);
+            this.appendUniqueSearchResults(unique, ytdlpResults);
+        }
+
+        if (unique.size < Math.min(maxResults, 3)) {
+            for (const variant of this.buildInflectedSearchVariants(query)) {
+                const variantResults = await this.searchWithYtdlp(variant, Math.min(Math.max(maxResults, 10), 15))
+                    .catch(() => [] as SearchResult[]);
+                this.appendUniqueSearchResults(unique, variantResults);
+                if (unique.size >= Math.min(maxResults, 3)) {
+                    break;
+                }
+            }
+        }
+
+        const results = Array.from(unique.values());
+        this.setSearchCache(cacheKey, results);
+        return results;
+    }
+
+    private appendUniqueSearchResults(unique: Map<string, SearchResult>, results: SearchResult[]): void {
+        for (const result of results) {
+            if (!unique.has(result.id)) {
+                unique.set(result.id, result);
+            }
+        }
+    }
+
+    private setSearchCache(key: string, results: SearchResult[]): void {
+        if (this.searchCache.size >= 100) {
+            const oldestKey = this.searchCache.keys().next().value;
+            if (oldestKey) {
+                this.searchCache.delete(oldestKey);
+            }
+        }
+
+        this.searchCache.set(key, {
+            expiresAt: Date.now() + this.searchCacheTtlMs,
+            results,
+        });
+    }
+
+    private async searchWithYouTubeWeb(query: string, maxResults: number): Promise<SearchResult[]> {
+        const params = new URLSearchParams({
+            search_query: query,
+            hl: 'fr',
+            gl: 'FR',
+        });
+        const searchUrl = `https://www.youtube.com/results?${params.toString()}&sp=EgIQAQ%3D%3D`;
+        const response = await httpRequest({
+            url: searchUrl,
+            allowedDomains: this.allowedDomains,
+            timeoutMs: 8_000,
+            maxBytes: 8 * 1024 * 1024,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
+                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+            },
+        });
+        const html = typeof response.body === 'string' ? response.body : response.body.toString('utf8');
+        const initialData = this.extractYtInitialData(html);
+        if (!initialData) {
+            return [];
+        }
+
+        return this.collectVideoRenderers(initialData, Math.max(maxResults * 3, maxResults))
+            .map((renderer) => this.searchResultFromVideoRenderer(renderer))
+            .filter((result: SearchResult | null): result is SearchResult => result !== null)
+            .filter((result) => !this.hasShortsMarker(`${result.title} ${result.channelTitle ?? ''}`))
+            .map((result, index) => ({ ...result, sourceRank: index + 1 }))
+            .slice(0, maxResults);
+    }
+
+    private extractYtInitialData(html: string): unknown | null {
+        const markers = [
+            'var ytInitialData =',
+            'window["ytInitialData"] =',
+            'ytInitialData =',
+        ];
+
+        for (const marker of markers) {
+            const markerIndex = html.indexOf(marker);
+            if (markerIndex < 0) {
+                continue;
+            }
+
+            const start = html.indexOf('{', markerIndex + marker.length);
+            if (start < 0) {
+                continue;
+            }
+
+            const json = this.extractBalancedJson(html, start);
+            if (!json) {
+                continue;
+            }
+
+            try {
+                return JSON.parse(json);
+            } catch {
+                continue;
+            }
+        }
+
+        return null;
+    }
+
+    private extractBalancedJson(text: string, start: number): string | null {
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+
+        for (let i = start; i < text.length; i += 1) {
+            const char = text[i];
+
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (char === '\\') {
+                    escaped = true;
+                } else if (char === '"') {
+                    inString = false;
+                }
+                continue;
+            }
+
+            if (char === '"') {
+                inString = true;
+            } else if (char === '{') {
+                depth += 1;
+            } else if (char === '}') {
+                depth -= 1;
+                if (depth === 0) {
+                    return text.slice(start, i + 1);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private collectVideoRenderers(root: unknown, maxRenderers: number): any[] {
+        const renderers: any[] = [];
+        const queue: unknown[] = [root];
+        const maxNodes = 25_000;
+
+        for (let index = 0; index < queue.length && index < maxNodes && renderers.length < maxRenderers; index += 1) {
+            const current = queue[index];
+            if (!current || typeof current !== 'object') {
+                continue;
+            }
+
+            const record = current as Record<string, any>;
+            if (record.videoRenderer) {
+                renderers.push(record.videoRenderer);
+                continue;
+            }
+
+            for (const value of Object.values(record)) {
+                if (value && typeof value === 'object') {
+                    queue.push(value);
+                }
+            }
+        }
+
+        return renderers;
+    }
+
+    private searchResultFromVideoRenderer(renderer: any): SearchResult | null {
+        const id = this.normalizeVideoId(renderer?.videoId);
+        if (!id) {
+            return null;
+        }
+
+        const title = this.textFromRuns(renderer?.title);
+        if (!title) {
+            return null;
+        }
+
+        const duration = this.textFromRuns(renderer?.lengthText);
+        const channelTitle = this.textFromRuns(renderer?.ownerText)
+            || this.textFromRuns(renderer?.longBylineText)
+            || this.textFromRuns(renderer?.shortBylineText);
+
+        return {
+            id,
+            title,
+            duration,
+            durationSeconds: duration ? this.parseDurationToSeconds(duration) : 0,
+            thumbnail: this.getRendererThumbnail(renderer),
+            channelTitle,
+            channelId: this.extractRendererChannelId(renderer),
+            viewCount: this.parseHumanViewCount(
+                this.textFromRuns(renderer?.viewCountText) || this.textFromRuns(renderer?.shortViewCountText)
+            ),
+        };
+    }
+
+    private textFromRuns(value: any): string {
+        if (typeof value?.simpleText === 'string') {
+            return this.decodeHtmlEntities(value.simpleText).trim();
+        }
+
+        if (Array.isArray(value?.runs)) {
+            return this.decodeHtmlEntities(
+                value.runs
+                    .map((run: any) => typeof run?.text === 'string' ? run.text : '')
+                    .join('')
+            ).trim();
+        }
+
+        return '';
+    }
+
+    private getRendererThumbnail(renderer: any): string {
+        const thumbnails = renderer?.thumbnail?.thumbnails;
+        if (!Array.isArray(thumbnails) || thumbnails.length === 0) {
+            return '';
+        }
+
+        const thumbnail = thumbnails
+            .filter((candidate: any) => typeof candidate?.url === 'string')
+            .sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0];
+        return thumbnail?.url ?? '';
+    }
+
+    private extractRendererChannelId(renderer: any): string | undefined {
+        const runs = renderer?.ownerText?.runs ?? renderer?.longBylineText?.runs ?? renderer?.shortBylineText?.runs;
+        if (!Array.isArray(runs)) {
+            return undefined;
+        }
+
+        const browseId = runs
+            .map((run: any) => run?.navigationEndpoint?.browseEndpoint?.browseId)
+            .find((value: unknown) => typeof value === 'string');
+        return typeof browseId === 'string' ? browseId : undefined;
+    }
+
+    private parseHumanViewCount(text: string): number | undefined {
+        const normalized = text
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/\p{Diacritic}/gu, '')
+            .replace(/(?<=\d)[\s\u00a0\u202f](?=\d)/g, '')
+            .replace(/[\u00a0\u202f]/g, ' ')
+            .replace(',', '.');
+        const match = normalized.match(/(\d+(?:\.\d+)?)\s*(k|m|b|mio|million|millions|milliard|milliards)?/);
+        if (!match) {
+            return undefined;
+        }
+
+        const amount = Number.parseFloat(match[1]);
+        if (!Number.isFinite(amount)) {
+            return undefined;
+        }
+
+        const unit = match[2] ?? '';
+        const multiplier = unit === 'k'
+            ? 1_000
+            : unit === 'm' || unit === 'mio' || unit.startsWith('million')
+                ? 1_000_000
+                : unit === 'b' || unit.startsWith('milliard')
+                    ? 1_000_000_000
+                    : 1;
+
+        return Math.floor(amount * multiplier);
     }
 
     private async searchRaw(query: string, maxResults = 10, forceYtdlp = false): Promise<SearchResult[]> {
@@ -415,7 +682,7 @@ export class YouTubeService {
 
     private async searchWithYtdlp(query: string, maxResults: number): Promise<SearchResult[]> {
         const unique = new Map<string, SearchResult>();
-        for (const prefix of ['ytmsearch', 'ytsearch'] as const) {
+        for (const prefix of ['ytsearch'] as const) {
             const results = await this.searchWithYtdlpPrefix(prefix, query, maxResults);
             for (const result of results) {
                 if (!unique.has(result.id)) {
@@ -683,8 +950,12 @@ export class YouTubeService {
 
         const viewCount = result.viewCount ?? 0;
         if (viewCount > 0) {
-            score += Math.min(170, Math.log10(viewCount + 1) * 19);
-            score += Math.min(120, viewCount / 10_000_000);
+            score += Math.min(260, Math.log10(viewCount + 1) * 32);
+            score += Math.min(260, viewCount / 1_000_000 * 6);
+        }
+
+        if (result.sourceRank) {
+            score += Math.max(0, 360 - result.sourceRank * 25);
         }
 
         if (fullText.includes('cover') && !explicit.cover) score -= 260;
