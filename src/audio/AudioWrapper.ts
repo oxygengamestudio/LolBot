@@ -63,6 +63,8 @@ interface CacheEntry {
     trackId: string;
     resource: AudioResource | null;
     streamUrl: string | null;
+    streamError?: string;
+    streamErrorAt?: number;
     timestamp: number;
 }
 
@@ -416,6 +418,24 @@ export class AudioWrapper extends EventEmitter {
         return lower.includes('could not copy') && lower.includes('cookie');
     }
 
+    private isAuthenticationRequiredError(stderr: string): boolean {
+        const lower = stderr.toLowerCase();
+        return lower.includes('sign in')
+            || lower.includes('confirm your age')
+            || lower.includes('confirm you are not a bot')
+            || lower.includes('inappropriate for some users');
+    }
+
+    private shouldSkipYtdlpFallback(cacheKey: string): boolean {
+        const cached = this.cache.get(cacheKey);
+        if (!cached?.streamError || this.hasCookieEnv() || !this.isAuthenticationRequiredError(cached.streamError)) {
+            return false;
+        }
+
+        log.warn(this.getYtdlpHint(cached.streamError) ?? 'YouTube demande une authentification pour cette vidéo.');
+        return true;
+    }
+
     private getYtdlpHint(stderr: string): string | null {
         const lower = stderr.toLowerCase();
         if (this.isCookieCopyError(stderr)) {
@@ -424,7 +444,7 @@ export class AudioWrapper extends EventEmitter {
         if (lower.includes('http error 403') || lower.includes('forbidden')) {
             return 'yt-dlp recoit un 403. Essayez YTDLP_COOKIES_FROM_BROWSER=chrome (ou edge) ou YTDLP_COOKIES=chemin\\cookies.txt.';
         }
-        if (lower.includes('sign in') || lower.includes('confirm you are not a bot')) {
+        if (this.isAuthenticationRequiredError(stderr)) {
             return 'YouTube demande une verification. Utilise des cookies via YTDLP_COOKIES_FROM_BROWSER ou YTDLP_COOKIES.';
         }
         return null;
@@ -603,6 +623,28 @@ export class AudioWrapper extends EventEmitter {
                     return directResource;
                 }
             }
+            if (shouldPreferDirectUrl && this.warmupInFlight.has(cacheKey)) {
+                log.debug('Résolution directe encore en cours, attente avant fallback yt-dlp');
+                await this.warmupInFlight.get(cacheKey)?.catch(() => undefined);
+                const warmed = this.cache.get(cacheKey);
+                if (warmed?.streamUrl && this.isLikelyDirectStreamUrl(warmed.streamUrl)) {
+                    const directResource = await this.createResourceWithDirectUrl(
+                        guildId,
+                        track,
+                        warmed.streamUrl,
+                        effectiveStartSeconds,
+                        sponsorSegments,
+                        targetVolume
+                    );
+                    if (directResource) {
+                        this.lastSourceModeByGuild.set(guildId, 'direct');
+                        return directResource;
+                    }
+                }
+                if (this.shouldSkipYtdlpFallback(cacheKey)) {
+                    return null;
+                }
+            }
 
             if (shouldPreferDirectUrl && !this.warmupInFlight.has(cacheKey)) {
                 const seekableUrl = await this.resolveDirectStreamUrlQuick(guildId, track, track.sourceType === 'url' ? 10_000 : 6_000);
@@ -619,6 +661,9 @@ export class AudioWrapper extends EventEmitter {
                         this.lastSourceModeByGuild.set(guildId, 'direct');
                         return directResource;
                     }
+                }
+                if (this.shouldSkipYtdlpFallback(cacheKey)) {
+                    return null;
                 }
             }
 
@@ -973,6 +1018,8 @@ export class AudioWrapper extends EventEmitter {
             trackId: track.id,
             resource: null,
             streamUrl: directUrl,
+            streamError: undefined,
+            streamErrorAt: undefined,
             timestamp: Date.now(),
         });
         return directUrl;
@@ -1014,10 +1061,22 @@ export class AudioWrapper extends EventEmitter {
                     trackId: track.id,
                     resource: null,
                     streamUrl: result.url,
+                    streamError: undefined,
+                    streamErrorAt: undefined,
                     timestamp: Date.now(),
                 });
                 return result.url;
             }
+
+            this.cache.set(cacheKey, {
+                guildId,
+                trackId: track.id,
+                resource: null,
+                streamUrl: cached?.streamUrl ?? null,
+                streamError: result.ytdlpErrors,
+                streamErrorAt: Date.now(),
+                timestamp: Date.now(),
+            });
 
             if (!attemptCookies || !this.isCookieCopyError(result.ytdlpErrors)) {
                 break;
@@ -1794,6 +1853,8 @@ export class AudioWrapper extends EventEmitter {
                 trackId: track.id,
                 resource: null,
                 streamUrl: directUrl ?? existingCache?.streamUrl ?? track.url,
+                streamError: directUrl ? undefined : streamResult.ytdlpErrors || existingCache?.streamError,
+                streamErrorAt: directUrl ? undefined : streamResult.ytdlpErrors ? Date.now() : existingCache?.streamErrorAt,
                 timestamp: Date.now(),
             });
 

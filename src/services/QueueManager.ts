@@ -978,6 +978,11 @@ class QueueManager extends EventEmitter {
     private handleTrackEnd(queue: GuildQueue): void {
         const currentTrackId = queue.currentTrack?.id ?? null;
         const now = Date.now();
+        if (!queue.currentTrack && !queue.crossfadeInProgress) {
+            log.trace('Fin de piste ignoree (aucune piste active)');
+            return;
+        }
+
         const lastEvent = this.lastTrackEndEvent.get(queue.guildId);
         if (
             lastEvent &&
