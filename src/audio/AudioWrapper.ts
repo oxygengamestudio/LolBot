@@ -2,7 +2,7 @@
 import { EventEmitter } from 'events';
 import { Readable, Transform } from 'stream';
 import type { ChildProcess } from 'child_process';
-import { existsSync, mkdirSync } from 'fs';
+import { createReadStream, existsSync, mkdirSync } from 'fs';
 import { mkdir, chmod, rename, unlink, readdir, rm, stat } from 'fs/promises';
 import { join } from 'path';
 import { createAudioResource, StreamType, AudioResource } from '@discordjs/voice';
@@ -85,6 +85,7 @@ interface SponsorSegment {
 
 export class AudioWrapper extends EventEmitter {
     private cache: Map<string, CacheEntry> = new Map();
+    private bitrateCache: Map<string, { bitrate: number | null; timestamp: number }> = new Map();
     private preloadingGuilds: Set<string> = new Set();
     private ffmpegPath: string = 'ffmpeg';
     private ytdlpPath: string = 'yt-dlp';
@@ -99,6 +100,7 @@ export class AudioWrapper extends EventEmitter {
     private readonly directStreamReadyWaitMs = 1_000;
     private readonly crossfadeReadyWaitMs = 4_000;
     private readonly warmResourceTtlMs = 90_000;
+    private readonly bitrateCacheTtlMs = 60 * 60 * 1000;
     private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
@@ -860,7 +862,27 @@ export class AudioWrapper extends EventEmitter {
         return this.lastSourceModeByGuild.get(guildId) ?? 'unknown';
     }
 
+    getEstimatedAudioBitrateKbps(guildId: string, track: Track): number | null {
+        const cached = this.cache.get(this.getScopedTrackKey(guildId, track.id));
+        const directEstimate = cached?.streamUrl ? this.estimateBitrateFromDirectUrl(cached.streamUrl) : null;
+        if (directEstimate) {
+            return directEstimate;
+        }
+
+        const infoEstimate = this.bitrateCache.get(track.url);
+        if (infoEstimate && Date.now() - infoEstimate.timestamp < this.bitrateCacheTtlMs) {
+            return infoEstimate.bitrate;
+        }
+
+        return null;
+    }
+
     async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
+        const cached = this.bitrateCache.get(url);
+        if (cached && Date.now() - cached.timestamp < this.bitrateCacheTtlMs) {
+            return cached.bitrate;
+        }
+
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
         if (!dependenciesOk) {
             return null;
@@ -869,17 +891,51 @@ export class AudioWrapper extends EventEmitter {
         const includeCookies = this.hasCookieEnv();
         const primary = await this.fetchYtdlpInfo(guildId, url, includeCookies);
         if (primary.info) {
-            return this.extractAudioBitrateKbps(primary.info);
+            const bitrate = this.extractAudioBitrateKbps(primary.info);
+            this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+            return bitrate;
         }
 
         if (includeCookies && this.isCookieCopyError(primary.ytdlpErrors)) {
             const fallback = await this.fetchYtdlpInfo(guildId, url, false);
             if (fallback.info) {
-                return this.extractAudioBitrateKbps(fallback.info);
+                const bitrate = this.extractAudioBitrateKbps(fallback.info);
+                this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+                return bitrate;
             }
         }
 
+        this.bitrateCache.set(url, { bitrate: null, timestamp: Date.now() });
         return null;
+    }
+
+    private estimateBitrateFromDirectUrl(url: string): number | null {
+        try {
+            const parsed = new URL(url);
+            const itag = parsed.searchParams.get('itag');
+            switch (itag) {
+                case '251':
+                    return 160;
+                case '250':
+                    return 70;
+                case '249':
+                    return 50;
+                case '140':
+                    return 128;
+                case '141':
+                    return 256;
+                case '139':
+                    return 48;
+                case '171':
+                    return 128;
+                case '172':
+                    return 256;
+                default:
+                    return null;
+            }
+        } catch {
+            return null;
+        }
     }
 
     private async resolveDirectStreamUrl(guildId: string, track: Track): Promise<string | null> {
@@ -1046,8 +1102,17 @@ export class AudioWrapper extends EventEmitter {
         sponsorSegments: SponsorSegment[] = [],
         targetVolume = 100
     ): Promise<AudioResource | null> {
-        const runDir = await this.createRunDirectory(guildId);
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
+        const nativeOpusType = this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
+        if (nativeOpusType) {
+            const nativeResource = await this.createNativeOpusResource(track, directUrl, nativeOpusType, startSeconds);
+            if (nativeResource) {
+                return nativeResource;
+            }
+            log.debug('Fallback FFmpeg: lecture native Opus impossible');
+        }
+
+        const runDir = await this.createRunDirectory(guildId);
         const useOpusCopy = this.canCopyDirectOpus(directUrl, filters, targetVolume);
         const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
             ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
@@ -1162,16 +1227,156 @@ export class AudioWrapper extends EventEmitter {
         return resource;
     }
 
+    private async createNativeOpusResource(
+        track: Track,
+        directUrl: string,
+        inputType: StreamType.WebmOpus | StreamType.OggOpus,
+        startSeconds: number
+    ): Promise<AudioResource | null> {
+        const controller = new AbortController();
+        let stream: Readable | null = null;
+        let tornDown = false;
+        const teardown = (reason: string) => {
+            if (tornDown) {
+                return;
+            }
+            tornDown = true;
+            log.trace(`Teardown native opus stream: ${reason}`);
+            controller.abort();
+            stream?.destroy();
+        };
+
+        try {
+            if (/^https?:\/\//i.test(directUrl)) {
+                const response = await fetch(directUrl, {
+                    signal: controller.signal,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0',
+                        Accept: '*/*',
+                    },
+                });
+                if (!response.ok || !response.body) {
+                    teardown(`native opus http ${response.status}`);
+                    return null;
+                }
+                stream = Readable.fromWeb(response.body as any);
+            } else {
+                stream = createReadStream(directUrl);
+            }
+
+            stream.once('close', () => teardown('native opus stream closed'));
+            stream.once('end', () => teardown('native opus stream ended'));
+            stream.once('error', () => teardown('native opus stream error'));
+
+            const resource = createAudioResource<ResourceMetadata>(stream, {
+                inputType,
+                inlineVolume: false,
+                metadata: {
+                    trackId: track.id,
+                    teardown: () => teardown('native opus resource teardown requested'),
+                    createdAt: Date.now(),
+                    startSeconds,
+                },
+            });
+
+            const ready = await this.waitForReadableStreamReady(stream, this.directStreamReadyWaitMs);
+            if (ready === 'close') {
+                return null;
+            }
+            if (ready === 'timeout') {
+                log.trace('Native opus readiness timeout, continuing');
+            }
+
+            return resource;
+        } catch (error) {
+            teardown('native opus setup failed');
+            log.trace('Lecture native Opus indisponible', error);
+            return null;
+        }
+    }
+
+    private async waitForReadableStreamReady(stream: Readable, timeoutMs: number): Promise<'ready' | 'timeout' | 'close'> {
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer: NodeJS.Timeout;
+
+            const finish = (result: 'ready' | 'timeout' | 'close') => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            };
+
+            const cleanup = () => {
+                stream.removeListener('readable', onReady);
+                stream.removeListener('close', onClose);
+                stream.removeListener('end', onClose);
+                stream.removeListener('error', onClose);
+            };
+
+            const onReady = () => {
+                clearTimeout(timer);
+                cleanup();
+                finish('ready');
+            };
+            const onClose = () => {
+                clearTimeout(timer);
+                cleanup();
+                finish('close');
+            };
+
+            timer = setTimeout(() => {
+                cleanup();
+                finish('timeout');
+            }, timeoutMs);
+            timer.unref?.();
+
+            if (stream.readableLength > 0) {
+                queueMicrotask(onReady);
+                return;
+            }
+
+            stream.once('readable', onReady);
+            stream.once('close', onClose);
+            stream.once('end', onClose);
+            stream.once('error', onClose);
+        });
+    }
+
+    private getNativeOpusStreamType(
+        directUrl: string,
+        filters: string[],
+        startSeconds: number,
+        targetVolume: number
+    ): StreamType.WebmOpus | StreamType.OggOpus | null {
+        if (filters.length > 0 || startSeconds > 0.25 || Math.round(targetVolume) !== 100) {
+            return null;
+        }
+
+        const decoded = this.safeDecodeUrl(directUrl);
+        if (/mime=audio\/webm/i.test(decoded) || /\.webm(?:$|[?#])/i.test(decoded)) {
+            return StreamType.WebmOpus;
+        }
+        if (/mime=audio\/ogg/i.test(decoded) || /\.ogg(?:$|[?#])/i.test(decoded)) {
+            return StreamType.OggOpus;
+        }
+
+        return null;
+    }
+
     private canCopyDirectOpus(directUrl: string, filters: string[], targetVolume: number): boolean {
         if (filters.length > 0 || Math.round(targetVolume) !== 100) {
             return false;
         }
 
+        const decoded = this.safeDecodeUrl(directUrl);
+        return /mime=audio\/(?:webm|ogg)/i.test(decoded);
+    }
+
+    private safeDecodeUrl(value: string): string {
         try {
-            const decoded = decodeURIComponent(directUrl);
-            return /mime=audio\/(?:webm|ogg)/i.test(decoded);
+            return decodeURIComponent(value);
         } catch {
-            return /mime=audio\/(?:webm|ogg)/i.test(directUrl);
+            return value;
         }
     }
 
@@ -1287,7 +1492,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-warnings',
             '--no-playlist',
             '--paths', `temp:${runDir}`,
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '-o', '-', // Output vers stdout
             '--quiet',
             track.url,
@@ -1621,7 +1826,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-warnings',
             '--no-playlist',
             '--paths', `temp:${runDir}`,
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '--get-url',
             url,
         ];
@@ -1749,7 +1954,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-playlist',
             '--paths', `temp:${runDir}`,
             '--skip-download',
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '--dump-single-json',
             url,
         ];

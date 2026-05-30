@@ -3,8 +3,7 @@ import {
     ButtonBuilder,
     ButtonInteraction,
     ButtonStyle,
-    ColorResolvable,
-    EmbedBuilder,
+    ComponentType,
     GuildMember,
     MessageFlags,
 } from 'discord.js';
@@ -24,9 +23,9 @@ const log = logger.createModuleLogger('NowPlaying');
 class NowPlayingManager {
     private updateIntervals: Map<string, NodeJS.Timeout> = new Map();
     private readonly COLORS = {
-        playing: 0x1DB954 as ColorResolvable,
-        paused: 0xFFA500 as ColorResolvable,
-        idle: 0x808080 as ColorResolvable,
+        playing: 0x1DB954,
+        paused: 0xFFA500,
+        idle: 0x808080,
     };
 
     constructor() {
@@ -57,22 +56,22 @@ class NowPlayingManager {
         }
 
         const locale = await resolveLocale(queue.guildId);
-        const embed = this.createEmbed(queue, locale);
-        const row = this.createButtons(queue, locale);
+        const components = this.createNowPlayingComponents(queue, locale);
 
         try {
             if (queue.nowPlayingMessage) {
                 log.trace('Mise a jour du message Now Playing existant');
                 await queue.nowPlayingMessage.edit({
-                    embeds: [embed],
-                    components: [row],
+                    embeds: [],
+                    components,
+                    flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
             } else {
                 log.debug('Creation d\'un nouveau message Now Playing');
                 const message = await queue.textChannel.send({
-                    embeds: [embed],
-                    components: [row],
+                    components,
+                    flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
                 queue.nowPlayingMessage = message;
@@ -81,6 +80,7 @@ class NowPlayingManager {
         } catch (error) {
             log.error('Erreur lors de la mise a jour:', error);
             if (queue.nowPlayingMessage) {
+                await queue.nowPlayingMessage.delete().catch(() => undefined);
                 queue.nowPlayingMessage = null;
                 await this.createOrUpdateNowPlaying(queue);
             }
@@ -91,13 +91,13 @@ class NowPlayingManager {
         if (!queue.nowPlayingMessage || !queue.currentTrack) return;
 
         const locale = await resolveLocale(queue.guildId);
-        const embed = this.createEmbed(queue, locale);
-        const row = this.createButtons(queue, locale);
+        const components = this.createNowPlayingComponents(queue, locale);
 
         try {
             await queue.nowPlayingMessage.edit({
-                embeds: [embed],
-                components: [row],
+                embeds: [],
+                components,
+                flags: MessageFlags.IsComponentsV2,
                 allowedMentions: { parse: [] },
             });
         } catch {
@@ -121,47 +121,70 @@ class NowPlayingManager {
         }
     }
 
-    private createEmbed(queue: GuildQueue, locale: 'en' | 'fr'): EmbedBuilder {
+    private createNowPlayingComponents(queue: GuildQueue, locale: 'en' | 'fr'): any[] {
         const track = queue.currentTrack!;
         const currentTime = queueManager.getCurrentTime(queue.guildId);
         const progress = this.createProgressBar(currentTime, track.duration);
         const currentTimeString = this.formatTime(currentTime);
         const totalTimeString = this.formatTime(track.duration);
         const progressLine = `\`${currentTimeString}\` ${progress} \`${totalTimeString}\``;
-
         const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
         const statusLabel = queue.isPaused
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
+        const info = [
+            `**${statusLabel}**`,
+            `### [${safeContent(track.title)}](${track.url})`,
+            progressLine,
+            '',
+            `**${t(locale, 'nowPlaying.field.info')}**`,
+            `👤 <@${track.requestedById}>`,
+            `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
+            `🔊 ${queue.volume}%`,
+            '',
+            queue.isPaused
+                ? t(locale, 'nowPlaying.footer.paused')
+                : t(locale, 'nowPlaying.footer.playing'),
+        ].join('\n');
 
-        const embed = new EmbedBuilder()
-            .setColor(color)
-            .setAuthor({ name: statusLabel })
-            .setTitle(safeContent(track.title))
-            .setURL(track.url)
-            .setDescription(progressLine)
-            .addFields(
+        const section = {
+            type: ComponentType.Section,
+            components: [
                 {
-                    name: t(locale, 'nowPlaying.field.info'),
-                    value: [
-                        `👤 <@${track.requestedById}>`,
-                        `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
-                        `🔊 ${queue.volume}%`,
-                    ].join('\n'),
-                    inline: false,
+                    type: ComponentType.TextDisplay,
+                    content: info,
+                },
+            ],
+            accessory: squareCover
+                ? {
+                    type: ComponentType.Thumbnail,
+                    media: { url: squareCover },
+                    description: safeContent(track.title).slice(0, 100),
                 }
-            )
-            .setFooter({
-                text: queue.isPaused
-                    ? t(locale, 'nowPlaying.footer.paused')
-                    : t(locale, 'nowPlaying.footer.playing'),
-            });
+                : {
+                    type: ComponentType.Button,
+                    style: ButtonStyle.Link,
+                    label: 'YouTube',
+                    url: track.url,
+                },
+        };
 
-        if (squareCover) {
-            embed.setImage(squareCover);
-        }
-        return embed;
+        return [
+            {
+                type: ComponentType.Container,
+                accent_color: color,
+                components: [
+                    section,
+                    {
+                        type: ComponentType.Separator,
+                        divider: true,
+                        spacing: 1,
+                    },
+                    this.createButtons(queue, locale).toJSON(),
+                ],
+            },
+        ];
     }
 
     private createButtons(queue: GuildQueue, locale: 'en' | 'fr'): ActionRowBuilder<ButtonBuilder> {
@@ -240,37 +263,6 @@ class NowPlayingManager {
                     url: source,
                     w: '512',
                     h: '512',
-                    fit: 'cover',
-                    a: 'center',
-                    output: 'jpg',
-                });
-                return `https://wsrv.nl/?${params.toString()}`;
-            }
-        } catch {
-            return url;
-        }
-
-        return url;
-    }
-
-    private getLargeCover(url: string): string {
-        if (!url) {
-            return url;
-        }
-
-        try {
-            const parsed = new URL(url);
-            if (parsed.protocol !== 'https:') {
-                return '';
-            }
-            const host = parsed.hostname.toLowerCase();
-
-            if (host.endsWith('ytimg.com') || host.endsWith('youtube.com') || host.endsWith('youtu.be')) {
-                const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
-                const params = new URLSearchParams({
-                    url: source,
-                    w: '1280',
-                    h: '720',
                     fit: 'cover',
                     a: 'center',
                     output: 'jpg',

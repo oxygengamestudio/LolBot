@@ -49,7 +49,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     await interaction.deferReply({ flags: 64 });
 
     const sourceBitrate = currentTrack
-        ? await audioWrapper.getBestAudioBitrateKbps(currentTrack.url)
+        ? audioWrapper.getEstimatedAudioBitrateKbps(guildId, currentTrack)
         : null;
     const outputBitrate = audioWrapper.getDiscordOutputBitrateKbps();
     const sourceMode = queue ? audioWrapper.getLastSourceMode(guildId) : 'unknown';

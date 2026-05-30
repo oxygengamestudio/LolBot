@@ -210,7 +210,7 @@ export const config: AppConfig = {
     },
     audio: {
         bufferSize: 5,
-        cacheAhead: 5,
+        cacheAhead: 0,
         cacheMaxMb: 1536,
         cacheMaxAgeHours: 24,
         ytDlpTimeoutMs: 20_000,
