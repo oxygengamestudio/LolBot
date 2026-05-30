@@ -88,13 +88,13 @@ Fix it in `/etc/pterodactyl/config.yml`; do not create a second top-level `docke
 
 ## Pterodactyl server settings
 
-Import the egg template:
+Import only this egg template:
 
 ```text
 pterodactyl/egg-lolbot.json
 ```
 
-Then create the server manually from the Pterodactyl panel using this egg. GitHub Actions only needs a client API key later to restart the existing server after a new image is pushed.
+Then create the prod and preprod servers manually from the Pterodactyl panel using this same egg. GitHub Actions only needs a client API key later to restart the existing server after a new image is pushed.
 
 Use the Docker image that matches the server:
 

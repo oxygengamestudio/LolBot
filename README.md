@@ -96,7 +96,7 @@ This repository now ships a dedicated image and egg for panel deployment:
 
 - Prod Docker image: `ghcr.io/oxygengamestudio/lolbot:prod`
 - Preprod Docker image: `ghcr.io/oxygengamestudio/lolbot:preprod`
-- Egg export: `pterodactyl/egg-lolbot.json`
+- Egg export to use for both servers: `pterodactyl/egg-lolbot.json`
 - Startup command: `mkdir -p "$DATA_DIR" && node /opt/lolbot/dist/index.js`
 
 See `PTERODACTYL.md` for the prod/preprod workflows, GitHub Secrets, and restart API setup.
