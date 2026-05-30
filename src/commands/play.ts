@@ -1,4 +1,8 @@
 ﻿import {
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonInteraction,
+    ButtonStyle,
     SlashCommandBuilder,
     AutocompleteInteraction,
     ChatInputCommandInteraction,
@@ -28,9 +32,10 @@ const AUTOCOMPLETE_HINT_REFINE = '__hint_refine_query__';
 const AUTOCOMPLETE_HINT_NO_RESULTS = '__hint_no_results__';
 const MAX_AUTOCOMPLETE_OPTIONS = 25;
 const PLAY_SELECTION_PREFIX = 'play_select';
+const PLAY_PLAYLIST_PREFIX = 'play_playlist';
 
 type AutocompleteOption = { name: string; value: string };
-type PlayInteraction = ChatInputCommandInteraction | StringSelectMenuInteraction;
+type PlayInteraction = ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction;
 type AutocompleteState = {
     lastApiCallAt: number;
     lastQuery: string;
@@ -47,9 +52,22 @@ type PendingPlaySelection = {
     query: string;
     results: SearchResult[];
 };
+type PendingPlaylistChoice = {
+    createdAt: number;
+    guildId: string;
+    userId: string;
+    textChannelId: string;
+    voiceChannelId: string;
+    requestedBy: string;
+    requestedById: string;
+    url: string;
+    playlistId: string;
+    videoId: string;
+};
 
 const autocompleteState = new Map<string, AutocompleteState>();
 const pendingSelections = new Map<string, PendingPlaySelection>();
+const pendingPlaylistChoices = new Map<string, PendingPlaylistChoice>();
 
 export const data = new SlashCommandBuilder()
     .setName('play')
@@ -245,11 +263,100 @@ export async function handleSelection(interaction: StringSelectMenuInteraction):
     await addTrackToQueue(interaction, track, voiceChannel as VoiceChannel | StageChannel, textChannel, locale);
 }
 
+export async function handlePlaylistChoice(interaction: ButtonInteraction): Promise<void> {
+    const parsed = parsePlaylistChoiceId(interaction.customId);
+    const payload = parsed ? pendingPlaylistChoices.get(parsed.id) : null;
+    if (!parsed || !payload) {
+        await interaction.update({
+            content: 'Cette confirmation a expiré. Relance `/play`.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    if (interaction.user.id !== payload.userId || interaction.guildId !== payload.guildId) {
+        await interaction.reply({
+            content: 'Cette confirmation ne vous appartient pas.',
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    const guild = interaction.guild;
+    const member = interaction.member as GuildMember;
+    const textChannel = guild?.channels.cache.get(payload.textChannelId) as TextChannel | undefined;
+    const voiceChannel = guild?.channels.cache.get(payload.voiceChannelId);
+    if (!guild || !textChannel || !voiceChannel?.isVoiceBased()) {
+        pendingPlaylistChoices.delete(parsed.id);
+        await interaction.update({
+            content: 'Salon introuvable. Relance `/play`.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    if (!(await canJoinVoiceChannel(voiceChannel, guild.id))) {
+        await interaction.update({
+            content: `Je n'ai pas l'autorisation de rejoindre <#${voiceChannel.id}>.`,
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    pendingPlaylistChoices.delete(parsed.id);
+    await interaction.update({
+        content: parsed.choice === 'video'
+            ? 'Chargement de la vidéo...'
+            : 'Chargement de la playlist...',
+        components: [],
+        allowedMentions: { parse: [] },
+    });
+
+    const locale = await resolveLocale(guild.id, interaction.locale);
+    if (parsed.choice === 'video') {
+        await addVideoUrlToQueue(
+            interaction,
+            `https://www.youtube.com/watch?v=${payload.videoId}`,
+            member,
+            voiceChannel as VoiceChannel | StageChannel,
+            textChannel,
+            locale
+        );
+        return;
+    }
+
+    await addPlaylistToQueue(
+        interaction,
+        payload.playlistId,
+        member,
+        voiceChannel as VoiceChannel | StageChannel,
+        textChannel,
+        locale
+    );
+}
+
 function parseSelectionId(customId: string): string | null {
     if (!customId.startsWith(`${PLAY_SELECTION_PREFIX}:`)) {
         return null;
     }
     return customId.split(':', 2)[1] ?? null;
+}
+
+function parsePlaylistChoiceId(customId: string): { id: string; choice: 'video' | 'playlist' } | null {
+    if (!customId.startsWith(`${PLAY_PLAYLIST_PREFIX}:`)) {
+        return null;
+    }
+
+    const [, id, choice] = customId.split(':');
+    if (!id || (choice !== 'video' && choice !== 'playlist')) {
+        return null;
+    }
+
+    return { id, choice };
 }
 
 async function handleYouTubeUrl(
@@ -273,85 +380,145 @@ async function handleYouTubeUrl(
             return;
         }
 
-        await interaction.editReply({
-            content: t(locale, 'play.playlistLoading'),
-            allowedMentions: { parse: [] },
-        });
-
-        log.debug(`Chargement playlist: ${playlistId}`);
-        const playlist = await youtubeService.getPlaylistTracks(
-            playlistId,
-            member.displayName,
-            member.id
-        );
-
-        if (!playlist || playlist.tracks.length === 0) {
-            log.warn('Playlist introuvable ou vide');
-            await interaction.editReply({
-                content: t(locale, 'play.playlistEmpty'),
-                allowedMentions: { parse: [] },
-            });
-            deleteEphemeralAfterDelay(interaction);
+        const videoId = youtubeService.extractVideoId(url);
+        if (videoId) {
+            await promptPlaylistChoice(interaction, url, playlistId, videoId, member, voiceChannel, textChannel, locale);
             return;
         }
 
-        log.info(`Playlist chargee: ${playlist.title} (${playlist.tracks.length} pistes)`);
+        await addPlaylistToQueue(interaction, playlistId, member, voiceChannel, textChannel, locale);
+        return;
+    }
 
-        const tracks = playlist.tracks.slice(0, config.audio.maxPlaylistTracks);
+    await addVideoUrlToQueue(interaction, url, member, voiceChannel, textChannel, locale);
+}
 
-        let queue = queueManager.getQueue(interaction.guildId!);
-        if (!queue) {
-            queue = queueManager.createQueue(interaction.guildId!, textChannel, voiceChannel);
-        } else if (queue.voiceChannel.id !== voiceChannel.id) {
-            if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
-                await interaction.editReply({
-                    content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
-                    allowedMentions: { parse: [] },
-                });
-                deleteEphemeralAfterDelay(interaction);
-                return;
-            }
-            const moved = await queueManager.moveToChannel(queue, voiceChannel);
-            if (!moved) {
-                await interaction.editReply({
-                    content: `❌ ${t(locale, 'settings.preferredMoveFailed')}`,
-                    allowedMentions: { parse: [] },
-                });
-                deleteEphemeralAfterDelay(interaction);
-                return;
-            }
-        }
+async function promptPlaylistChoice(
+    interaction: ChatInputCommandInteraction,
+    url: string,
+    playlistId: string,
+    videoId: string,
+    member: GuildMember,
+    voiceChannel: VoiceChannel | StageChannel,
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
+): Promise<void> {
+    const selectionId = createPendingId();
+    pendingPlaylistChoices.set(selectionId, {
+        createdAt: Date.now(),
+        guildId: interaction.guildId!,
+        userId: interaction.user.id,
+        textChannelId: textChannel.id,
+        voiceChannelId: voiceChannel.id,
+        requestedBy: member.displayName,
+        requestedById: member.id,
+        url,
+        playlistId,
+        videoId,
+    });
 
-        const wasEmpty = queue.tracks.length === 0 && !queue.currentTrack;
-        const addedCount = queueManager.addTracks(interaction.guildId!, tracks);
+    setTimeout(() => {
+        pendingPlaylistChoices.delete(selectionId);
+    }, config.audio.ephemeralInteractiveDeleteDelay).unref?.();
 
-        if (addedCount <= 0) {
-            await interaction.editReply({
-                content: t(locale, 'play.queueFull'),
-                allowedMentions: { parse: [] },
-            });
-            deleteEphemeralAfterDelay(interaction);
-            return;
-        }
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`${PLAY_PLAYLIST_PREFIX}:${selectionId}:video`)
+            .setLabel(t(locale, 'play.playlistChoiceVideo'))
+            .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+            .setCustomId(`${PLAY_PLAYLIST_PREFIX}:${selectionId}:playlist`)
+            .setLabel(t(locale, 'play.playlistChoicePlaylist'))
+            .setStyle(ButtonStyle.Secondary)
+    );
 
-        if (wasEmpty && addedCount > 0) {
-            log.debug('Queue etait vide, demarrage de la lecture');
-            const playNextStart = Date.now();
-            await queueManager.playNext(interaction.guildId!);
-            log.debug(`request_to_playNext_ms=${Date.now() - playNextStart} (playlist)`);
-        }
+    await interaction.editReply({
+        content: t(locale, 'play.playlistChoicePrompt'),
+        components: [row],
+        allowedMentions: { parse: [] },
+    });
+}
 
+async function addPlaylistToQueue(
+    interaction: PlayInteraction,
+    playlistId: string,
+    member: GuildMember,
+    voiceChannel: VoiceChannel | StageChannel,
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
+): Promise<void> {
+    await interaction.editReply({
+        content: t(locale, 'play.playlistLoading'),
+        components: [],
+        allowedMentions: { parse: [] },
+    });
+
+    log.debug(`Chargement playlist: ${playlistId}`);
+    const playlist = await youtubeService.getPlaylistTracks(
+        playlistId,
+        member.displayName,
+        member.id
+    );
+
+    if (!playlist || playlist.tracks.length === 0) {
+        log.warn('Playlist introuvable ou vide');
         await interaction.editReply({
-            content: t(locale, 'play.playlistAdded', {
-                title: safeContent(playlist.title),
-                count: addedCount,
-            }),
+            content: t(locale, 'play.playlistEmpty'),
+            components: [],
             allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
         return;
     }
 
+    log.info(`Playlist chargee: ${playlist.title} (${playlist.tracks.length} pistes)`);
+
+    const tracks = playlist.tracks.slice(0, config.audio.maxPlaylistTracks);
+    const queue = await ensureQueueForPlayback(interaction, voiceChannel, textChannel, locale);
+    if (!queue) {
+        deleteEphemeralAfterDelay(interaction);
+        return;
+    }
+
+    const wasEmpty = queue.tracks.length === 0 && !queue.currentTrack;
+    const addedCount = queueManager.addTracks(interaction.guildId!, tracks);
+
+    if (addedCount <= 0) {
+        await interaction.editReply({
+            content: t(locale, 'play.queueFull'),
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        deleteEphemeralAfterDelay(interaction);
+        return;
+    }
+
+    if (wasEmpty && addedCount > 0) {
+        log.debug('Queue etait vide, demarrage de la lecture');
+        const playNextStart = Date.now();
+        await queueManager.playNext(interaction.guildId!);
+        log.debug(`request_to_playNext_ms=${Date.now() - playNextStart} (playlist)`);
+    }
+
+    await interaction.editReply({
+        content: t(locale, 'play.playlistAdded', {
+            title: safeContent(playlist.title),
+            count: addedCount,
+        }),
+        components: [],
+        allowedMentions: { parse: [] },
+    });
+    deleteEphemeralAfterDelay(interaction);
+}
+
+async function addVideoUrlToQueue(
+    interaction: PlayInteraction,
+    url: string,
+    member: GuildMember,
+    voiceChannel: VoiceChannel | StageChannel,
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
+): Promise<void> {
     log.debug('URL de video simple');
     const track = await youtubeService.createTrackFromUrl(
         url,
@@ -363,6 +530,7 @@ async function handleYouTubeUrl(
         log.error('Impossible de charger la video');
         await interaction.editReply({
             content: t(locale, 'play.videoLoadFailed'),
+            components: [],
             allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
@@ -371,6 +539,44 @@ async function handleYouTubeUrl(
 
     log.info(`Track cree: ${track.title}`);
     await addTrackToQueue(interaction, track, voiceChannel, textChannel, locale);
+}
+
+async function ensureQueueForPlayback(
+    interaction: PlayInteraction,
+    voiceChannel: VoiceChannel | StageChannel,
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
+) {
+    let queue = queueManager.getQueue(interaction.guildId!);
+    if (!queue) {
+        log.debug('Creation d\'une nouvelle queue');
+        return queueManager.createQueue(interaction.guildId!, textChannel, voiceChannel);
+    }
+
+    if (queue.voiceChannel.id === voiceChannel.id) {
+        return queue;
+    }
+
+    if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
+        await interaction.editReply({
+            content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return null;
+    }
+
+    const moved = await queueManager.moveToChannel(queue, voiceChannel);
+    if (!moved) {
+        await interaction.editReply({
+            content: `❌ ${t(locale, 'settings.preferredMoveFailed')}`,
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return null;
+    }
+
+    return queue;
 }
 
 async function handleSearchAuto(
@@ -422,28 +628,10 @@ async function addTrackToQueue(
     textChannel: TextChannel,
     locale: 'en' | 'fr'
 ): Promise<void> {
-    let queue = queueManager.getQueue(interaction.guildId!);
+    const queue = await ensureQueueForPlayback(interaction, voiceChannel, textChannel, locale);
     if (!queue) {
-        log.debug('Creation d\'une nouvelle queue');
-        queue = queueManager.createQueue(interaction.guildId!, textChannel, voiceChannel);
-    } else if (queue.voiceChannel.id !== voiceChannel.id) {
-        if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
-            await interaction.editReply({
-                content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
-                allowedMentions: { parse: [] },
-            });
-            deleteEphemeralAfterDelay(interaction);
-            return;
-        }
-        const moved = await queueManager.moveToChannel(queue, voiceChannel);
-        if (!moved) {
-            await interaction.editReply({
-                content: `❌ ${t(locale, 'settings.preferredMoveFailed')}`,
-                allowedMentions: { parse: [] },
-            });
-            deleteEphemeralAfterDelay(interaction);
-            return;
-        }
+        deleteEphemeralAfterDelay(interaction);
+        return;
     }
 
     const wasEmpty = queue.tracks.length === 0 && !queue.currentTrack;
@@ -451,6 +639,7 @@ async function addTrackToQueue(
     if (added <= 0) {
         await interaction.editReply({
             content: t(locale, 'play.queueFull'),
+            components: [],
             allowedMentions: { parse: [] },
         });
         deleteEphemeralAfterDelay(interaction);
@@ -466,6 +655,7 @@ async function addTrackToQueue(
 
     await interaction.editReply({
         content: t(locale, 'play.trackAdded', { title: safeContent(track.title) }),
+        components: [],
         allowedMentions: { parse: [] },
     });
     deleteEphemeralAfterDelay(interaction);
@@ -473,6 +663,10 @@ async function addTrackToQueue(
 
 function truncateString(str: string, maxLength: number): string {
     return truncate(str, maxLength);
+}
+
+function createPendingId(): string {
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 async function deleteEphemeralAfterDelay(interaction: PlayInteraction): Promise<void> {

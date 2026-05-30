@@ -21,6 +21,9 @@ const VERSION_TOKENS = new Set(['cover', 'remix', 'live', 'karaoke', 'instrument
 const COMMON_QUERY_TYPOS = new Map<string, string>([
     ['lvoe', 'love'],
     ['lvo', 'love'],
+    ['ressurection', 'resurrection'],
+    ['resurection', 'resurrection'],
+    ['errection', 'erection'],
 ]);
 
 export interface RankedSearchResult extends SearchResult {
@@ -78,6 +81,7 @@ export class YouTubeService {
     private readonly maxBytes = 2 * 1024 * 1024;
     private readonly allowedDomains = ['googleapis.com', 'youtube.com', 'youtube-nocookie.com', 'youtu.be'] as const;
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
+    private youtubeApiBackoffUntil = 0;
 
     async search(query: string, maxResults = 10): Promise<SearchResult[]> {
         const ranked = await this.searchWithRanking(query, maxResults);
@@ -90,10 +94,27 @@ export class YouTubeService {
     async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
         const normalizedQuery = this.normalizeSearchInput(query);
         const rawResults = await this.searchRawVariants(normalizedQuery, maxResults);
-        const ranked = this.rankSearchResults(normalizedQuery, rawResults)
+        let ranked = this.rankSearchResults(normalizedQuery, rawResults)
             .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
             .filter((result) => result.score >= 0)
             .slice(0, maxResults);
+
+        if (this.apiKey && ranked.length < Math.min(3, maxResults)) {
+            const fallbackResults = await this.searchRawVariants(normalizedQuery, maxResults, true);
+            if (fallbackResults.length > 0) {
+                const unique = new Map<string, SearchResult>();
+                for (const result of [...rawResults, ...fallbackResults]) {
+                    if (!unique.has(result.id)) {
+                        unique.set(result.id, result);
+                    }
+                }
+
+                ranked = this.rankSearchResults(normalizedQuery, Array.from(unique.values()))
+                    .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
+                    .filter((result) => result.score >= 0)
+                    .slice(0, maxResults);
+            }
+        }
 
         return ranked;
     }
@@ -121,31 +142,35 @@ export class YouTubeService {
         return top >= 120 && hasTitleMatch && top - secondScore >= 140;
     }
 
-    private async searchRaw(query: string, maxResults = 10): Promise<SearchResult[]> {
-        if (!this.apiKey) {
+    private async searchRaw(query: string, maxResults = 10, forceYtdlp = false): Promise<SearchResult[]> {
+        if (!this.apiKey || forceYtdlp || this.isYouTubeApiBackedOff()) {
             return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
         }
 
         try {
             return await this.searchWithGoogle(query, maxResults);
         } catch (error) {
+            if (this.isQuotaOrAuthError(error)) {
+                this.youtubeApiBackoffUntil = Date.now() + 10 * 60 * 1000;
+            }
             console.warn('YouTube Data API search failed, falling back to yt-dlp:', this.formatError(error));
             return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
         }
     }
 
-    private async searchRawVariants(query: string, maxResults = 10): Promise<SearchResult[]> {
+    private async searchRawVariants(query: string, maxResults = 10, forceYtdlp = false): Promise<SearchResult[]> {
         const variants = this.buildSearchVariants(query);
-        const resultSets = await Promise.all(
-            variants.map((variant) => this.searchRaw(variant, maxResults).catch(() => [] as SearchResult[]))
-        );
         const unique = new Map<string, SearchResult>();
 
-        for (const results of resultSets) {
+        for (const variant of variants) {
+            const results = await this.searchRaw(variant, maxResults, forceYtdlp).catch(() => [] as SearchResult[]);
             for (const result of results) {
                 if (!unique.has(result.id)) {
                     unique.set(result.id, result);
                 }
+            }
+            if (unique.size >= Math.max(maxResults * 2, 12)) {
+                break;
             }
         }
 
@@ -389,13 +414,29 @@ export class YouTubeService {
     }
 
     private async searchWithYtdlp(query: string, maxResults: number): Promise<SearchResult[]> {
+        const unique = new Map<string, SearchResult>();
+        for (const prefix of ['ytmsearch', 'ytsearch'] as const) {
+            const results = await this.searchWithYtdlpPrefix(prefix, query, maxResults);
+            for (const result of results) {
+                if (!unique.has(result.id)) {
+                    unique.set(result.id, result);
+                }
+            }
+            if (unique.size >= maxResults) {
+                break;
+            }
+        }
+        return Array.from(unique.values()).slice(0, maxResults);
+    }
+
+    private async searchWithYtdlpPrefix(prefix: 'ytmsearch' | 'ytsearch', query: string, maxResults: number): Promise<SearchResult[]> {
         try {
             const payload = await this.runYtdlpJson([
                 '--no-warnings',
                 '--skip-download',
                 '--flat-playlist',
                 '--dump-single-json',
-                `ytsearch${Math.max(1, maxResults)}:${query}`,
+                `${prefix}${Math.max(1, maxResults)}:${query}`,
             ]);
 
             const entries = Array.isArray(payload?.entries) ? payload.entries : [];
@@ -404,7 +445,7 @@ export class YouTubeService {
                 .filter((entry: SearchResult | null): entry is SearchResult => entry !== null)
                 .slice(0, maxResults);
         } catch (error) {
-            console.warn('yt-dlp search fallback failed:', this.formatError(error));
+            console.warn(`yt-dlp ${prefix} fallback failed:`, this.formatError(error));
             return [];
         }
     }
@@ -698,6 +739,15 @@ export class YouTubeService {
             .filter(Boolean)
             .map((token) => COMMON_QUERY_TYPOS.get(token) ?? token);
         return tokens.join(' ') || query.trim();
+    }
+
+    private isYouTubeApiBackedOff(): boolean {
+        return Date.now() < this.youtubeApiBackoffUntil;
+    }
+
+    private isQuotaOrAuthError(error: unknown): boolean {
+        const message = this.formatError(error).toLowerCase();
+        return message.includes('http 403') || message.includes('http 429') || message.includes('quota');
     }
 
     private normalizeRankingText(text: string): string {

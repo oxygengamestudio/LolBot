@@ -318,7 +318,7 @@ class QueueViewManager {
             const statusIcon = queue.isPaused ? '⏸️' : '▶️';
             embed.addFields({
                 name: statusIcon,
-                value: `**${safeContent(queue.currentTrack.title)}**\n⏱️ \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
+                value: `**${safeContent(this.truncateString(queue.currentTrack.title, 80))}** • \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
                 inline: false,
             });
         }
@@ -327,9 +327,9 @@ class QueueViewManager {
             const list = pageTracks
                 .map((track, index) => {
                     const position = startIndex + index + 1;
-                    return `**${position}.** ${this.truncateString(track.title, 60)}\n⏱️ \`${this.formatTime(track.duration)}\` • 👤 <@${track.requestedById}>`;
+                    return `**${position}.** ${this.truncateString(track.title, 68)} • \`${this.formatTime(track.duration)}\` • 👤 <@${track.requestedById}>`;
                 })
-                .join('\n\n');
+                .join('\n');
             embed.setDescription(this.fitEmbedDescription(`**${t(state.locale, 'queue.listTitle')}**\n${list}`));
         } else {
             embed.setDescription(t(state.locale, 'queue.empty'));

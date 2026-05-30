@@ -127,13 +127,15 @@ async function sendLyricsMessages(
     const headerTitle = result.title && result.artist
         ? `${safeContent(result.title)} - ${safeContent(result.artist)}`
         : safeContent(result.fullTitle || result.title);
-    const header = `🎤 ${headerTitle}`.trim();
-    const chunks = splitLyrics(result.lyrics, 1800);
+    const header = `## 🎤 ${headerTitle}`.trim();
+    const source = result.url ? `Source: ${result.url}` : '';
+    const formattedLyrics = formatLyricsForDiscord(result.lyrics);
+    const chunks = splitLyrics(formattedLyrics, 1800);
     if (chunks.length === 0) {
         return [];
     }
 
-    chunks[0] = `${header}\n\n${chunks[0]}`;
+    chunks[0] = [header, source, chunks[0]].filter(Boolean).join('\n\n');
 
     const messages: Message[] = [];
     for (let i = 0; i < chunks.length; i++) {
@@ -147,6 +149,30 @@ async function sendLyricsMessages(
     }
 
     return messages;
+}
+
+function formatLyricsForDiscord(text: string): string {
+    const lines = text
+        .replace(/\r\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .split('\n');
+
+    return lines
+        .map((line) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                return '';
+            }
+
+            if (/^\[[^\]]{1,80}\]$/.test(trimmed)) {
+                return `**${safeContent(trimmed)}**`;
+            }
+
+            return `> ${safeContent(trimmed)}`;
+        })
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 function splitLyrics(text: string, maxLength: number): string[] {

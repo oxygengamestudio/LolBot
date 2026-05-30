@@ -44,7 +44,7 @@ import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/di
 import { resolveLocale, t } from './utils/i18n.js';
 import fs from 'fs';
 import { join } from 'path';
-import { handleSelection as handlePlaySelection } from './commands/play.js';
+import { handlePlaylistChoice, handleSelection as handlePlaySelection } from './commands/play.js';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
@@ -309,6 +309,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (interaction.isStringSelectMenu() && interaction.customId.startsWith('play_select:')) {
             await handlePlaySelection(interaction);
+            return;
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('play_playlist:')) {
+            await handlePlaylistChoice(interaction);
             return;
         }
 

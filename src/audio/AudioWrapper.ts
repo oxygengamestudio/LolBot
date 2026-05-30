@@ -623,9 +623,10 @@ export class AudioWrapper extends EventEmitter {
             }
 
             if (track.sourceType === 'url') {
-                log.warn(`URL YouTube non lisible ou indisponible: ${track.id}`);
-                this.lastSourceModeByGuild.set(guildId, 'unknown');
-                return null;
+                log.warn(`URL directe indisponible pour ${track.id}, fallback streaming yt-dlp`);
+                const fallback = await this.createResourceWithYtdlp(guildId, track, effectiveStartSeconds, sponsorSegments);
+                this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
+                return fallback;
             }
 
             log.debug('Aucun media pre-resolu disponible, demarrage streaming yt-dlp immediat');
