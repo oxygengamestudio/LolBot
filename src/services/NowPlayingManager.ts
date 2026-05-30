@@ -127,20 +127,20 @@ class NowPlayingManager {
         const progress = this.createProgressBar(currentTime, track.duration);
         const currentTimeString = this.formatTime(currentTime);
         const totalTimeString = this.formatTime(track.duration);
+        const progressLine = `\`${currentTimeString}\` ${progress} \`${totalTimeString}\``;
 
         const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
         const statusLabel = queue.isPaused
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
-        const largeCover = this.getLargeCover(track.thumbnail);
 
         const embed = new EmbedBuilder()
             .setColor(color)
             .setAuthor({ name: statusLabel })
             .setTitle(safeContent(track.title))
             .setURL(track.url)
-            .setDescription(`\`${currentTimeString}\` ${progress} \`${totalTimeString}\``)
+            .setDescription(progressLine)
             .addFields(
                 {
                     name: t(locale, 'nowPlaying.field.info'),
@@ -149,14 +149,7 @@ class NowPlayingManager {
                         `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
                         `🔊 ${queue.volume}%`,
                     ].join('\n'),
-                    inline: true,
-                },
-                {
-                    name: t(locale, 'nowPlaying.field.thumbnail'),
-                    value: largeCover
-                        ? t(locale, 'nowPlaying.field.thumbnailAvailable')
-                        : t(locale, 'nowPlaying.field.thumbnailUnavailable'),
-                    inline: true,
+                    inline: false,
                 }
             )
             .setFooter({
@@ -168,10 +161,6 @@ class NowPlayingManager {
         if (squareCover) {
             embed.setThumbnail(squareCover);
         }
-        if (largeCover) {
-            embed.setImage(largeCover);
-        }
-
         return embed;
     }
 
