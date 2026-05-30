@@ -14,6 +14,7 @@ export interface Track {
     title: string;
     url: string;
     duration: number; // en secondes
+    originalDuration?: number;
     thumbnail: string;
     channelTitle?: string;
     channelId?: string;

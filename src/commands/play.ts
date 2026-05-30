@@ -512,7 +512,10 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
     }
 
     if (youtubeService.isYouTubeUrl(query)) {
-        await safeAutocompleteRespond(interaction, [], true);
+        await safeAutocompleteRespond(interaction, [{
+            name: '\u200B',
+            value: toAutocompleteValue(query),
+        }]);
         return;
     }
 

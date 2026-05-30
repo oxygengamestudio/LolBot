@@ -16,7 +16,10 @@ interface SponsorEntry {
 }
 
 export class SponsorBlockService {
-    private readonly endpoint = 'https://sponsor.ajay.app/api/skipSegments';
+    private readonly endpoints = [
+        'https://api.sponsor.ajay.app/api/skipSegments',
+        'https://sponsor.ajay.app/api/skipSegments',
+    ];
     private cache: Map<string, { segments: Segment[]; fetchedAt: number }> = new Map();
     private readonly cacheTtlMs = 30 * 60 * 1000;
     private readonly requestTimeoutMs = 10_000;
@@ -47,45 +50,51 @@ export class SponsorBlockService {
             categories: JSON.stringify(categories),
         }).toString();
 
-        const url = `${this.endpoint}?${query}`;
-        try {
-            const response = await this.requestText(url);
-            if (!response) {
-                return [];
-            }
-            const payload = JSON.parse(response) as unknown;
-            if (!Array.isArray(payload)) {
-                return [];
-            }
+        for (const endpoint of this.endpoints) {
+            const url = `${endpoint}?${query}`;
+            try {
+                const response = await this.requestText(url);
+                if (!response) {
+                    continue;
+                }
 
-            const segments = payload
-                .map((entry): Segment | null => {
-                    if (!this.isSponsorEntry(entry)) {
+                const payload = JSON.parse(response) as unknown;
+                if (!Array.isArray(payload)) {
+                    continue;
+                }
+
+                const segments = payload
+                    .map((entry): Segment | null => {
+                        if (!this.isSponsorEntry(entry)) {
+                            return null;
+                        }
+
+                        const segment = entry.segment;
+                        if (!segment || segment.length < 2) {
+                            return null;
+                        }
+
+                        const start = Number(segment[0]);
+                        const end = Number(segment[1]);
+                        if (start < end && Number.isFinite(start) && Number.isFinite(end)) {
+                            return { start, end };
+                        }
+
                         return null;
-                    }
-                    const segment = entry.segment;
-                    if (!segment || segment.length < 2) {
-                        return null;
-                    }
+                    })
+                    .filter((segment): segment is Segment => segment !== null);
 
-                    const start = Number(segment[0]);
-                    const end = Number(segment[1]);
-                    if (start < end && Number.isFinite(start) && Number.isFinite(end)) {
-                        return { start, end };
-                    }
-                    return null;
-                })
-                .filter((segment): segment is Segment => segment !== null);
+                if (segments.length > 0) {
+                    log.debug(`Segments SponsorBlock récupérés pour ${videoId}: ${segments.length}`);
+                }
 
-            if (segments.length > 0) {
-                log.debug(`Segments SponsorBlock récupérés pour ${videoId}: ${segments.length}`);
+                return segments;
+            } catch (error) {
+                log.warn(`SponsorBlock indisponible via ${endpoint} pour ${videoId}`, error);
             }
-
-            return segments;
-        } catch (error) {
-            log.warn(`SponsorBlock indisponible pour ${videoId}`, error);
-            return [];
         }
+
+        return [];
     }
 
     private isSponsorEntry(entry: unknown): entry is SponsorEntry {

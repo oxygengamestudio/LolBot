@@ -542,6 +542,7 @@ export class AudioWrapper extends EventEmitter {
 
         try {
             const sponsorSegments = await this.getSponsorSegmentsFast(track.id, sponsorBlockEnabled);
+            this.applySponsorAdjustedDuration(track, sponsorSegments);
             const effectiveStartSeconds = this.getSponsorAdjustedStart(startSeconds, sponsorSegments);
             if (effectiveStartSeconds > startSeconds + 0.25) {
                 log.info(`SponsorBlock: saut du debut non musical jusqu'a ${effectiveStartSeconds.toFixed(1)}s`);
@@ -665,6 +666,37 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return adjustedStart;
+    }
+
+    private applySponsorAdjustedDuration(track: Track, sponsorSegments: SponsorSegment[]): void {
+        if (sponsorSegments.length === 0 || !Number.isFinite(track.duration) || track.duration <= 0) {
+            return;
+        }
+
+        const originalDuration = track.originalDuration ?? track.duration;
+        if (!Number.isFinite(originalDuration) || originalDuration <= 0) {
+            return;
+        }
+
+        const skippedDuration = this.getSponsorSkippedDuration(originalDuration, sponsorSegments);
+        if (skippedDuration <= 0.3) {
+            return;
+        }
+
+        track.originalDuration = originalDuration;
+        track.duration = Math.max(1, Math.round(originalDuration - skippedDuration));
+        log.debug(`SponsorBlock: duree ajustee ${Math.round(originalDuration)}s -> ${track.duration}s`);
+    }
+
+    private getSponsorSkippedDuration(durationSeconds: number, sponsorSegments: SponsorSegment[]): number {
+        const clipped = this.normalizeSponsorSegments(sponsorSegments)
+            .map((segment) => ({
+                start: Math.max(0, Math.min(durationSeconds, segment.start)),
+                end: Math.max(0, Math.min(durationSeconds, segment.end)),
+            }))
+            .filter((segment) => segment.end > segment.start + 0.3);
+
+        return clipped.reduce((total, segment) => total + (segment.end - segment.start), 0);
     }
 
     async createCrossfadeResource(
