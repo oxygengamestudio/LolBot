@@ -155,6 +155,15 @@ POST /api/client/servers/{server}/power
 {"signal":"restart"}
 ```
 
+Before the restart, the workflow also sends this server command:
+
+```text
+POST /api/client/servers/{server}/command
+{"command":"lolbot:clear-console"}
+```
+
+The running bot handles that stdin command and writes ANSI clear-screen sequences to the Pterodactyl console. If the clear command fails because the server is not currently accepting commands, the workflow still continues with the restart.
+
 If `PTERO_PROD_SERVER_ID` or `PTERO_PREPROD_SERVER_ID` is a full UUID, the workflow automatically uses the short identifier before calling the Client API.
 
 ## systemctl

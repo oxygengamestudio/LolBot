@@ -26,9 +26,24 @@ function formatBuildSuffix(): string {
     return ` (build ${buildSha.slice(0, 7)})`;
 }
 
+function registerConsoleControlCommands(): void {
+    const clearCommand = 'lolbot:clear-console';
+
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: Buffer | string) => {
+        for (const line of chunk.toString().split(/\r?\n/)) {
+            if (line.trim() === clearCommand) {
+                process.stdout.write('\x1b[H\x1b[2J\x1b[3J');
+            }
+        }
+    });
+}
+
 const packageMetadata = readPackageMetadata();
 const botName = packageMetadata.name === 'lolbot' ? 'LolBot' : packageMetadata.name ?? 'LolBot';
 const botVersion = packageMetadata.version ?? 'unknown';
+
+registerConsoleControlCommands();
 
 console.log(`${formatTimestamp()} INFO  [Bootstrap] ${botName} v${botVersion}${formatBuildSuffix()}`);
 

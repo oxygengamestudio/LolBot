@@ -135,6 +135,25 @@ jobs:
             fi
           fi
 
+          clear_body="$(mktemp)"
+          clear_status="$(curl --silent --show-error \
+            --request POST \
+            "${api_base}/servers/${server_identifier}/command" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --header "Content-Type: application/json" \
+            --data '{"command":"lolbot:clear-console"}' \
+            --output "$clear_body" \
+            --write-out "%{http_code}")"
+
+          if [ "$clear_status" = "204" ]; then
+            echo "Pterodactyl console clear command sent."
+            sleep 1
+          else
+            echo "Pterodactyl console clear command failed with HTTP ${clear_status}; continuing restart."
+            cat "$clear_body"
+          fi
+
           response_body="$(mktemp)"
           status_code="$(curl --silent --show-error \
             --request POST \
