@@ -90,9 +90,12 @@ export class YouTubeService {
     async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
         const normalizedQuery = this.normalizeSearchInput(query);
         const rawResults = await this.searchRawVariants(normalizedQuery, maxResults);
-        return this.rankSearchResults(normalizedQuery, rawResults)
+        const ranked = this.rankSearchResults(normalizedQuery, rawResults)
             .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
+            .filter((result) => result.score >= 0)
             .slice(0, maxResults);
+
+        return ranked;
     }
 
     shouldAutoSelect(results: RankedSearchResult[], query: string): boolean {
@@ -155,13 +158,17 @@ export class YouTubeService {
             return [trimmed];
         }
 
-        const variants = [
-            trimmed,
-            `"${trimmed}" official music video`,
+        const inflectedQueries = this.buildInflectedSearchVariants(trimmed);
+        const variants: string[] = [];
+        variants.push(trimmed, `"${trimmed}"`);
+        for (const inflectedQuery of inflectedQueries) {
+            variants.push(inflectedQuery, `"${inflectedQuery}"`);
+        }
+        variants.push(
             `${trimmed} official music video`,
             `${trimmed} official lyric video`,
             `${trimmed} vevo`,
-        ];
+        );
 
         return Array.from(new Set(variants));
     }
@@ -547,6 +554,7 @@ export class YouTubeService {
 
     private rankSearchResults(query: string, results: SearchResult[]): RankedSearchResult[] {
         const tokens = this.extractRankingTokens(query);
+        const normalizedQuery = this.normalizeRankingText(query);
         const explicit = {
             cover: tokens.includes('cover'),
             remix: tokens.includes('remix'),
@@ -560,7 +568,7 @@ export class YouTubeService {
 
         return results.map((result) => ({
             ...result,
-            score: this.scoreSearchResult(result, tokens, explicit),
+            score: this.scoreSearchResult(result, tokens, explicit, normalizedQuery),
         })).sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)));
     }
 
@@ -576,20 +584,37 @@ export class YouTubeService {
             instrumental: boolean;
             reaction: boolean;
             spedup: boolean;
-        }
+        },
+        normalizedQuery: string
     ): number {
         const title = this.normalizeRankingText(result.title);
         const channel = this.normalizeRankingText(result.channelTitle ?? '');
         const fullText = `${title} ${channel}`;
+        const titleTokens = this.tokenizeRankingText(title);
+        const fullTextTokens = this.tokenizeRankingText(fullText);
         const durationSeconds = result.durationSeconds ?? this.parseDurationToSeconds(result.duration);
-        const queryPhrase = queryTokens.filter((token) => !VERSION_TOKENS.has(token)).join(' ');
+        const coreTokens = queryTokens.filter((token) => !VERSION_TOKENS.has(token));
+        const queryPhrase = coreTokens.join(' ');
+        const compactTitle = this.compactRankingText(title);
+        const compactQuery = this.compactRankingText(normalizedQuery);
         let score = 20;
+
+        if (normalizedQuery && title === normalizedQuery) {
+            score += 1200;
+        } else if (compactQuery && compactTitle === compactQuery) {
+            score += 1100;
+        } else if (normalizedQuery && title.includes(normalizedQuery)) {
+            score += 520;
+        }
 
         if (queryPhrase.length > 0 && title.includes(queryPhrase)) {
             score += 260;
         }
         if (queryPhrase.length > 0 && fullText.includes(queryPhrase)) {
             score += 90;
+        }
+        if (coreTokens.length > 1 && this.hasOrderedTokenMatch(title, coreTokens)) {
+            score += 240;
         }
 
         for (const keyword of OFFICIAL_KEYWORDS) {
@@ -603,10 +628,17 @@ export class YouTubeService {
         if (title.includes('vevo')) score += 90;
         if (title.includes('official')) score += 70;
 
-        const matchedTokens = queryTokens.filter((token) => fullText.includes(token));
-        const missingTokens = queryTokens.filter((token) => !fullText.includes(token) && !VERSION_TOKENS.has(token));
-        score += matchedTokens.length * 28;
-        score -= missingTokens.length * 140;
+        const matchedTitleTokens = coreTokens.filter((token) => this.hasRankingToken(titleTokens, token));
+        const matchedFullTokens = coreTokens.filter((token) => this.hasRankingToken(fullTextTokens, token));
+        const missingFullTokens = coreTokens.filter((token) => !this.hasRankingToken(fullTextTokens, token));
+        const missingTitleTokens = coreTokens.filter((token) => !this.hasRankingToken(titleTokens, token));
+        score += matchedFullTokens.length * 34;
+        score += matchedTitleTokens.length * 24;
+        if (coreTokens.length > 0 && matchedTitleTokens.length === coreTokens.length) {
+            score += coreTokens.length >= 2 ? 180 : 70;
+        }
+        score -= missingFullTokens.length * (coreTokens.length >= 2 ? 620 : 130);
+        score -= missingTitleTokens.length * (coreTokens.length >= 2 ? 180 : 20);
 
         const viewCount = result.viewCount ?? 0;
         if (viewCount > 0) {
@@ -633,6 +665,25 @@ export class YouTubeService {
         return score;
     }
 
+    private buildInflectedSearchVariants(query: string): string[] {
+        const normalized = this.normalizeRankingText(query);
+        const tokens = normalized.split(/\s+/).filter(Boolean);
+        if (tokens.length !== 2) {
+            return [];
+        }
+
+        const [first, second] = tokens;
+        if (first.length <= 3 || second.length <= 2) {
+            return [];
+        }
+
+        if (first.endsWith('s')) {
+            return [`${first.slice(0, -1)} ${second}`];
+        }
+
+        return [`${first}s ${second}`];
+    }
+
     private extractRankingTokens(query: string): string[] {
         return this.normalizeRankingText(query)
             .split(/\s+/)
@@ -657,6 +708,57 @@ export class YouTubeService {
             .replace(/[^a-z0-9\s]/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
+    }
+
+    private compactRankingText(text: string): string {
+        return this.normalizeRankingText(text).replace(/\s+/g, '');
+    }
+
+    private tokenizeRankingText(text: string): string[] {
+        return this.normalizeRankingText(text)
+            .split(/\s+/)
+            .filter(Boolean);
+    }
+
+    private hasRankingToken(tokens: string[], queryToken: string): boolean {
+        return tokens.some((token) => this.rankingTokensMatch(token, queryToken));
+    }
+
+    private hasOrderedTokenMatch(text: string, queryTokens: string[]): boolean {
+        const textTokens = this.tokenizeRankingText(text);
+        if (queryTokens.length === 0 || textTokens.length < queryTokens.length) {
+            return false;
+        }
+
+        for (let i = 0; i <= textTokens.length - queryTokens.length; i += 1) {
+            const matches = queryTokens.every((queryToken, offset) =>
+                this.rankingTokensMatch(textTokens[i + offset], queryToken)
+            );
+            if (matches) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private rankingTokensMatch(candidateToken: string, queryToken: string): boolean {
+        if (candidateToken === queryToken) {
+            return true;
+        }
+        if (candidateToken.length > 3 && candidateToken.endsWith('s') && candidateToken.slice(0, -1) === queryToken) {
+            return true;
+        }
+        if (queryToken.length > 3 && queryToken.endsWith('s') && queryToken.slice(0, -1) === candidateToken) {
+            return true;
+        }
+        if (candidateToken.endsWith('ies') && `${candidateToken.slice(0, -3)}y` === queryToken) {
+            return true;
+        }
+        if (queryToken.endsWith('ies') && `${queryToken.slice(0, -3)}y` === candidateToken) {
+            return true;
+        }
+        return false;
     }
 
     private buildSearchQuery(query: string): string {

@@ -1259,7 +1259,9 @@ export class AudioWrapper extends EventEmitter {
                     teardown(`native opus http ${response.status}`);
                     return null;
                 }
-                stream = Readable.fromWeb(response.body as any);
+                stream = Readable.fromWeb(response.body as any, {
+                    highWaterMark: 4 * 1024 * 1024,
+                });
             } else {
                 stream = createReadStream(directUrl);
             }

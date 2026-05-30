@@ -148,34 +148,31 @@ class NowPlayingManager {
                 : t(locale, 'nowPlaying.footer.playing'),
         ].join('\n');
 
-        const section = {
-            type: ComponentType.Section,
-            components: [
-                {
-                    type: ComponentType.TextDisplay,
-                    content: info,
-                },
-            ],
-            accessory: squareCover
-                ? {
-                    type: ComponentType.Thumbnail,
-                    media: { url: squareCover },
-                    description: safeContent(track.title).slice(0, 100),
-                }
-                : {
-                    type: ComponentType.Button,
-                    style: ButtonStyle.Link,
-                    label: 'YouTube',
-                    url: track.url,
-                },
-        };
+        const displayComponents: any[] = [
+            {
+                type: ComponentType.TextDisplay,
+                content: info,
+            },
+        ];
+
+        if (squareCover) {
+            displayComponents.push({
+                type: ComponentType.MediaGallery,
+                items: [
+                    {
+                        media: { url: squareCover },
+                        description: safeContent(track.title).slice(0, 100),
+                    },
+                ],
+            });
+        }
 
         return [
             {
                 type: ComponentType.Container,
                 accent_color: color,
                 components: [
-                    section,
+                    ...displayComponents,
                     {
                         type: ComponentType.Separator,
                         divider: true,
@@ -261,8 +258,8 @@ class NowPlayingManager {
                 const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
                 const params = new URLSearchParams({
                     url: source,
-                    w: '512',
-                    h: '512',
+                    w: '768',
+                    h: '768',
                     fit: 'cover',
                     a: 'center',
                     output: 'jpg',
