@@ -520,7 +520,8 @@ class QueueManager extends EventEmitter {
             queue.guildId,
             queue.currentTrack,
             Math.max(0, resumeOffset),
-            settings.sponsorBlockEnabled
+            settings.sponsorBlockEnabled,
+            queue.volume
         );
         if (!resource) {
             return false;
@@ -717,7 +718,7 @@ class QueueManager extends EventEmitter {
 
             const resourceStartedAt = Date.now();
             const settings = await guildSettingsManager.getSettings(guildId);
-            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
+            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled, settings.volume);
             const resourceMs = Date.now() - resourceStartedAt;
             log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
             queue.lastStartMetrics = {
@@ -732,7 +733,7 @@ class QueueManager extends EventEmitter {
             joinMs = 0;
             const resourceStartedAt = Date.now();
             const settings = await guildSettingsManager.getSettings(guildId);
-            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
+            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled, settings.volume);
             const resourceMs = Date.now() - resourceStartedAt;
             log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
             queue.lastStartMetrics = {
@@ -853,6 +854,13 @@ class QueueManager extends EventEmitter {
                 resource.volume.setVolume(clamped / 100);
                 applied = true;
             }
+        }
+
+        if (!applied && state?.status === AudioPlayerStatus.Playing && queue.currentTrack) {
+            const offset = this.getCurrentTime(guildId);
+            void this.resumeCurrentTrack(queue, offset).catch((error) => {
+                log.warn('Impossible de recreer la ressource audio pour appliquer le volume', error);
+            });
         }
 
         log.debug(`Volume ${applied ? 'applique' : 'memorise'}: ${clamped}%`);
@@ -1015,7 +1023,8 @@ class QueueManager extends EventEmitter {
                 guildId,
                 queue.currentTrack,
                 clamped,
-                settings.sponsorBlockEnabled
+                settings.sponsorBlockEnabled,
+                queue.volume
             );
             if (!resource) {
                 log.error('Seek: impossible de créer la ressource audio');

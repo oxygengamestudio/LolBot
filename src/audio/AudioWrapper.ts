@@ -529,7 +529,8 @@ export class AudioWrapper extends EventEmitter {
         guildId: string,
         track: Track,
         startSeconds: number = 0,
-        sponsorBlockEnabled = false
+        sponsorBlockEnabled = false,
+        targetVolume = 100
     ): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
         log.trace('Track ID:', track.id);
@@ -550,7 +551,14 @@ export class AudioWrapper extends EventEmitter {
 
             const cachedFile = await mediaCacheManager.getTrackPath(track.id);
             if (cachedFile) {
-                const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, effectiveStartSeconds, sponsorSegments);
+                const resource = await this.createResourceWithDirectUrl(
+                    guildId,
+                    track,
+                    cachedFile,
+                    effectiveStartSeconds,
+                    sponsorSegments,
+                    targetVolume
+                );
                 if (resource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
                     return resource;
@@ -566,7 +574,8 @@ export class AudioWrapper extends EventEmitter {
                     track,
                     cached.streamUrl,
                     effectiveStartSeconds,
-                    sponsorSegments
+                    sponsorSegments,
+                    targetVolume
                 );
                 if (directResource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
@@ -583,7 +592,8 @@ export class AudioWrapper extends EventEmitter {
                     track,
                     warmDirectUrl,
                     effectiveStartSeconds,
-                    sponsorSegments
+                    sponsorSegments,
+                    targetVolume
                 );
                 if (directResource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
@@ -599,7 +609,8 @@ export class AudioWrapper extends EventEmitter {
                         track,
                         seekableUrl,
                         effectiveStartSeconds,
-                        sponsorSegments
+                        sponsorSegments,
+                        targetVolume
                     );
                     if (directResource) {
                         this.lastSourceModeByGuild.set(guildId, 'direct');
@@ -1030,23 +1041,30 @@ export class AudioWrapper extends EventEmitter {
         track: Track,
         directUrl: string,
         startSeconds: number,
-        sponsorSegments: SponsorSegment[] = []
+        sponsorSegments: SponsorSegment[] = [],
+        targetVolume = 100
     ): Promise<AudioResource | null> {
         const runDir = await this.createRunDirectory(guildId);
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
+        const useOpusCopy = this.canCopyDirectOpus(directUrl, filters, targetVolume);
         const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
             ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
             : [];
+        const outputArgs = useOpusCopy
+            ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg']
+            : [
+                ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+                '-f', 's16le',
+                '-ar', '48000',
+                '-ac', '2',
+            ];
         const ffmpegArgs = [
             '-loglevel', 'warning',
             ...inputReconnectArgs,
             ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
             '-i', directUrl,
             '-vn',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2',
-            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+            ...outputArgs,
             'pipe:1',
         ];
 
@@ -1114,8 +1132,8 @@ export class AudioWrapper extends EventEmitter {
         stdout.once('error', () => teardown('direct audio stream error'));
 
         const resource = createAudioResource<ResourceMetadata>(stdout, {
-            inputType: StreamType.Raw,
-            inlineVolume: true,
+            inputType: useOpusCopy ? StreamType.OggOpus : StreamType.Raw,
+            inlineVolume: !useOpusCopy,
             metadata: {
                 trackId: track.id,
                 teardown: () => teardown('direct resource teardown requested'),
@@ -1139,6 +1157,19 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return resource;
+    }
+
+    private canCopyDirectOpus(directUrl: string, filters: string[], targetVolume: number): boolean {
+        if (filters.length > 0 || Math.round(targetVolume) !== 100) {
+            return false;
+        }
+
+        try {
+            const decoded = decodeURIComponent(directUrl);
+            return /mime=audio\/(?:webm|ogg)/i.test(decoded);
+        } catch {
+            return /mime=audio\/(?:webm|ogg)/i.test(directUrl);
+        }
     }
 
     private buildAudioFilters(startSeconds: number, sponsorSegments: SponsorSegment[]): string[] {
@@ -1537,10 +1568,10 @@ export class AudioWrapper extends EventEmitter {
         const warmup = (async () => {
             const startedAt = Date.now();
             const includeCookies = this.hasCookieEnv();
-            let streamResult = await this.fetchDirectStreamUrl(guildId, track.url, includeCookies, 8_000)
+            let streamResult = await this.fetchDirectStreamUrl(guildId, track.url, includeCookies, 15_000)
                 .catch(() => ({ url: null, ytdlpErrors: '' }));
             if (!streamResult.url && includeCookies && this.isCookieCopyError(streamResult.ytdlpErrors)) {
-                streamResult = await this.fetchDirectStreamUrl(guildId, track.url, false, 8_000)
+                streamResult = await this.fetchDirectStreamUrl(guildId, track.url, false, 15_000)
                     .catch(() => ({ url: null, ytdlpErrors: '' }));
             }
 

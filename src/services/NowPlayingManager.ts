@@ -159,7 +159,7 @@ class NowPlayingManager {
             });
 
         if (squareCover) {
-            embed.setThumbnail(squareCover);
+            embed.setImage(squareCover);
         }
         return embed;
     }
