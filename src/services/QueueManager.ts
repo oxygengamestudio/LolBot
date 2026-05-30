@@ -550,6 +550,7 @@ class QueueManager extends EventEmitter {
             log.warn(`Queue non trouvée pour guild: ${guildId}`);
             return -1;
         }
+        const wasIdle = !queue.currentTrack && !queue.isPlaying && queue.tracks.length === 0;
         if (queue.tracks.length >= config.audio.maxQueueTracks) {
             log.warn(`Queue pleine (${config.audio.maxQueueTracks}), impossible d'ajouter: ${track.title}`);
             return 0;
@@ -563,7 +564,9 @@ class QueueManager extends EventEmitter {
         log.info(`Piste ajoutée à la queue (total: ${queue.tracks.length})`);
         log.trace('Détails de la piste:', track);
 
-        this.refreshWarmup(queue);
+        if (!wasIdle) {
+            this.refreshWarmup(queue);
+        }
 
         return 1;
     }
@@ -578,6 +581,7 @@ class QueueManager extends EventEmitter {
             log.warn(`Queue non trouvée pour guild: ${guildId}`);
             return -1;
         }
+        const wasIdle = !queue.currentTrack && !queue.isPlaying && queue.tracks.length === 0;
         const availableSlots = Math.max(0, config.audio.maxQueueTracks - queue.tracks.length);
         if (availableSlots == 0) {
             log.warn(`Queue pleine (${config.audio.maxQueueTracks}), aucune piste ajoutee`);
@@ -592,7 +596,9 @@ class QueueManager extends EventEmitter {
 
         log.info(`${tracksToAdd.length} pistes ajoutées à la queue (total: ${queue.tracks.length})`);
 
-        this.refreshWarmup(queue);
+        if (!wasIdle) {
+            this.refreshWarmup(queue);
+        }
 
         return tracksToAdd.length;
     }

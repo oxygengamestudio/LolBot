@@ -14,10 +14,22 @@ import { config } from '../config.js';
 import { resolveLocale, t } from './i18n.js';
 import { logger } from './Logger.js';
 import { safeContent } from './text.js';
+import type { Track } from '../types/index.js';
 
 const log = logger.createModuleLogger('Lyrics');
 
 type LyricsInteraction = ChatInputCommandInteraction | ButtonInteraction | ModalSubmitInteraction;
+
+export function buildTrackLyricsQuery(track: Track): string {
+    const primaryTitle = track.title
+        .split('|')[0]
+        .replace(/\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*/g, ' ')
+        .replace(/\b(official|officiel|officielle|lyrics?|audio|video|clip|mv|m\/v|visualizer|hd|hq|4k|8k)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return primaryTitle || track.title;
+}
 
 export async function sendLyrics(
     interaction: LyricsInteraction,

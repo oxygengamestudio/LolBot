@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
-import { sendLyrics } from '../utils/lyrics.js';
+import { buildTrackLyricsQuery, sendLyrics } from '../utils/lyrics.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
 import { getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
@@ -48,5 +48,5 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         return;
     }
 
-    await sendLyrics(interaction, queue.currentTrack.title, queue);
+    await sendLyrics(interaction, buildTrackLyricsQuery(queue.currentTrack), queue);
 }
