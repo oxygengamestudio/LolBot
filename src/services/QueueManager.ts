@@ -5,7 +5,6 @@
     VoiceConnectionStatus,
     entersState,
     VoiceConnection,
-    AudioPlayer,
     NoSubscriberBehavior,
     VoiceConnectionState,
     AudioPlayerState,

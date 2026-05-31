@@ -35,16 +35,6 @@ interface YouTubeThumbnailSet {
     high?: { url?: string };
 }
 
-interface SearchApiItem {
-    id?: { videoId?: string };
-    snippet?: {
-        title?: string;
-        channelTitle?: string;
-        channelId?: string;
-        thumbnails?: YouTubeThumbnailSet;
-    };
-}
-
 interface VideoApiItem {
     id?: string;
     snippet?: {
@@ -81,7 +71,6 @@ export class YouTubeService {
     private readonly maxBytes = 2 * 1024 * 1024;
     private readonly allowedDomains = ['googleapis.com', 'youtube.com', 'youtube-nocookie.com', 'youtu.be'] as const;
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
-    private youtubeApiBackoffUntil = 0;
     private readonly searchCache = new Map<string, { expiresAt: number; results: SearchResult[] }>();
     private readonly searchCacheTtlMs = 3 * 60 * 1000;
 
@@ -407,115 +396,6 @@ export class YouTubeService {
                     : 1;
 
         return Math.floor(amount * multiplier);
-    }
-
-    private async searchRaw(query: string, maxResults = 10, forceYtdlp = false): Promise<SearchResult[]> {
-        if (!this.apiKey || forceYtdlp || this.isYouTubeApiBackedOff()) {
-            return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
-        }
-
-        try {
-            return await this.searchWithGoogle(query, maxResults);
-        } catch (error) {
-            if (this.isQuotaOrAuthError(error)) {
-                this.youtubeApiBackoffUntil = Date.now() + 10 * 60 * 1000;
-            }
-            console.warn('YouTube Data API search failed, falling back to yt-dlp:', this.formatError(error));
-            return this.searchWithYtdlp(query, Math.min(Math.max(maxResults * 3, maxResults), 25));
-        }
-    }
-
-    private async searchRawVariants(query: string, maxResults = 10, forceYtdlp = false): Promise<SearchResult[]> {
-        const variants = this.buildSearchVariants(query);
-        const unique = new Map<string, SearchResult>();
-
-        for (const variant of variants) {
-            const results = await this.searchRaw(variant, maxResults, forceYtdlp).catch(() => [] as SearchResult[]);
-            for (const result of results) {
-                if (!unique.has(result.id)) {
-                    unique.set(result.id, result);
-                }
-            }
-            if (unique.size >= Math.max(maxResults * 2, 12)) {
-                break;
-            }
-        }
-
-        return Array.from(unique.values());
-    }
-
-    private buildSearchVariants(query: string): string[] {
-        const trimmed = query.trim();
-        if (!trimmed) {
-            return [trimmed];
-        }
-
-        const inflectedQueries = this.buildInflectedSearchVariants(trimmed);
-        const variants: string[] = [];
-        variants.push(trimmed, `"${trimmed}"`);
-        for (const inflectedQuery of inflectedQueries) {
-            variants.push(inflectedQuery, `"${inflectedQuery}"`);
-        }
-        variants.push(
-            `${trimmed} official music video`,
-            `${trimmed} official lyric video`,
-            `${trimmed} vevo`,
-        );
-
-        return Array.from(new Set(variants));
-    }
-
-    private async searchWithGoogle(query: string, maxResults = 10): Promise<SearchResult[]> {
-        const effectiveMaxResults = Math.max(1, Math.min(maxResults, 25));
-        const expandedMaxResults = Math.max(effectiveMaxResults, Math.min(effectiveMaxResults * 3, 25));
-        const params = new URLSearchParams({
-            part: 'snippet',
-            q: this.buildSearchQuery(query),
-            type: 'video',
-            maxResults: expandedMaxResults.toString(),
-            key: this.apiKey!,
-            videoCategoryId: '10',
-        });
-
-        const searchUrl = `${YOUTUBE_API_BASE}/search?${params.toString()}`;
-        const searchData = await this.fetchJson<YouTubeListResponse<SearchApiItem>>(searchUrl);
-        const items = searchData.items ?? [];
-        if (items.length === 0) {
-            return [];
-        }
-
-        const videoIds = items
-            .map((item) => item.id?.videoId)
-            .filter((value): value is string => Boolean(value))
-            .join(',');
-        if (!videoIds) {
-            return [];
-        }
-
-        const detailsParams = new URLSearchParams({
-            part: 'contentDetails,snippet,statistics',
-            id: videoIds,
-            key: this.apiKey!,
-        });
-        const detailsUrl = `${YOUTUBE_API_BASE}/videos?${detailsParams.toString()}`;
-        const detailsData = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(detailsUrl);
-
-        return (detailsData.items ?? [])
-            .filter((item): item is VideoApiItem & { id: string; snippet: NonNullable<VideoApiItem['snippet']>; contentDetails: NonNullable<VideoApiItem['contentDetails']> } =>
-                Boolean(item.id && item.snippet && item.contentDetails?.duration)
-            )
-            .filter((item) => !this.isLikelyShortVideo(item))
-            .map((item) => ({
-                id: item.id,
-                title: this.decodeHtmlEntities(item.snippet.title ?? 'Unknown title'),
-                duration: this.parseDuration(item.contentDetails.duration ?? 'PT0S'),
-                durationSeconds: this.parseDurationToSeconds(item.contentDetails.duration ?? 'PT0S'),
-                thumbnail: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.default?.url || '',
-                channelTitle: item.snippet.channelTitle ?? 'Unknown channel',
-                channelId: item.snippet.channelId,
-                viewCount: this.coerceViewCount(item.statistics?.viewCount),
-            }))
-            .slice(0, expandedMaxResults);
     }
 
     isYouTubeUrl(url: string): boolean {
@@ -1012,15 +892,6 @@ export class YouTubeService {
         return tokens.join(' ') || query.trim();
     }
 
-    private isYouTubeApiBackedOff(): boolean {
-        return Date.now() < this.youtubeApiBackoffUntil;
-    }
-
-    private isQuotaOrAuthError(error: unknown): boolean {
-        const message = this.formatError(error).toLowerCase();
-        return message.includes('http 403') || message.includes('http 429') || message.includes('quota');
-    }
-
     private normalizeRankingText(text: string): string {
         return text
             .toLowerCase()
@@ -1082,40 +953,8 @@ export class YouTubeService {
         return false;
     }
 
-    private buildSearchQuery(query: string): string {
-        const trimmed = query.trim();
-        if (!trimmed) {
-            return trimmed;
-        }
-
-        return `${trimmed} -shorts -#shorts`;
-    }
-
-    private isLikelyShortVideo(item: VideoApiItem): boolean {
-        const title = this.decodeHtmlEntities(item.snippet?.title ?? '');
-        const channelTitle = this.decodeHtmlEntities(item.snippet?.channelTitle ?? '');
-        const durationSeconds = this.parseDurationToSeconds(item.contentDetails?.duration ?? 'PT0S');
-
-        if (this.hasShortsMarker(title) || this.hasShortsMarker(channelTitle)) {
-            return true;
-        }
-
-        // Shorts results often arrive with explicit markers removed inconsistently;
-        // keep obvious micro-clips out of music search/autocomplete.
-        if (durationSeconds > 0 && durationSeconds <= 65 && this.looksLikeVerticalClipTitle(title)) {
-            return true;
-        }
-
-        return false;
-    }
-
     private hasShortsMarker(text: string): boolean {
         return this.shortsMarkerPattern.test(this.normalizeSearchText(text));
-    }
-
-    private looksLikeVerticalClipTitle(title: string): boolean {
-        const normalized = this.normalizeSearchText(title);
-        return /\b(short|clip|edit|meme|status)\b/i.test(normalized);
     }
 
     private getYtdlpPath(): string {
@@ -1237,18 +1076,6 @@ export class YouTubeService {
         }
 
         return '';
-    }
-
-    private parseDuration(duration: string): string {
-        const totalSeconds = this.parseDurationToSeconds(duration);
-        const hours = Math.floor(totalSeconds / 3600);
-        const minutes = Math.floor((totalSeconds % 3600) / 60);
-        const seconds = totalSeconds % 60;
-
-        if (hours > 0) {
-            return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-        }
-        return `${minutes}:${seconds.toString().padStart(2, '0')}`;
     }
 
     private parseDurationToSeconds(duration: string): number {

@@ -156,7 +156,7 @@ async function requestInternal(
                 return;
             }
 
-            const source = decompress ? getDecodedStream(res) : res;
+            const source: NodeJS.ReadableStream = decompress ? getDecodedStream(res) : res;
             const chunks: Buffer[] = [];
             let totalBytes = 0;
 

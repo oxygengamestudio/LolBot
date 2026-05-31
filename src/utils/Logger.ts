@@ -1,5 +1,3 @@
-import { config } from '../config.js';
-
 export enum LogLevel {
     NONE = 0,
     ERROR = 1,

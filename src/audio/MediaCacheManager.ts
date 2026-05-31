@@ -2,8 +2,6 @@ import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { mkdir, stat, rename, unlink } from 'fs/promises';
 import { join } from 'path';
-import http from 'http';
-import https from 'https';
 import { config } from '../config.js';
 import type { Track } from '../types/index.js';
 import { logger } from '../utils/Logger.js';
@@ -37,20 +35,6 @@ export class MediaCacheManager {
         this.ffmpegPath = this.resolveFfmpegPath();
         this.ensureCacheDir();
         this.startCleanup();
-    }
-
-    private hasCookieEnv(): boolean {
-        if (process.env.YTDLP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES) {
-            return true;
-        }
-
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
-        return extraArgs.some((arg) =>
-            arg === '--cookies' ||
-            arg === '--cookies-from-browser' ||
-            arg.startsWith('--cookies=') ||
-            arg.startsWith('--cookies-from-browser=')
-        );
     }
 
     private parseExtraArgs(rawArgs: string | undefined): string[] {
@@ -211,7 +195,7 @@ export class MediaCacheManager {
     }
 
     clearUnused(keepTrackIds: Set<string>): void {
-        for (const [trackId, entry] of this.entries) {
+        for (const trackId of this.entries.keys()) {
             if (!keepTrackIds.has(trackId)) {
                 this.clearTrack(trackId);
             }

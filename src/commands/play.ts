@@ -227,7 +227,6 @@ export async function handleSelection(interaction: StringSelectMenuInteraction):
     }
 
     const guild = interaction.guild;
-    const member = interaction.member as GuildMember;
     const textChannel = guild?.channels.cache.get(payload.textChannelId) as TextChannel | undefined;
     const voiceChannel = guild?.channels.cache.get(payload.voiceChannelId);
     if (!guild || !textChannel || !voiceChannel?.isVoiceBased()) {
@@ -765,40 +764,6 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
     }
 }
 
-async function buildYouTubeUrlAutocompleteOptions(query: string, locale: 'en' | 'fr'): Promise<AutocompleteOption[]> {
-    const optionValue = toAutocompleteValue(query);
-    const options: AutocompleteOption[] = [
-        {
-            name: truncateString(`🔗 ${t(locale, 'play.autocomplete.keepUrl')}`, 100),
-            value: optionValue,
-        },
-    ];
-
-    const videoId = youtubeService.extractVideoId(query);
-    if (videoId) {
-        try {
-            const info = await youtubeService.getVideoInfo(videoId);
-            if (info) {
-                options.push({
-                    name: truncateString(
-                        `🎵 ${t(locale, 'play.autocomplete.detected', {
-                            title: safeContent(info.title),
-                            duration: formatDuration(info.duration),
-                        })}`,
-                        100
-                    ),
-                    value: AUTOCOMPLETE_HINT_REFINE,
-                });
-                return options;
-            }
-        } catch (error) {
-            log.trace('Impossible de resoudre le titre de l\'URL en autocomplete', error);
-        }
-    }
-
-    return options;
-}
-
 function withHintOption(
     options: AutocompleteOption[],
     hintName: string,
@@ -820,37 +785,6 @@ function withHintOption(
 
 function isAutocompleteHintValue(value: string): boolean {
     return value.startsWith(AUTOCOMPLETE_HINT_PREFIX);
-}
-
-function formatDuration(totalSeconds: number): string {
-    const safe = Math.max(0, Math.floor(totalSeconds));
-    const hours = Math.floor(safe / 3600);
-    const minutes = Math.floor((safe % 3600) / 60);
-    const seconds = safe % 60;
-
-    if (hours > 0) {
-        return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-    }
-
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-}
-
-function toAutocompleteValue(query: string): string {
-    if (query.length <= 100) {
-        return query;
-    }
-
-    const videoId = youtubeService.extractVideoId(query);
-    if (videoId) {
-        return `https://www.youtube.com/watch?v=${videoId}`;
-    }
-
-    const playlistId = youtubeService.extractPlaylistId(query);
-    if (playlistId) {
-        return `https://www.youtube.com/playlist?list=${playlistId}`;
-    }
-
-    return query.slice(0, 100);
 }
 
 function getAutocompleteKey(interaction: {
