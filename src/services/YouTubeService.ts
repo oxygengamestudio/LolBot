@@ -4,6 +4,7 @@ import { httpRequest } from '../utils/httpClient.js';
 import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
+import type { MediaProvider, MediaSearchContext } from './providers/MediaProvider.js';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const OFFICIAL_KEYWORDS = [
@@ -25,6 +26,88 @@ const COMMON_QUERY_TYPOS = new Map<string, string>([
     ['resurection', 'resurrection'],
     ['errection', 'erection'],
 ]);
+
+type PermitWaiter = {
+    resolve: (release: () => void) => void;
+    reject: (error: Error) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+};
+
+type TimedCacheEntry<T> = {
+    expiresAt: number;
+    value: T;
+};
+
+class AsyncSemaphore {
+    private available: number;
+    private readonly waiters: PermitWaiter[] = [];
+
+    constructor(private readonly capacity: number) {
+        this.available = capacity;
+    }
+
+    get idle(): boolean {
+        return this.available === this.capacity && this.waiters.length === 0;
+    }
+
+    acquire(signal?: AbortSignal): Promise<() => void> {
+        if (signal?.aborted) {
+            return Promise.reject(createAbortError());
+        }
+
+        if (this.available > 0) {
+            this.available -= 1;
+            return Promise.resolve(this.createRelease());
+        }
+
+        return new Promise((resolve, reject) => {
+            const waiter: PermitWaiter = { resolve, reject, signal };
+            if (signal) {
+                waiter.onAbort = () => {
+                    const index = this.waiters.indexOf(waiter);
+                    if (index >= 0) {
+                        this.waiters.splice(index, 1);
+                    }
+                    reject(createAbortError());
+                };
+                signal.addEventListener('abort', waiter.onAbort, { once: true });
+            }
+            this.waiters.push(waiter);
+        });
+    }
+
+    private createRelease(): () => void {
+        let released = false;
+        return () => {
+            if (released) {
+                return;
+            }
+            released = true;
+
+            while (this.waiters.length > 0) {
+                const waiter = this.waiters.shift()!;
+                if (waiter.onAbort) {
+                    waiter.signal?.removeEventListener('abort', waiter.onAbort);
+                }
+                if (waiter.signal?.aborted) {
+                    waiter.reject(createAbortError());
+                    continue;
+                }
+                waiter.resolve(this.createRelease());
+                return;
+            }
+
+            this.available = Math.min(this.capacity, this.available + 1);
+        };
+    }
+}
+
+function createAbortError(): Error {
+    const error = new Error('Media search aborted');
+    error.name = 'AbortError';
+    return error;
+}
 
 export interface RankedSearchResult extends SearchResult {
     score: number;
@@ -65,7 +148,8 @@ interface YouTubeListResponse<TItem> {
     items?: TItem[];
 }
 
-export class YouTubeService {
+export class YouTubeService implements MediaProvider {
+    readonly provider = 'youtube';
     private readonly apiKey = config.youtube.apiKey;
     private readonly requestTimeoutMs = 15_000;
     private readonly maxBytes = 2 * 1024 * 1024;
@@ -73,18 +157,37 @@ export class YouTubeService {
     private readonly shortsMarkerPattern = /(?:^|[^a-z0-9])(?:shorts|#shorts)(?:$|[^a-z0-9])/i;
     private readonly searchCache = new Map<string, { expiresAt: number; results: SearchResult[] }>();
     private readonly searchCacheTtlMs = 3 * 60 * 1000;
+    private readonly searchInFlight = new Map<string, Promise<SearchResult[]>>();
+    private readonly videoInfoCache = new Map<string, TimedCacheEntry<YouTubeVideoInfo | null>>();
+    private readonly videoInfoInFlight = new Map<string, Promise<YouTubeVideoInfo | null>>();
+    private readonly playlistCache = new Map<string, TimedCacheEntry<PlaylistInfo | null>>();
+    private readonly playlistInFlight = new Map<string, Promise<PlaylistInfo | null>>();
+    private readonly metadataCacheTtlMs = 10 * 60 * 1000;
+    private readonly negativeMetadataCacheTtlMs = 30 * 1000;
+    private readonly metadataCacheMaxEntries = 256;
+    private readonly globalProviderSemaphore = new AsyncSemaphore(4);
+    private readonly scopedProviderSemaphores = new Map<string, AsyncSemaphore>();
+    private readonly dataApiFailureThreshold = 3;
+    private readonly dataApiCooldownMs = 5 * 60 * 1000;
+    private dataApiConsecutiveFailures = 0;
+    private dataApiUnavailableUntil = 0;
+    private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
-    async search(query: string, maxResults = 10): Promise<SearchResult[]> {
-        const ranked = await this.searchWithRanking(query, maxResults);
+    async search(query: string, maxResults = 10, context?: MediaSearchContext): Promise<SearchResult[]> {
+        const ranked = await this.searchWithRanking(query, maxResults, context);
         return ranked.map((result) => {
             const { score: _score, ...searchResult } = result;
             return searchResult;
         });
     }
 
-    async searchWithRanking(query: string, maxResults = 10): Promise<RankedSearchResult[]> {
+    async searchWithRanking(
+        query: string,
+        maxResults = 10,
+        context?: MediaSearchContext
+    ): Promise<RankedSearchResult[]> {
         const normalizedQuery = this.normalizeSearchInput(query);
-        const rawResults = await this.searchIndependent(normalizedQuery, maxResults);
+        const rawResults = await this.searchIndependent(normalizedQuery, maxResults, context);
         return this.rankSearchResults(normalizedQuery, rawResults)
             .sort((a, b) => (b.score - a.score) || ((b.viewCount ?? 0) - (a.viewCount ?? 0)))
             .filter((result) => result.score >= 0)
@@ -114,31 +217,62 @@ export class YouTubeService {
         return top >= 120 && hasTitleMatch && top - secondScore >= 140;
     }
 
-    private async searchIndependent(query: string, maxResults = 10): Promise<SearchResult[]> {
+    private async searchIndependent(
+        query: string,
+        maxResults = 10,
+        context?: MediaSearchContext
+    ): Promise<SearchResult[]> {
         const cacheKey = `${query}:${maxResults}`;
         const cached = this.searchCache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) {
             return cached.results;
         }
 
+        const inFlightKey = `${context?.scopeKey ?? 'shared'}:${context?.signal ? 'abortable' : 'stable'}:${cacheKey}`;
+        const current = this.searchInFlight.get(inFlightKey);
+        if (current) {
+            return current;
+        }
+
+        const pending = this.withProviderPermit(context, () => this.fetchIndependentSearch(query, maxResults, context))
+            .finally(() => {
+                if (this.searchInFlight.get(inFlightKey) === pending) {
+                    this.searchInFlight.delete(inFlightKey);
+                }
+            });
+        this.searchInFlight.set(inFlightKey, pending);
+        return pending;
+    }
+
+    private async fetchIndependentSearch(
+        query: string,
+        maxResults: number,
+        context?: MediaSearchContext
+    ): Promise<SearchResult[]> {
+        this.throwIfAborted(context?.signal);
+        const cacheKey = `${query}:${maxResults}`;
+
         const unique = new Map<string, SearchResult>();
         const webLimit = Math.min(Math.max(maxResults * 2, maxResults), 20);
-        const webResults = await this.searchWithYouTubeWeb(query, webLimit).catch((error) => {
+        const webResults = await this.searchWithYouTubeWeb(query, webLimit, context?.signal).catch((error) => {
             console.warn('YouTube web search failed, falling back to yt-dlp:', this.formatError(error));
             return [] as SearchResult[];
         });
+        this.throwIfAborted(context?.signal);
         this.appendUniqueSearchResults(unique, webResults);
 
         if (unique.size < Math.min(maxResults, 5)) {
-            const ytdlpResults = await this.searchWithYtdlp(query, Math.min(Math.max(maxResults, 10), 15))
+            const ytdlpResults = await this.searchWithYtdlp(query, Math.min(Math.max(maxResults, 10), 15), context)
                 .catch(() => [] as SearchResult[]);
+            this.throwIfAborted(context?.signal);
             this.appendUniqueSearchResults(unique, ytdlpResults);
         }
 
         if (unique.size < Math.min(maxResults, 3)) {
             for (const variant of this.buildInflectedSearchVariants(query)) {
-                const variantResults = await this.searchWithYtdlp(variant, Math.min(Math.max(maxResults, 10), 15))
+                const variantResults = await this.searchWithYtdlp(variant, Math.min(Math.max(maxResults, 10), 15), context)
                     .catch(() => [] as SearchResult[]);
+                this.throwIfAborted(context?.signal);
                 this.appendUniqueSearchResults(unique, variantResults);
                 if (unique.size >= Math.min(maxResults, 3)) {
                     break;
@@ -149,6 +283,36 @@ export class YouTubeService {
         const results = Array.from(unique.values());
         this.setSearchCache(cacheKey, results);
         return results;
+    }
+
+    private async withProviderPermit<T>(context: MediaSearchContext | undefined, operation: () => Promise<T>): Promise<T> {
+        const scopeKey = context?.scopeKey?.trim() || 'unscoped';
+        let scoped = this.scopedProviderSemaphores.get(scopeKey);
+        if (!scoped) {
+            scoped = new AsyncSemaphore(1);
+            this.scopedProviderSemaphores.set(scopeKey, scoped);
+        }
+
+        let releaseScope: (() => void) | undefined;
+        let releaseGlobal: (() => void) | undefined;
+        try {
+            releaseScope = await scoped.acquire(context?.signal);
+            releaseGlobal = await this.globalProviderSemaphore.acquire(context?.signal);
+            this.throwIfAborted(context?.signal);
+            return await operation();
+        } finally {
+            releaseGlobal?.();
+            releaseScope?.();
+            if (scoped.idle && this.scopedProviderSemaphores.get(scopeKey) === scoped) {
+                this.scopedProviderSemaphores.delete(scopeKey);
+            }
+        }
+    }
+
+    private throwIfAborted(signal?: AbortSignal): void {
+        if (signal?.aborted) {
+            throw createAbortError();
+        }
     }
 
     private appendUniqueSearchResults(unique: Map<string, SearchResult>, results: SearchResult[]): void {
@@ -173,7 +337,11 @@ export class YouTubeService {
         });
     }
 
-    private async searchWithYouTubeWeb(query: string, maxResults: number): Promise<SearchResult[]> {
+    private async searchWithYouTubeWeb(
+        query: string,
+        maxResults: number,
+        signal?: AbortSignal
+    ): Promise<SearchResult[]> {
         const params = new URLSearchParams({
             search_query: query,
             hl: 'fr',
@@ -189,6 +357,7 @@ export class YouTubeService {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36',
                 'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
             },
+            signal,
         });
         const html = typeof response.body === 'string' ? response.body : response.body.toString('utf8');
         const initialData = this.extractYtInitialData(html);
@@ -433,20 +602,51 @@ export class YouTubeService {
         return match?.[1] ?? null;
     }
 
-    async getVideoInfo(videoId: string): Promise<YouTubeVideoInfo | null> {
-        if (!this.apiKey) {
-            return this.getVideoInfoWithYtdlp(videoId);
+    async getVideoInfo(videoId: string, context?: MediaSearchContext): Promise<YouTubeVideoInfo | null> {
+        const cached = this.getMetadataCacheValue(this.videoInfoCache, videoId);
+        if (cached.hit) {
+            return cached.value;
+        }
+
+        const inFlightKey = this.getMetadataInFlightKey(videoId, context);
+        const existing = this.videoInfoInFlight.get(inFlightKey);
+        if (existing) {
+            return existing;
+        }
+
+        const pending = this.withProviderPermit(context, () => this.fetchVideoInfo(videoId, context?.signal))
+            .then((value) => {
+                this.setMetadataCacheValue(this.videoInfoCache, videoId, value);
+                return value;
+            })
+            .finally(() => {
+                if (this.videoInfoInFlight.get(inFlightKey) === pending) {
+                    this.videoInfoInFlight.delete(inFlightKey);
+                }
+            });
+        this.videoInfoInFlight.set(inFlightKey, pending);
+        return pending;
+    }
+
+    private async fetchVideoInfo(videoId: string, signal?: AbortSignal): Promise<YouTubeVideoInfo | null> {
+        this.throwIfAborted(signal);
+        if (!this.canUseDataApi()) {
+            return this.getVideoInfoWithYtdlp(videoId, signal);
         }
 
         try {
-            return await this.getVideoInfoWithGoogle(videoId);
+            const info = await this.getVideoInfoWithGoogle(videoId, signal);
+            this.noteDataApiSuccess();
+            return info;
         } catch (error) {
+            this.throwIfAborted(signal);
+            this.noteDataApiFailure(error);
             console.warn('YouTube Data API video lookup failed, falling back to yt-dlp:', this.formatError(error));
-            return this.getVideoInfoWithYtdlp(videoId);
+            return this.getVideoInfoWithYtdlp(videoId, signal);
         }
     }
 
-    private async getVideoInfoWithGoogle(videoId: string): Promise<YouTubeVideoInfo | null> {
+    private async getVideoInfoWithGoogle(videoId: string, signal?: AbortSignal): Promise<YouTubeVideoInfo | null> {
         const params = new URLSearchParams({
             part: 'snippet,contentDetails',
             id: videoId,
@@ -454,7 +654,7 @@ export class YouTubeService {
         });
 
         const url = `${YOUTUBE_API_BASE}/videos?${params.toString()}`;
-        const data = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(url);
+        const data = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(url, signal);
         const item = data.items?.[0];
         if (!item?.id || !item.snippet || !item.contentDetails?.duration) {
             return null;
@@ -470,23 +670,139 @@ export class YouTubeService {
         };
     }
 
-    async getPlaylistTracks(playlistId: string, requestedBy: string, requestedById: string): Promise<PlaylistInfo | null> {
-        if (!this.apiKey) {
-            return this.getPlaylistTracksWithYtdlp(playlistId, requestedBy, requestedById);
+    async getPlaylistTracks(
+        playlistId: string,
+        requestedBy: string,
+        requestedById: string,
+        context?: MediaSearchContext
+    ): Promise<PlaylistInfo | null> {
+        const cached = this.getMetadataCacheValue(this.playlistCache, playlistId);
+        if (cached.hit) {
+            return this.clonePlaylistForRequester(cached.value, requestedBy, requestedById);
+        }
+
+        const inFlightKey = this.getMetadataInFlightKey(playlistId, context);
+        const existing = this.playlistInFlight.get(inFlightKey);
+        if (existing) {
+            return this.clonePlaylistForRequester(await existing, requestedBy, requestedById);
+        }
+
+        const pending = this.withProviderPermit(context, () => this.fetchPlaylistTracks(playlistId, context?.signal))
+            .then((value) => {
+                this.setMetadataCacheValue(this.playlistCache, playlistId, value);
+                return value;
+            })
+            .finally(() => {
+                if (this.playlistInFlight.get(inFlightKey) === pending) {
+                    this.playlistInFlight.delete(inFlightKey);
+                }
+            });
+        this.playlistInFlight.set(inFlightKey, pending);
+        return this.clonePlaylistForRequester(await pending, requestedBy, requestedById);
+    }
+
+    private async fetchPlaylistTracks(playlistId: string, signal?: AbortSignal): Promise<PlaylistInfo | null> {
+        this.throwIfAborted(signal);
+        const cacheRequester = 'cache';
+        const cacheRequesterId = '0';
+        if (!this.canUseDataApi()) {
+            return this.getPlaylistTracksWithYtdlp(playlistId, cacheRequester, cacheRequesterId, signal);
         }
 
         try {
-            return await this.getPlaylistTracksWithGoogle(playlistId, requestedBy, requestedById);
+            const playlist = await this.getPlaylistTracksWithGoogle(playlistId, cacheRequester, cacheRequesterId, signal);
+            this.noteDataApiSuccess();
+            return playlist;
         } catch (error) {
+            this.throwIfAborted(signal);
+            this.noteDataApiFailure(error);
             console.warn('YouTube Data API playlist lookup failed, falling back to yt-dlp:', this.formatError(error));
-            return this.getPlaylistTracksWithYtdlp(playlistId, requestedBy, requestedById);
+            return this.getPlaylistTracksWithYtdlp(playlistId, cacheRequester, cacheRequesterId, signal);
+        }
+    }
+
+    private clonePlaylistForRequester(
+        playlist: PlaylistInfo | null,
+        requestedBy: string,
+        requestedById: string
+    ): PlaylistInfo | null {
+        if (!playlist) return null;
+        return {
+            ...playlist,
+            tracks: playlist.tracks.map((track) => ({ ...track, requestedBy, requestedById })),
+        };
+    }
+
+    private getMetadataInFlightKey(key: string, context?: MediaSearchContext): string {
+        return `${context?.scopeKey?.trim() || 'unscoped'}:${context?.signal ? 'abortable' : 'stable'}:${key}`;
+    }
+
+    private getMetadataCacheValue<T>(
+        cache: Map<string, TimedCacheEntry<T>>,
+        key: string
+    ): { hit: true; value: T } | { hit: false } {
+        const now = Date.now();
+        this.pruneExpiredMetadataCache(cache, now);
+        const cached = cache.get(key);
+        if (!cached) {
+            return { hit: false };
+        }
+
+        // Refresh insertion order so bounded eviction behaves as a small LRU.
+        cache.delete(key);
+        cache.set(key, cached);
+        return { hit: true, value: cached.value };
+    }
+
+    private setMetadataCacheValue<T>(cache: Map<string, TimedCacheEntry<T>>, key: string, value: T): void {
+        const now = Date.now();
+        this.pruneExpiredMetadataCache(cache, now);
+        cache.delete(key);
+        cache.set(key, {
+            expiresAt: now + (value === null ? this.negativeMetadataCacheTtlMs : this.metadataCacheTtlMs),
+            value,
+        });
+
+        while (cache.size > this.metadataCacheMaxEntries) {
+            const oldestKey = cache.keys().next().value;
+            if (oldestKey === undefined) {
+                break;
+            }
+            cache.delete(oldestKey);
+        }
+    }
+
+    private pruneExpiredMetadataCache<T>(cache: Map<string, TimedCacheEntry<T>>, now: number): void {
+        for (const [key, entry] of cache) {
+            if (entry.expiresAt <= now) {
+                cache.delete(key);
+            }
+        }
+    }
+
+    private canUseDataApi(): boolean {
+        return Boolean(this.apiKey) && Date.now() >= this.dataApiUnavailableUntil;
+    }
+
+    private noteDataApiSuccess(): void {
+        this.dataApiConsecutiveFailures = 0;
+        this.dataApiUnavailableUntil = 0;
+    }
+
+    private noteDataApiFailure(error: unknown): void {
+        this.dataApiConsecutiveFailures += 1;
+        const message = this.formatError(error).toLowerCase();
+        const quotaLimited = /(?:quota|rate.?limit|too many requests|\b403\b|\b429\b)/.test(message);
+        if (quotaLimited || this.dataApiConsecutiveFailures >= this.dataApiFailureThreshold) {
+            this.dataApiUnavailableUntil = Date.now() + (quotaLimited ? 15 * 60 * 1000 : this.dataApiCooldownMs);
         }
     }
 
     private async getPlaylistTracksWithGoogle(
         playlistId: string,
         requestedBy: string,
-        requestedById: string
+        requestedById: string,
+        signal?: AbortSignal
     ): Promise<PlaylistInfo | null> {
         const playlistParams = new URLSearchParams({
             part: 'snippet',
@@ -494,7 +810,7 @@ export class YouTubeService {
             key: this.apiKey!,
         });
         const playlistUrl = `${YOUTUBE_API_BASE}/playlists?${playlistParams.toString()}`;
-        const playlistData = await this.fetchJson<YouTubeListResponse<{ snippet?: { title?: string } }>>(playlistUrl);
+        const playlistData = await this.fetchJson<YouTubeListResponse<{ snippet?: { title?: string } }>>(playlistUrl, signal);
         const playlist = playlistData.items?.[0];
         if (!playlist?.snippet?.title) {
             return null;
@@ -507,7 +823,7 @@ export class YouTubeService {
             key: this.apiKey!,
         });
         const itemsUrl = `${YOUTUBE_API_BASE}/playlistItems?${itemsParams.toString()}`;
-        const itemsData = await this.fetchJson<YouTubeListResponse<PlaylistItemApi>>(itemsUrl);
+        const itemsData = await this.fetchJson<YouTubeListResponse<PlaylistItemApi>>(itemsUrl, signal);
         const items = itemsData.items ?? [];
         if (items.length === 0) {
             return null;
@@ -526,7 +842,7 @@ export class YouTubeService {
             key: this.apiKey!,
         });
         const detailsUrl = `${YOUTUBE_API_BASE}/videos?${detailsParams.toString()}`;
-        const detailsData = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(detailsUrl);
+        const detailsData = await this.fetchJson<YouTubeListResponse<VideoApiItem>>(detailsUrl, signal);
         const durationMap = new Map<string, number>();
         for (const item of detailsData.items ?? []) {
             if (item.id && item.contentDetails?.duration) {
@@ -540,7 +856,7 @@ export class YouTubeService {
             )
             .map((item) => {
                 const videoId = item.snippet.resourceId!.videoId!;
-                return {
+                return this.withYouTubeIdentity({
                     id: videoId,
                     title: this.decodeHtmlEntities(item.snippet.title ?? 'Unknown title'),
                     url: `https://www.youtube.com/watch?v=${videoId}`,
@@ -549,7 +865,7 @@ export class YouTubeService {
                     sourceType: 'playlist',
                     requestedBy,
                     requestedById,
-                };
+                });
             });
 
         return {
@@ -560,10 +876,14 @@ export class YouTubeService {
         };
     }
 
-    private async searchWithYtdlp(query: string, maxResults: number): Promise<SearchResult[]> {
+    private async searchWithYtdlp(
+        query: string,
+        maxResults: number,
+        context?: MediaSearchContext
+    ): Promise<SearchResult[]> {
         const unique = new Map<string, SearchResult>();
         for (const prefix of ['ytsearch'] as const) {
-            const results = await this.searchWithYtdlpPrefix(prefix, query, maxResults);
+            const results = await this.searchWithYtdlpPrefix(prefix, query, maxResults, context);
             for (const result of results) {
                 if (!unique.has(result.id)) {
                     unique.set(result.id, result);
@@ -576,7 +896,12 @@ export class YouTubeService {
         return Array.from(unique.values()).slice(0, maxResults);
     }
 
-    private async searchWithYtdlpPrefix(prefix: 'ytmsearch' | 'ytsearch', query: string, maxResults: number): Promise<SearchResult[]> {
+    private async searchWithYtdlpPrefix(
+        prefix: 'ytmsearch' | 'ytsearch',
+        query: string,
+        maxResults: number,
+        context?: MediaSearchContext
+    ): Promise<SearchResult[]> {
         try {
             const payload = await this.runYtdlpJson([
                 '--no-warnings',
@@ -584,7 +909,7 @@ export class YouTubeService {
                 '--flat-playlist',
                 '--dump-single-json',
                 `${prefix}${Math.max(1, maxResults)}:${query}`,
-            ]);
+            ], context?.signal);
 
             const entries = Array.isArray(payload?.entries) ? payload.entries : [];
             return entries
@@ -597,7 +922,7 @@ export class YouTubeService {
         }
     }
 
-    private async getVideoInfoWithYtdlp(videoId: string): Promise<YouTubeVideoInfo | null> {
+    private async getVideoInfoWithYtdlp(videoId: string, signal?: AbortSignal): Promise<YouTubeVideoInfo | null> {
         try {
             const payload = await this.runYtdlpJson([
                 '--no-warnings',
@@ -605,7 +930,7 @@ export class YouTubeService {
                 '--no-playlist',
                 '--dump-single-json',
                 `https://www.youtube.com/watch?v=${videoId}`,
-            ]);
+            ], signal);
 
             const id = this.normalizeVideoId(payload?.id ?? videoId);
             if (!id) {
@@ -619,6 +944,9 @@ export class YouTubeService {
                 thumbnail: this.getYtdlpThumbnail(payload),
             };
         } catch (error) {
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw error;
+            }
             console.warn('yt-dlp video lookup fallback failed:', this.formatError(error));
             return null;
         }
@@ -627,7 +955,8 @@ export class YouTubeService {
     private async getPlaylistTracksWithYtdlp(
         playlistId: string,
         requestedBy: string,
-        requestedById: string
+        requestedById: string,
+        signal?: AbortSignal
     ): Promise<PlaylistInfo | null> {
         try {
             const payload = await this.runYtdlpJson([
@@ -638,7 +967,7 @@ export class YouTubeService {
                 config.audio.maxPlaylistTracks.toString(),
                 '--dump-single-json',
                 `https://www.youtube.com/playlist?list=${playlistId}`,
-            ]);
+            ], signal);
 
             const entries = Array.isArray(payload?.entries) ? payload.entries : [];
             const tracks: Track[] = entries
@@ -657,6 +986,9 @@ export class YouTubeService {
                 tracks,
             };
         } catch (error) {
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw error;
+            }
             console.warn('yt-dlp playlist fallback failed:', this.formatError(error));
             return null;
         }
@@ -686,7 +1018,7 @@ export class YouTubeService {
             return null;
         }
 
-        return {
+        return this.withYouTubeIdentity({
             id,
             title: this.decodeHtmlEntities(String(entry?.title ?? id)),
             url: `https://www.youtube.com/watch?v=${id}`,
@@ -697,11 +1029,11 @@ export class YouTubeService {
             sourceType: 'playlist',
             requestedBy,
             requestedById,
-        };
+        });
     }
 
     async createTrackFromSearch(result: SearchResult, requestedBy: string, requestedById: string): Promise<Track> {
-        return {
+        return this.withYouTubeIdentity({
             id: result.id,
             title: result.title,
             url: `https://www.youtube.com/watch?v=${result.id}`,
@@ -712,21 +1044,26 @@ export class YouTubeService {
             sourceType: 'search',
             requestedBy,
             requestedById,
-        };
+        });
     }
 
-    async createTrackFromUrl(url: string, requestedBy: string, requestedById: string): Promise<Track | null> {
+    async createTrackFromUrl(
+        url: string,
+        requestedBy: string,
+        requestedById: string,
+        context?: MediaSearchContext
+    ): Promise<Track | null> {
         const videoId = this.extractVideoId(url);
         if (!videoId) {
             return null;
         }
 
-        const info = await this.getVideoInfo(videoId);
+        const info = await this.getVideoInfo(videoId, context);
         if (!info) {
             return null;
         }
 
-        return {
+        return this.withYouTubeIdentity({
             id: info.id,
             title: info.title,
             url: `https://www.youtube.com/watch?v=${videoId}`,
@@ -737,6 +1074,18 @@ export class YouTubeService {
             sourceType: 'url',
             requestedBy,
             requestedById,
+        });
+    }
+
+    private withYouTubeIdentity(track: Track): Track {
+        const canonicalUrl = `https://www.youtube.com/watch?v=${track.id}`;
+        return {
+            ...track,
+            provider: 'youtube',
+            sourceId: track.id,
+            canonicalUrl,
+            isLive: track.isLive ?? false,
+            url: canonicalUrl,
         };
     }
 
@@ -967,8 +1316,8 @@ export class YouTubeService {
         return existsSync(localYtdlpPath) ? localYtdlpPath : 'yt-dlp';
     }
 
-    private runYtdlpJson(args: string[]): Promise<any> {
-        return this.runYtdlpText(args).then((payload) => {
+    private runYtdlpJson(args: string[], signal?: AbortSignal): Promise<any> {
+        return this.runYtdlpText(args, signal).then((payload) => {
             const trimmed = payload.trim();
             if (!trimmed) {
                 throw new Error('yt-dlp returned no JSON payload');
@@ -982,34 +1331,157 @@ export class YouTubeService {
         });
     }
 
-    private runYtdlpText(args: string[]): Promise<string> {
+    private runYtdlpText(args: string[], signal?: AbortSignal): Promise<string> {
         return new Promise((resolve, reject) => {
-            const ytdlp = spawn(this.getYtdlpPath(), args, {
+            if (signal?.aborted) {
+                reject(createAbortError());
+                return;
+            }
+
+            const ytdlp = spawn(this.getYtdlpPath(), [...this.getYtdlpRuntimeArgs(), ...args], {
                 stdio: ['ignore', 'pipe', 'pipe'],
                 windowsHide: true,
             });
 
-            let stdout = '';
-            let stderr = '';
+            const timeoutMs = 20_000;
+            const killGraceMs = 2_000;
+            const maxStdoutBytes = 8 * 1024 * 1024;
+            const maxStderrBytes = 512 * 1024;
+            const stdoutChunks: Buffer[] = [];
+            const stderrChunks: Buffer[] = [];
+            let stdoutBytes = 0;
+            let stderrBytes = 0;
+            let settled = false;
+            let terminalError: Error | undefined;
+            let killTimer: NodeJS.Timeout | undefined;
+
+            const cleanup = (): void => {
+                clearTimeout(timeout);
+                if (signal) {
+                    signal.removeEventListener('abort', onAbort);
+                }
+            };
+
+            const terminate = (): void => {
+                if (ytdlp.exitCode !== null || ytdlp.killed) {
+                    return;
+                }
+                ytdlp.kill('SIGTERM');
+                killTimer = setTimeout(() => {
+                    if (ytdlp.exitCode === null) {
+                        ytdlp.kill('SIGKILL');
+                    }
+                }, killGraceMs);
+                killTimer.unref?.();
+            };
+
+            const finish = (error?: Error): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve(Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'));
+            };
+
+            const failAndTerminate = (error: Error): void => {
+                if (settled || terminalError) {
+                    return;
+                }
+                terminalError = error;
+                terminate();
+                ytdlp.stdout?.resume();
+                ytdlp.stderr?.resume();
+            };
+
+            const onAbort = (): void => {
+                failAndTerminate(createAbortError());
+            };
+
+            const timeout = setTimeout(() => {
+                failAndTerminate(new Error(`yt-dlp timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            timeout.unref?.();
 
             ytdlp.stdout?.on('data', (data) => {
-                stdout += data.toString();
+                if (settled || terminalError) {
+                    return;
+                }
+                const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                stdoutBytes += chunk.length;
+                if (stdoutBytes > maxStdoutBytes) {
+                    failAndTerminate(new Error(`yt-dlp stdout exceeded ${maxStdoutBytes} bytes`));
+                    return;
+                }
+                stdoutChunks.push(chunk);
             });
 
             ytdlp.stderr?.on('data', (data) => {
-                stderr += data.toString();
+                if (settled || terminalError) {
+                    return;
+                }
+                const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                stderrBytes += chunk.length;
+                if (stderrBytes > maxStderrBytes) {
+                    failAndTerminate(new Error(`yt-dlp stderr exceeded ${maxStderrBytes} bytes`));
+                    return;
+                }
+                stderrChunks.push(chunk);
             });
 
-            ytdlp.on('error', reject);
+            signal?.addEventListener('abort', onAbort, { once: true });
+
+            ytdlp.once('error', (error) => {
+                if (ytdlp.pid === undefined) finish(error);
+                else failAndTerminate(error);
+            });
             ytdlp.on('close', (code) => {
+                if (killTimer) {
+                    clearTimeout(killTimer);
+                }
+                if (settled) {
+                    return;
+                }
+                if (terminalError) {
+                    finish(terminalError);
+                    return;
+                }
                 if (code !== 0) {
-                    reject(new Error(`yt-dlp exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
+                    const stderr = Buffer.concat(stderrChunks, stderrBytes).toString('utf8');
+                    finish(new Error(`yt-dlp exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
                     return;
                 }
 
-                resolve(stdout);
+                finish();
             });
         });
+    }
+
+    private getYtdlpRuntimeArgs(): string[] {
+        const args: string[] = [];
+        if (process.env.YTDLP_COOKIES_FROM_BROWSER) {
+            args.push('--cookies-from-browser', process.env.YTDLP_COOKIES_FROM_BROWSER);
+        } else if (process.env.YTDLP_COOKIES) {
+            args.push('--cookies', process.env.YTDLP_COOKIES);
+        }
+
+        const raw = process.env.YTDLP_EXTRA_ARGS?.trim();
+        if (!raw) return args;
+        if (!config.audio.allowUnsafeYtdlpExtraArgs) {
+            if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
+                this.warnedUnsafeYtdlpExtraArgsIgnored = true;
+                console.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only in a trusted environment.');
+            }
+            return args;
+        }
+
+        const matches = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+        args.push(...matches.map((arg) => arg.replace(/^['"]|['"]$/g, '')));
+        return args;
     }
 
     private normalizeVideoId(value: unknown): string | null {
@@ -1131,7 +1603,7 @@ export class YouTubeService {
             .trim();
     }
 
-    private async fetchJson<T>(url: string): Promise<T> {
+    private async fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
         const response = await httpRequest({
             url,
             method: 'GET',
@@ -1144,7 +1616,13 @@ export class YouTubeService {
             timeoutMs: this.requestTimeoutMs,
             maxBytes: this.maxBytes,
             responseType: 'text',
+            signal,
         });
+
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+            const body = String(response.body).replace(/\s+/g, ' ').trim().slice(0, 300);
+            throw new Error(`YouTube Data API request failed with status ${response.statusCode}: ${body}`);
+        }
 
         return JSON.parse(response.body as string) as T;
     }

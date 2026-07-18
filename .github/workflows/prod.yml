@@ -11,55 +11,33 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: lolbot-prod-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Typecheck, test, and build
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'main'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: |
-          if compgen -G "test/*.test.ts" > /dev/null; then
-            npm test
-          else
-            echo "No test/*.test.ts files found. Skipping tests."
-          fi
-
-      - name: Build
-        run: npm run build
+  quality:
+    name: Shared quality gate
+    uses: ./.github/workflows/quality.yml
+    permissions:
+      contents: read
+      security-events: write
 
   docker:
     name: Build and push GHCR image
     runs-on: ubuntu-latest
-    needs: test
+    needs: quality
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
     outputs:
       image: ${{ steps.image.outputs.image }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Resolve image name
         id: image
@@ -68,20 +46,22 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          push: true
+          load: true
+          push: false
+          provenance: false
           build-args: |
             BOT_BUILD_SHA=${{ github.sha }}
           tags: |
@@ -89,27 +69,50 @@ jobs:
             ${{ steps.image.outputs.image }}:latest
             ${{ steps.image.outputs.image }}:${{ github.sha }}
 
+      - name: Run image doctor
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image }}:${{ github.sha }}
+        run: docker run --rm --entrypoint node "$IMAGE_REF" dist/doctor.js
+
+      - name: Scan image for high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ steps.image.outputs.image }}:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          timeout: 10m
+
+      - name: Push validated image
+        run: |
+          docker push "${{ steps.image.outputs.image }}:prod"
+          docker push "${{ steps.image.outputs.image }}:latest"
+          docker push "${{ steps.image.outputs.image }}:${{ github.sha }}"
+
   restart:
     name: Restart Pterodactyl prod
     runs-on: ubuntu-latest
     needs: docker
 
     steps:
+      - name: Setup Node for readiness probe
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
       - name: Restart server through Pterodactyl API
         env:
           PTERO_URL: ${{ secrets.PTERO_URL }}
           PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
           PTERO_TARGET_SERVER_ID: ${{ secrets.PTERO_PROD_SERVER_ID }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          if [ -z "$PTERO_TARGET_SERVER_ID" ]; then
-            echo "PTERO_PROD_SERVER_ID is not set. Skipping Pterodactyl restart."
-            exit 0
-          fi
-
           test -n "$PTERO_URL"
           test -n "$PTERO_CLIENT_API_KEY"
+          test -n "$PTERO_TARGET_SERVER_ID"
 
           api_base="${PTERO_URL%/}/api/client"
           server_identifier="$PTERO_TARGET_SERVER_ID"
@@ -155,22 +158,178 @@ jobs:
             cat "$clear_body"
           fi
 
-          response_body="$(mktemp)"
-          status_code="$(curl --silent --show-error \
-            --request POST \
-            "${api_base}/servers/${server_identifier}/power" \
-            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
-            --header "Accept: Application/vnd.pterodactyl.v1+json" \
-            --header "Content-Type: application/json" \
-            --data '{"signal":"restart"}' \
-            --output "$response_body" \
-            --write-out "%{http_code}")"
+          export PTERO_RESOLVED_SERVER_IDENTIFIER="$server_identifier"
+          node --input-type=module <<'NODE'
+          const panelUrl = process.env.PTERO_URL;
+          const apiKey = process.env.PTERO_CLIENT_API_KEY;
+          const serverIdentifier = process.env.PTERO_RESOLVED_SERVER_IDENTIFIER;
+          const expectedBuildSha = process.env.EXPECTED_BUILD_SHA;
 
-          if [ "$status_code" = "204" ]; then
-            echo "Pterodactyl restart signal sent."
-            exit 0
-          fi
+          if (!panelUrl || !apiKey || !serverIdentifier) {
+            throw new Error('Pterodactyl production deployment variables unavailable');
+          }
+          if (!expectedBuildSha || !/^[0-9a-f]{40}$/i.test(expectedBuildSha)) {
+            throw new Error('Expected GitHub build SHA unavailable');
+          }
 
-          echo "Pterodactyl restart failed with HTTP ${status_code}."
-          cat "$response_body"
-          exit 1
+          const apiBase = `${panelUrl.replace(/\/+$/, '')}/api/client/servers/${encodeURIComponent(serverIdentifier)}`;
+          const apiHeaders = {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'Application/vnd.pterodactyl.v1+json',
+          };
+
+          async function request(path, init = {}) {
+            const response = await fetch(`${apiBase}${path}`, {
+              ...init,
+              signal: init.signal ?? AbortSignal.timeout(15_000),
+              headers: {
+                ...apiHeaders,
+                ...(init.headers ?? {}),
+              },
+            });
+            if (!response.ok) {
+              const detail = (await response.text()).slice(0, 1_000);
+              throw new Error(`Pterodactyl ${path} failed with HTTP ${response.status}: ${detail}`);
+            }
+            return response.status === 204 ? null : response.json();
+          }
+
+          function readRuntimeState(payload) {
+            const state = String(payload?.attributes?.current_state ?? 'unknown');
+            const uptime = Number(payload?.attributes?.resources?.uptime);
+            if (!Number.isFinite(uptime) || uptime < 0) {
+              throw new Error('Pterodactyl resource uptime is unavailable');
+            }
+            return { state, uptime };
+          }
+
+          const initialRuntime = readRuntimeState(await request('/resources'));
+          const websocketPayload = await request('/websocket');
+          const websocketUrl = websocketPayload?.data?.socket;
+          const websocketToken = websocketPayload?.data?.token;
+          if (!websocketUrl || !websocketToken) {
+            throw new Error('Pterodactyl websocket credentials unavailable');
+          }
+
+          await new Promise((resolve, reject) => {
+            const socket = new WebSocket(websocketUrl);
+            const buildMarker = `(build ${expectedBuildSha})`;
+            let settled = false;
+            let restartRequested = false;
+            let restartAccepted = false;
+            let restartBoundaryObserved = false;
+            let currentState = initialRuntime.state;
+            let currentUptime = initialRuntime.uptime;
+            let freshLogs = '';
+            let polling = false;
+
+            const cleanup = () => {
+              clearTimeout(timeout);
+              clearInterval(pollTimer);
+            };
+            const fail = (error) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              socket.close();
+              reject(error instanceof Error ? error : new Error(String(error)));
+            };
+            const succeed = () => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              socket.close();
+              resolve();
+            };
+            const maybeComplete = () => {
+              if (!restartAccepted || !restartBoundaryObserved || currentState !== 'running') return;
+              const buildIndex = freshLogs.indexOf(buildMarker);
+              const readyIndex = freshLogs.indexOf('Bot connecté en tant que', Math.max(0, buildIndex));
+              if (buildIndex >= 0 && readyIndex > buildIndex) {
+                succeed();
+              }
+            };
+            const observeRuntime = (state, uptime = currentUptime) => {
+              currentState = state;
+              currentUptime = uptime;
+              if (restartRequested && (
+                state !== 'running'
+                || uptime < initialRuntime.uptime
+                || (initialRuntime.state !== 'running' && state === 'running')
+              )) {
+                restartBoundaryObserved = true;
+              }
+              maybeComplete();
+            };
+            const appendFreshLog = (output) => {
+              if (!restartBoundaryObserved) return;
+              freshLogs = `${freshLogs}${output}\n`.slice(-1_000_000);
+              maybeComplete();
+            };
+
+            const timeout = setTimeout(() => {
+              fail(new Error(
+                `Fresh build ${expectedBuildSha}, restart boundary, running state and Discord Ready `
+                + 'were not all observed within 180 seconds'
+              ));
+            }, 180_000);
+            const pollTimer = setInterval(async () => {
+              if (!restartRequested || polling || settled) return;
+              polling = true;
+              try {
+                const runtime = readRuntimeState(await request('/resources'));
+                observeRuntime(runtime.state, runtime.uptime);
+              } catch (error) {
+                fail(error);
+              } finally {
+                polling = false;
+              }
+            }, 500);
+
+            socket.addEventListener('open', () => {
+              socket.send(JSON.stringify({ event: 'auth', args: [websocketToken] }));
+            });
+            socket.addEventListener('message', (message) => {
+              let payload;
+              try { payload = JSON.parse(String(message.data)); } catch { return; }
+
+              if (payload.event === 'auth success' && !restartRequested) {
+                restartRequested = true;
+                void request('/power', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ signal: 'restart' }),
+                }).then(() => {
+                  restartAccepted = true;
+                  console.log('Pterodactyl production restart signal accepted.');
+                  maybeComplete();
+                }).catch(fail);
+                return;
+              }
+
+              if (!restartRequested) return;
+              if (payload.event === 'status') {
+                observeRuntime(String(payload.args?.[0] ?? 'unknown'));
+                return;
+              }
+              if (payload.event === 'console output') {
+                const output = Array.isArray(payload.args)
+                  ? payload.args.join('\n')
+                  : String(payload.args ?? '');
+                appendFreshLog(output);
+              }
+            });
+            socket.addEventListener('error', () => {
+              fail(new Error('Pterodactyl websocket readiness probe failed'));
+            });
+            socket.addEventListener('close', () => {
+              if (!settled) {
+                fail(new Error('Pterodactyl websocket closed before production readiness was proven'));
+              }
+            });
+          });
+
+          console.log(
+            `Pterodactyl production restart, fresh build ${expectedBuildSha} and Discord Ready confirmed.`
+          );
+          NODE

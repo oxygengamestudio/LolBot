@@ -18,6 +18,7 @@ export interface HttpRequestOptions {
     maxBytes?: number;
     responseType?: 'text' | 'buffer';
     decompress?: boolean;
+    signal?: AbortSignal;
 }
 
 export interface HttpResponse<TBody extends string | Buffer> {
@@ -59,6 +60,7 @@ export async function httpRequest(
         maxBytes = DEFAULT_MAX_BYTES,
         responseType = 'text',
         decompress = true,
+        signal,
     } = options;
 
     return requestInternal(
@@ -73,14 +75,15 @@ export async function httpRequest(
             maxBytes,
             responseType,
             decompress,
+            signal,
         },
         0
     );
 }
 
 async function requestInternal(
-    options: Required<Omit<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress'>> &
-        Pick<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress'>,
+    options: Required<Omit<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>> &
+        Pick<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>,
     redirectCount: number
 ): Promise<HttpResponse<string | Buffer>> {
     const {
@@ -94,6 +97,7 @@ async function requestInternal(
         maxBytes = DEFAULT_MAX_BYTES,
         responseType = 'text',
         decompress = true,
+        signal,
     } = options;
 
     if (redirectCount > maxRedirects) {
@@ -112,6 +116,26 @@ async function requestInternal(
     };
 
     return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            const error = new Error('HTTP request aborted');
+            error.name = 'AbortError';
+            reject(error);
+            return;
+        }
+
+        let settled = false;
+        const finishResolve = (value: HttpResponse<string | Buffer>) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener('abort', onAbort);
+            resolve(value);
+        };
+        const finishReject = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener('abort', onAbort);
+            reject(error);
+        };
         const req = transport.request(requestOptions, (res) => {
             const statusCode = res.statusCode ?? 0;
 
@@ -142,17 +166,18 @@ async function requestInternal(
                         maxBytes,
                         responseType,
                         decompress,
+                        signal,
                     },
                     redirectCount + 1
                 )
-                    .then(resolve)
-                    .catch(reject);
+                    .then(finishResolve)
+                    .catch(finishReject);
                 return;
             }
 
             if (statusCode < 200 || statusCode >= 300) {
                 res.resume();
-                reject(new Error(`HTTP ${statusCode} from ${sanitizeUrlForLogs(url)}`));
+                finishReject(new Error(`HTTP ${statusCode} from ${sanitizeUrlForLogs(url)}`));
                 return;
             }
 
@@ -173,7 +198,7 @@ async function requestInternal(
             source.on('end', () => {
                 const buffer = Buffer.concat(chunks);
                 const responseBody = responseType === 'buffer' ? buffer : buffer.toString('utf8');
-                resolve({
+                finishResolve({
                     statusCode,
                     headers: res.headers,
                     body: responseBody as string | Buffer,
@@ -181,13 +206,20 @@ async function requestInternal(
                 });
             });
 
-            source.on('error', reject);
+            source.on('error', finishReject);
         });
+
+        const onAbort = () => {
+            const error = new Error('HTTP request aborted');
+            error.name = 'AbortError';
+            req.destroy(error);
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
 
         req.setTimeout(timeoutMs, () => {
             req.destroy(new Error(`Request timeout after ${timeoutMs}ms for ${sanitizeUrlForLogs(url)}`));
         });
-        req.on('error', reject);
+        req.on('error', finishReject);
 
         if (body) {
             req.write(body);

@@ -66,6 +66,7 @@ type PendingPlaylistChoice = {
 };
 
 const autocompleteState = new Map<string, AutocompleteState>();
+const autocompleteAbortControllers = new Map<string, { query: string; controller: AbortController }>();
 const pendingSelections = new Map<string, PendingPlaySelection>();
 const pendingPlaylistChoices = new Map<string, PendingPlaylistChoice>();
 
@@ -216,6 +217,15 @@ export async function handleSelection(interaction: StringSelectMenuInteraction):
         return;
     }
 
+    if (!interaction.inCachedGuild() || !(await canUseBot(interaction.member))) {
+        await interaction.reply({
+            content: `❌ ${t(interaction.locale, 'error.noPermission')}`,
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
     const index = Number.parseInt(interaction.values?.[0] ?? '', 10);
     if (!Number.isInteger(index) || index < 0 || index >= payload.results.length) {
         await interaction.update({
@@ -283,6 +293,15 @@ export async function handlePlaylistChoice(interaction: ButtonInteraction): Prom
         return;
     }
 
+    if (!interaction.inCachedGuild() || !(await canUseBot(interaction.member))) {
+        await interaction.reply({
+            content: `❌ ${t(interaction.locale, 'error.noPermission')}`,
+            flags: MessageFlags.Ephemeral,
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
     const guild = interaction.guild;
     const member = interaction.member as GuildMember;
     const textChannel = guild?.channels.cache.get(payload.textChannelId) as TextChannel | undefined;
@@ -291,6 +310,19 @@ export async function handlePlaylistChoice(interaction: ButtonInteraction): Prom
         pendingPlaylistChoices.delete(parsed.id);
         await interaction.update({
             content: 'Salon introuvable. Relance `/play`.',
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        return;
+    }
+
+    // The member may have left voice while the playlist confirmation was pending.
+    // Keep using the channel selected when /play ran (including a preferred channel),
+    // but never resolve media or enqueue tracks for a member who is no longer in voice.
+    if (!member.voice.channel) {
+        pendingPlaylistChoices.delete(parsed.id);
+        await interaction.update({
+            content: `❌ ${t(interaction.locale, 'error.mustBeInVoice')}`,
             components: [],
             allowedMentions: { parse: [] },
         });
@@ -456,7 +488,8 @@ async function addPlaylistToQueue(
     const playlist = await youtubeService.getPlaylistTracks(
         playlistId,
         member.displayName,
-        member.id
+        member.id,
+        { scopeKey: interaction.guildId! }
     );
 
     if (!playlist || playlist.tracks.length === 0) {
@@ -479,7 +512,6 @@ async function addPlaylistToQueue(
         return;
     }
 
-    const wasEmpty = queue.tracks.length === 0 && !queue.currentTrack;
     const addedCount = queueManager.addTracks(interaction.guildId!, tracks);
 
     if (addedCount <= 0) {
@@ -492,11 +524,22 @@ async function addPlaylistToQueue(
         return;
     }
 
-    if (wasEmpty && addedCount > 0) {
+    const shouldStart = !queue.currentTrack && !queue.isPlaying;
+    if (shouldStart && addedCount > 0) {
         log.debug('Queue etait vide, demarrage de la lecture');
         const playNextStart = Date.now();
-        await queueManager.playNext(interaction.guildId!);
+        const startResult = await queueManager.playNext(interaction.guildId!);
         log.debug(`request_to_playNext_ms=${Date.now() - playNextStart} (playlist)`);
+        if (startResult.status !== 'started') {
+            log.warn(`Impossible de demarrer la playlist: ${startResult.status === 'failed' ? startResult.code : startResult.status}`);
+            await interaction.editReply({
+                content: t(locale, 'play.videoLoadFailed'),
+                components: [],
+                allowedMentions: { parse: [] },
+            });
+            deleteEphemeralAfterDelay(interaction);
+            return;
+        }
     }
 
     await interaction.editReply({
@@ -522,7 +565,8 @@ async function addVideoUrlToQueue(
     const track = await youtubeService.createTrackFromUrl(
         url,
         member.displayName,
-        member.id
+        member.id,
+        { scopeKey: interaction.guildId! }
     );
 
     if (!track) {
@@ -592,7 +636,9 @@ async function handleSearchAuto(
     });
 
     log.debug(`Recherche YouTube (auto): ${query}`);
-    const rankedResults = await youtubeService.searchWithRanking(query, config.audio.searchResults);
+    const rankedResults = await youtubeService.searchWithRanking(query, config.audio.searchResults, {
+        scopeKey: interaction.guildId ?? undefined,
+    });
     const results = rankedResults.map((result) => {
         const { score: _score, ...searchResult } = result;
         return searchResult;
@@ -633,7 +679,6 @@ async function addTrackToQueue(
         return;
     }
 
-    const wasEmpty = queue.tracks.length === 0 && !queue.currentTrack;
     const added = queueManager.addTrack(interaction.guildId!, track);
     if (added <= 0) {
         await interaction.editReply({
@@ -645,11 +690,22 @@ async function addTrackToQueue(
         return;
     }
 
-    if (wasEmpty) {
+    const shouldStart = !queue.currentTrack && !queue.isPlaying;
+    if (shouldStart) {
         log.debug('Queue etait vide, demarrage de la lecture');
         const playNextStart = Date.now();
-        await queueManager.playNext(interaction.guildId!);
+        const startResult = await queueManager.playNext(interaction.guildId!);
         log.debug(`request_to_playNext_ms=${Date.now() - playNextStart}`);
+        if (startResult.status !== 'started') {
+            log.warn(`Impossible de demarrer la piste: ${startResult.status === 'failed' ? startResult.code : startResult.status}`);
+            await interaction.editReply({
+                content: t(locale, 'play.videoLoadFailed'),
+                components: [],
+                allowedMentions: { parse: [] },
+            });
+            deleteEphemeralAfterDelay(interaction);
+            return;
+        }
     }
 
     await interaction.editReply({
@@ -680,11 +736,18 @@ async function deleteEphemeralAfterDelay(interaction: PlayInteraction): Promise<
 }
 
 export async function autocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    if (!interaction.inCachedGuild() || !(await canUseBot(interaction.member))) {
+        await safeAutocompleteRespond(interaction, [], true);
+        return;
+    }
+
     const focusedValue = interaction.options.getFocused() as string;
     const query = focusedValue.trim();
     const locale = await resolveLocale(interaction.guildId, interaction.locale);
+    const key = getAutocompleteKey(interaction);
 
     if (!query) {
+        cancelAutocomplete(key);
         await safeAutocompleteRespond(interaction, [
             {
                 name: `✍️ ${t(locale, 'play.autocomplete.startTyping')}`,
@@ -695,6 +758,7 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
     }
 
     if (query.length < 2 && !youtubeService.isYouTubeUrl(query)) {
+        cancelAutocomplete(key);
         await safeAutocompleteRespond(interaction, [
             {
                 name: `⌨️ ${t(locale, 'play.autocomplete.refine')}`,
@@ -705,10 +769,10 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
     }
 
     if (youtubeService.isYouTubeUrl(query)) {
+        cancelAutocomplete(key);
         return;
     }
 
-    const key = getAutocompleteKey(interaction);
     const state = autocompleteState.get(key);
     const now = Date.now();
 
@@ -727,8 +791,20 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
         return;
     }
 
+    const activeSearch = autocompleteAbortControllers.get(key);
+    if (activeSearch && activeSearch.query !== query) {
+        cancelAutocomplete(key);
+    }
+    const abortController = activeSearch?.query === query
+        ? activeSearch.controller
+        : new AbortController();
+    autocompleteAbortControllers.set(key, { query, controller: abortController });
+
     try {
-        const results = await youtubeService.search(query, config.audio.searchResults);
+        const results = await youtubeService.search(query, config.audio.searchResults, {
+            scopeKey: interaction.guildId,
+            signal: abortController.signal,
+        });
 
         const options = results.map(r => ({
             name: truncateString(`${r.title} ${r.duration}`, 100),
@@ -750,6 +826,9 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
 
         await safeAutocompleteRespond(interaction, safeOptions);
     } catch (error) {
+        if (abortController.signal.aborted) {
+            return;
+        }
         if (isKnownInteractionResponseError(error)) {
             log.warn('Autocomplete déjà traitée ou expirée, abandon.');
             return;
@@ -761,7 +840,20 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
                 value: AUTOCOMPLETE_HINT_REFINE,
             },
         ]);
+    } finally {
+        if (autocompleteAbortControllers.get(key)?.controller === abortController) {
+            autocompleteAbortControllers.delete(key);
+        }
     }
+}
+
+function cancelAutocomplete(key: string): void {
+    const controller = autocompleteAbortControllers.get(key);
+    if (!controller) {
+        return;
+    }
+    controller.controller.abort();
+    autocompleteAbortControllers.delete(key);
 }
 
 function withHintOption(

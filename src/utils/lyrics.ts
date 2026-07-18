@@ -1,6 +1,7 @@
 ﻿import type {
     ButtonInteraction,
     ChatInputCommandInteraction,
+    GuildMember,
     ModalSubmitInteraction,
     Message,
     TextBasedChannel,
@@ -15,6 +16,7 @@ import { resolveLocale, t } from './i18n.js';
 import { logger } from './Logger.js';
 import { safeContent } from './text.js';
 import type { Track } from '../types/index.js';
+import { ensureCanUseBot } from './commandHelpers.js';
 
 const log = logger.createModuleLogger('Lyrics');
 
@@ -218,6 +220,15 @@ function createDeleteButton(): ActionRowBuilder<ButtonBuilder> {
 }
 
 export async function handleLyricsDelete(interaction: ButtonInteraction): Promise<void> {
+    if (!interaction.inCachedGuild()) {
+        return;
+    }
+
+    const member = interaction.member as GuildMember;
+    if (!(await ensureCanUseBot(interaction, member))) {
+        return;
+    }
+
     const guildId = interaction.guildId;
     const queue = guildId ? queueManager.getQueue(guildId) : undefined;
 

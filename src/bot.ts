@@ -42,6 +42,7 @@ import { logger } from './utils/Logger.js';
 import { acquireProcessLock } from './utils/processLock.js';
 import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
 import { resolveLocale, t } from './utils/i18n.js';
+import { safeContent } from './utils/text.js';
 import fs from 'fs';
 import { join } from 'path';
 import { handlePlaylistChoice, handleSelection as handlePlaySelection } from './commands/play.js';
@@ -449,6 +450,18 @@ queueManager.on('trackStart', (queue) => {
     }
 });
 
+queueManager.on('trackFailed', (queue, track, code) => {
+    void (async () => {
+        const locale = await resolveLocale(queue.guildId);
+        await queue.textChannel.send({
+            content: `❌ ${t(locale, 'play.videoLoadFailed')} — **${safeContent(track.title)}** (${code})`,
+            allowedMentions: { parse: [] },
+        });
+    })().catch((error) => {
+        log.warn('Impossible d\'annoncer l\'échec définitif de la piste', error);
+    });
+});
+
 queueManager.on('queueEmpty', () => {
     log.debug('Queue vide, retour au status idle');
     updateIdleStatus();
@@ -617,13 +630,6 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
         case SETTINGS_BUTTON_IDS.pauseOnEmpty: {
             const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
                 pauseOnEmptyChannelWhenAlwaysConnected: !settings.pauseOnEmptyChannelWhenAlwaysConnected,
-            });
-            await interaction.update(buildSettingsMessage(updated));
-            return;
-        }
-        case SETTINGS_BUTTON_IDS.crossfade: {
-            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
-                crossfadeEnabled: !settings.crossfadeEnabled,
             });
             await interaction.update(buildSettingsMessage(updated));
             return;
@@ -1081,21 +1087,28 @@ async function registerCommands(): Promise<void> {
 // Gestion des erreurs non capturées
 process.on('unhandledRejection', (error) => {
     log.error('Unhandled promise rejection:', error);
+    void gracefulShutdown('unhandledRejection', 1);
 });
 
 process.on('uncaughtException', (error) => {
     log.error('Uncaught exception:', error);
+    void gracefulShutdown('uncaughtException', 1);
 });
 
 // Gestion de l'arrêt propre
-async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
+async function gracefulShutdown(reason: NodeJS.Signals | 'unhandledRejection' | 'uncaughtException' | 'loginFailed', exitCode = 0): Promise<void> {
     if (isShuttingDown) {
-        log.warn(`Signal ${signal} reçu pendant l'arrêt, arrêt déjà en cours.`);
+        log.warn(`${reason} reçu pendant l'arrêt, arrêt déjà en cours.`);
         return;
     }
 
     isShuttingDown = true;
-    log.info(`Signal ${signal} reçu, arrêt du bot...`);
+    log.info(`${reason} reçu, arrêt du bot...`);
+    const forceExit = setTimeout(() => {
+        log.error('Délai maximal d’arrêt dépassé, fermeture forcée.');
+        process.exit(exitCode || 1);
+    }, 10_000);
+    forceExit.unref();
 
     if (idleStatusInterval) {
         clearInterval(idleStatusInterval);
@@ -1113,6 +1126,11 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
         queueManager.deleteQueue(guildId, true);
     }
 
+    await guildSettingsManager.flushAll().catch((error) => {
+        log.error('Impossible de vider les réglages avant arrêt:', error);
+        exitCode = exitCode || 1;
+    });
+
     try {
         processLock?.release();
         processLock = null;
@@ -1121,7 +1139,8 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
         log.error('Erreur lors de la fermeture du client Discord:', error);
     }
 
-    process.exit(0);
+    clearTimeout(forceExit);
+    process.exit(exitCode);
 }
 
 process.on('SIGINT', () => {
@@ -1136,4 +1155,7 @@ log.info('Dependances requises: FFmpeg (https://ffmpeg.org/) et yt-dlp (https://
 
 // Connexion du bot
 log.info('Démarrage du bot...');
-client.login(config.discord.token);
+void client.login(config.discord.token).catch((error) => {
+    log.error('Connexion Discord impossible:', error);
+    void gracefulShutdown('loginFailed', 1);
+});

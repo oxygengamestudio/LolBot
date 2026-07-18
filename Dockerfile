@@ -2,6 +2,10 @@ FROM node:24-bookworm-slim AS build
 
 WORKDIR /opt/lolbot
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci
 
@@ -20,8 +24,7 @@ ARG YTDLP_VERSION=2026.03.03
 ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
     DATA_DIR=/home/container/data \
-    BOT_BUILD_SHA=${BOT_BUILD_SHA} \
-    YTDLP_AUTO_DOWNLOAD=false
+    BOT_BUILD_SHA=${BOT_BUILD_SHA}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 python3-venv tini \

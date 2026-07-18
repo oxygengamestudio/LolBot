@@ -22,6 +22,15 @@ const log = logger.createModuleLogger('NowPlaying');
 
 class NowPlayingManager {
     private updateIntervals: Map<string, NodeJS.Timeout> = new Map();
+    private pendingUpdates: Map<string, GuildQueue> = new Map();
+    private retryTimers: Map<string, NodeJS.Timeout> = new Map();
+    private retryAttempts: Map<string, number> = new Map();
+    private updatesInFlight = 0;
+    private readonly maxConcurrentUpdates = 2;
+    private readonly maxRetryAttempts = 5;
+    private readonly retryBaseDelayMs = 1_000;
+    private readonly retryMaxDelayMs = 30_000;
+    private readonly retryJitterMs = 250;
     private readonly COLORS = {
         playing: 0x1DB954,
         paused: 0xFFA500,
@@ -33,7 +42,7 @@ class NowPlayingManager {
 
         queueManager.on('trackStart', (queue: GuildQueue) => this.onTrackStart(queue));
         queueManager.on('trackEnd', (queue: GuildQueue) => this.onTrackEnd(queue));
-        queueManager.on('trackPaused', (queue: GuildQueue) => this.updateNowPlaying(queue));
+        queueManager.on('trackPaused', (queue: GuildQueue) => this.scheduleUpdate(queue));
         queueManager.on('queueStopped', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueEmpty', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueDeleted', (guildId: string) => this.stopUpdateInterval(guildId));
@@ -79,10 +88,18 @@ class NowPlayingManager {
             }
         } catch (error) {
             log.error('Erreur lors de la mise a jour:', error);
-            if (queue.nowPlayingMessage) {
+            if (this.getDiscordErrorCode(error) === '10008' && queue.nowPlayingMessage) {
                 await queue.nowPlayingMessage.delete().catch(() => undefined);
                 queue.nowPlayingMessage = null;
                 await this.createOrUpdateNowPlaying(queue);
+                return;
+            }
+            if (this.isPermanentDiscordError(error)) {
+                this.abandonNowPlayingUpdates(queue, error);
+                return;
+            }
+            if (queue.nowPlayingMessage) {
+                this.scheduleRetry(queue, error);
             }
         }
     }
@@ -100,9 +117,13 @@ class NowPlayingManager {
                 flags: MessageFlags.IsComponentsV2,
                 allowedMentions: { parse: [] },
             });
-        } catch {
-            log.trace('Message supprime, reset');
-            queue.nowPlayingMessage = null;
+            this.clearRetryState(queue.guildId);
+        } catch (error) {
+            if (this.isPermanentDiscordError(error)) {
+                this.abandonNowPlayingUpdates(queue, error);
+                return;
+            }
+            this.scheduleRetry(queue, error);
         }
     }
 
@@ -280,7 +301,7 @@ class NowPlayingManager {
         const interval = setInterval(() => {
             const currentQueue = queueManager.getQueue(queue.guildId);
             if (currentQueue && currentQueue.isPlaying && !currentQueue.isPaused) {
-                void this.updateNowPlaying(currentQueue);
+                this.scheduleUpdate(currentQueue);
             }
         }, config.audio.updateInterval);
 
@@ -294,6 +315,114 @@ class NowPlayingManager {
             clearInterval(interval);
             this.updateIntervals.delete(guildId);
         }
+        this.pendingUpdates.delete(guildId);
+        this.clearRetryState(guildId);
+    }
+
+    private scheduleUpdate(queue: GuildQueue, allowRetryDispatch = false): void {
+        if (queueManager.getQueue(queue.guildId) !== queue) {
+            return;
+        }
+        if (this.retryTimers.has(queue.guildId) && !allowRetryDispatch) {
+            log.trace(`Mise à jour périodique ignorée pendant le backoff: ${queue.guildId}`);
+            return;
+        }
+        this.pendingUpdates.set(queue.guildId, queue);
+        this.pumpUpdates();
+    }
+
+    private pumpUpdates(): void {
+        while (this.updatesInFlight < this.maxConcurrentUpdates && this.pendingUpdates.size > 0) {
+            const next = this.pendingUpdates.entries().next().value as [string, GuildQueue] | undefined;
+            if (!next) return;
+            const [guildId, queue] = next;
+            this.pendingUpdates.delete(guildId);
+            if (this.retryTimers.has(guildId) || queueManager.getQueue(guildId) !== queue) {
+                continue;
+            }
+            this.updatesInFlight += 1;
+            void this.updateNowPlaying(queue).finally(() => {
+                this.updatesInFlight -= 1;
+                this.pumpUpdates();
+            });
+        }
+    }
+
+    private scheduleRetry(queue: GuildQueue, error: unknown): void {
+        if (this.retryTimers.has(queue.guildId) || queueManager.getQueue(queue.guildId) !== queue) {
+            return;
+        }
+
+        const previousAttempts = this.retryAttempts.get(queue.guildId) ?? 0;
+        if (previousAttempts >= this.maxRetryAttempts) {
+            log.error('Abandon des mises à jour Now Playing après épuisement des retries', {
+                guildId: queue.guildId,
+                attempts: previousAttempts,
+            });
+            this.abandonNowPlayingUpdates(queue, error);
+            return;
+        }
+
+        const attempt = previousAttempts + 1;
+        this.retryAttempts.set(queue.guildId, attempt);
+        this.pendingUpdates.delete(queue.guildId);
+        const retryAfterSeconds = Number((error as { retry_after?: unknown })?.retry_after);
+        const retryAfterMs = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : 0;
+        const exponentialMs = Math.min(this.retryMaxDelayMs, this.retryBaseDelayMs * 2 ** (attempt - 1));
+        const jitterMs = Math.floor(Math.random() * this.retryJitterMs);
+        const delayMs = Math.max(retryAfterMs, exponentialMs + jitterMs);
+
+        log.warn(`Mise à jour Now Playing différée de ${delayMs}ms`, {
+            guildId: queue.guildId,
+            attempt,
+        });
+        const timer = setTimeout(() => {
+            this.retryTimers.delete(queue.guildId);
+            if (queueManager.getQueue(queue.guildId) === queue) {
+                this.scheduleUpdate(queue, true);
+            }
+        }, delayMs);
+        timer.unref?.();
+        this.retryTimers.set(queue.guildId, timer);
+    }
+
+    private getDiscordErrorCode(error: unknown): string | null {
+        const candidate = error as {
+            code?: number | string;
+            rawError?: { code?: number | string };
+        };
+        const code = candidate?.code ?? candidate?.rawError?.code;
+        return code === undefined || code === null ? null : String(code);
+    }
+
+    private isPermanentDiscordError(error: unknown): boolean {
+        const candidate = error as { status?: number; statusCode?: number; httpStatus?: number };
+        const status = candidate?.status ?? candidate?.statusCode ?? candidate?.httpStatus;
+        if (status === 401 || status === 403) {
+            return true;
+        }
+
+        const code = this.getDiscordErrorCode(error);
+        return code !== null && ['10003', '10004', '10008', '50001', '50013'].includes(code);
+    }
+
+    private clearRetryState(guildId: string): void {
+        const retryTimer = this.retryTimers.get(guildId);
+        if (retryTimer) {
+            clearTimeout(retryTimer);
+            this.retryTimers.delete(guildId);
+        }
+        this.retryAttempts.delete(guildId);
+    }
+
+    private abandonNowPlayingUpdates(queue: GuildQueue, error: unknown): void {
+        log.warn('Mises à jour Now Playing désactivées pour le message courant', {
+            guildId: queue.guildId,
+            code: this.getDiscordErrorCode(error),
+        });
+        queue.nowPlayingMessage = null;
+        this.pendingUpdates.delete(queue.guildId);
+        this.stopUpdateInterval(queue.guildId);
     }
 
     async handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {

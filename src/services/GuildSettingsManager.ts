@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync } from 'fs';
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, rename, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
@@ -101,10 +101,9 @@ class GuildSettingsManager {
                 typeof settings.pauseOnEmptyChannelWhenAlwaysConnected === 'boolean'
                     ? settings.pauseOnEmptyChannelWhenAlwaysConnected
                     : defaults.pauseOnEmptyChannelWhenAlwaysConnected,
-            crossfadeEnabled:
-                typeof settings.crossfadeEnabled === 'boolean'
-                    ? settings.crossfadeEnabled
-                    : defaults.crossfadeEnabled,
+            // Legacy field kept for one release. The former crossfade pipeline was
+            // not sample-continuous and is intentionally disabled during migration.
+            crossfadeEnabled: false,
             sponsorBlockEnabled:
                 typeof settings.sponsorBlockEnabled === 'boolean'
                     ? settings.sponsorBlockEnabled
@@ -194,6 +193,18 @@ class GuildSettingsManager {
         this.saveQueue.set(guildId, timeout);
     }
 
+    async flushAll(): Promise<void> {
+        const pendingGuildIds = new Set<string>([
+            ...this.cache.keys(),
+            ...this.saveQueue.keys(),
+        ]);
+        for (const timeout of this.saveQueue.values()) {
+            clearTimeout(timeout);
+        }
+        this.saveQueue.clear();
+        await Promise.all(Array.from(pendingGuildIds, (guildId) => this.flushSettings(guildId)));
+    }
+
     private async flushSettings(guildId: string): Promise<void> {
         const settings = this.cache.get(guildId);
         if (!settings) return;
@@ -203,7 +214,7 @@ class GuildSettingsManager {
         try {
             this.ensureGuildDir(guildId);
             const data = JSON.stringify(this.serializeSettings(guildId, settings), null, 2);
-            await writeFile(filePath, data, 'utf-8');
+            await this.writeAtomic(filePath, data);
             log.debug(`Settings sauvegardés pour guild ${guildId}`);
         } catch (error) {
             log.error(`Erreur sauvegarde settings pour guild ${guildId}:`, error);
@@ -240,10 +251,21 @@ class GuildSettingsManager {
             this.ensureGuildDir(guildId);
             this.localeConfigured.set(guildId, localeConfigured);
             const data = JSON.stringify(this.serializeSettings(guildId, settings), null, 2);
-            await writeFile(filePath, data, 'utf-8');
+            await this.writeAtomic(filePath, data);
             log.debug(`Settings par défaut créés pour guild ${guildId}`);
         } catch (error) {
             log.error(`Erreur création settings pour guild ${guildId}:`, error);
+        }
+    }
+
+    private async writeAtomic(filePath: string, data: string): Promise<void> {
+        const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+        try {
+            await writeFile(tempPath, data, { encoding: 'utf-8', mode: 0o600 });
+            await rename(tempPath, filePath);
+        } catch (error) {
+            await rm(tempPath, { force: true }).catch(() => undefined);
+            throw error;
         }
     }
 

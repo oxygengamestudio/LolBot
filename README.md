@@ -20,12 +20,11 @@ Use `.env.example` as template for local and preprod runs.
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID. |
 | `DISCORD_GUILD_ID` | No | Test guild ID for instant slash command sync. |
 | `DISCORD_COMMAND_SCOPE` | No | Slash registration scope: `auto` (default), `guild`, or `global`. |
-| `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. No owner is hardcoded in the image. |
+| `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. The legacy operator ID `189457295279783936` remains an explicitly accepted hardcoded bypass for this release. |
 | `GOOGLE_API_KEY` | No | Optional Google/YouTube API key. If missing or quota-limited, the bot falls back to `yt-dlp`. |
 | `GENIUS_CLIENT_ID` | No | Genius OAuth client ID. |
 | `GENIUS_CLIENT_SECRET` | No | Genius OAuth client secret. |
 | `DATA_DIR` | No | Base path for persistent bot data. Default: `./data` locally, `/home/container/data` in Pterodactyl. |
-| `YTDLP_AUTO_DOWNLOAD` | No | `true` to allow automatic yt-dlp download. Default: `false`. |
 | `YTDLP_PATH` | No | Custom path to an installed `yt-dlp` binary. |
 | `LOG_LEVEL` | No | Log verbosity (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`). |
 

@@ -48,6 +48,7 @@ export interface AppConfig {
         ytDlpTimeoutMs: number;
         ffmpegTimeoutMs: number;
         cacheDownloadTimeoutMs: number;
+        cacheDownloadConcurrency: number;
         voiceReconnectMaxAttempts: number;
         voiceReconnectBaseDelayMs: number;
         voiceReconnectMaxDelayMs: number;
@@ -57,7 +58,6 @@ export interface AppConfig {
         maxQueueTracks: number;
         maxPlaylistTracks: number;
         searchResults: number;
-        ytdlpAutoDownload: boolean;
         allowUnsafeYtdlpExtraArgs: boolean;
     };
 }
@@ -165,6 +165,21 @@ function normalizeBooleanEnv(name: string, defaultValue: boolean): boolean {
     return defaultValue;
 }
 
+function normalizePositiveNumberEnv(name: string, defaultValue: number, minimum = 1): number {
+    const rawValue = getTrimmedEnv(name);
+    if (!rawValue) {
+        return defaultValue;
+    }
+
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value < minimum) {
+        console.warn(`[config] Unsupported numeric value "${rawValue}" for ${name}. Falling back to ${defaultValue}.`);
+        return defaultValue;
+    }
+
+    return value;
+}
+
 function resolvePathEnv(name: string, defaultPath: string): string {
     const rawValue = getOptionalEnv(name);
     if (!rawValue) {
@@ -210,22 +225,22 @@ export const config: AppConfig = {
     },
     audio: {
         bufferSize: 5,
-        cacheAhead: 0,
-        cacheMaxMb: 1536,
-        cacheMaxAgeHours: 24,
+        cacheAhead: Math.floor(normalizePositiveNumberEnv('CACHE_AHEAD', 2)),
+        cacheMaxMb: normalizePositiveNumberEnv('CACHE_MAX_MB', 1536),
+        cacheMaxAgeHours: normalizePositiveNumberEnv('CACHE_MAX_AGE_HOURS', 24),
         ytDlpTimeoutMs: 20_000,
         ffmpegTimeoutMs: 12_000,
-        cacheDownloadTimeoutMs: 180_000,
+        cacheDownloadTimeoutMs: normalizePositiveNumberEnv('CACHE_DOWNLOAD_TIMEOUT_MS', 180_000, 5_000),
+        cacheDownloadConcurrency: Math.floor(normalizePositiveNumberEnv('CACHE_DOWNLOAD_CONCURRENCY', 2)),
         voiceReconnectMaxAttempts: 4,
         voiceReconnectBaseDelayMs: 1_000,
         voiceReconnectMaxDelayMs: 8_000,
-        updateInterval: 5000,
+        updateInterval: normalizePositiveNumberEnv('NOW_PLAYING_UPDATE_INTERVAL_MS', 15_000, 5_000),
         ephemeralInfoDeleteDelay: 5000,
         ephemeralInteractiveDeleteDelay: 30000,
         maxQueueTracks: 100,
         maxPlaylistTracks: 50,
         searchResults: 10,
-        ytdlpAutoDownload: normalizeBooleanEnv('YTDLP_AUTO_DOWNLOAD', false),
         allowUnsafeYtdlpExtraArgs: normalizeBooleanEnv('YTDLP_ALLOW_UNSAFE_EXTRA_ARGS', false),
     },
 };

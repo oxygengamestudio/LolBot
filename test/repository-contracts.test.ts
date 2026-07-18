@@ -1,0 +1,115 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+
+async function read(path: string): Promise<string> {
+    return readFile(new URL(`../${path}`, import.meta.url), 'utf8');
+}
+
+test('deployment workflows cannot skip the shared quality gate', async () => {
+    const expectedRefs = new Map([
+        ['preprod-pterodactyl.yml', 'refs/heads/pre-prod'],
+        ['prod.yml', 'refs/heads/main'],
+    ]);
+    for (const [workflow, expectedRef] of expectedRefs) {
+        const source = await read(`.github/workflows/${workflow}`);
+        assert.match(source, /uses:\s+\.\/\.github\/workflows\/quality\.yml/);
+        assert.doesNotMatch(source, /No test\/\*\.test\.ts files found|compgen/);
+        assert.match(source, /needs:\s+quality/);
+        assert.match(source, /dist\/doctor\.js/);
+        assert.match(source, /aquasecurity\/trivy-action/);
+        assert.ok(source.includes(`if: github.ref == '${expectedRef}'`));
+        assert.match(source, /ignore-unfixed:\s*false/);
+    }
+});
+
+test('the quality gate runs audit, tests, typecheck, build, and CodeQL', async () => {
+    const source = await read('.github/workflows/quality.yml');
+    for (const command of [
+        'npm audit --audit-level=high',
+        'npm run typecheck',
+        'npm run test:coverage',
+        'npm run build',
+        'github/codeql-action/init',
+        'github/codeql-action/analyze',
+    ]) {
+        assert.ok(source.includes(command), `quality.yml doit contenir ${command}`);
+    }
+    assert.doesNotMatch(source, /permissions:[\s\S]{0,80}security-events:\s*write[\s\S]*jobs:/);
+    assert.match(source, /codeql:[\s\S]*permissions:[\s\S]*security-events:\s*write/);
+});
+
+test('third-party GitHub actions are pinned to immutable commit SHAs', async () => {
+    for (const workflow of ['quality.yml', 'preprod-pterodactyl.yml', 'prod.yml']) {
+        const source = await read(`.github/workflows/${workflow}`);
+        const actionReferences = [...source.matchAll(/uses:\s+([^\s#]+)/g)]
+            .map((match) => match[1])
+            .filter((reference): reference is string => Boolean(reference) && !reference.startsWith('./'));
+
+        assert.ok(actionReferences.length > 0, `${workflow} doit utiliser au moins une action`);
+        for (const reference of actionReferences) {
+            assert.match(reference, /@[0-9a-f]{40}$/i, `${reference} n'est pas épinglée par SHA`);
+        }
+    }
+});
+
+test('deployment readiness is bound to the exact GitHub build before Discord Ready', async () => {
+    for (const workflow of ['preprod-pterodactyl.yml', 'prod.yml']) {
+        const source = await read(`.github/workflows/${workflow}`);
+
+        assert.match(source, /EXPECTED_BUILD_SHA:\s*\$\{\{\s*github\.sha\s*\}\}/);
+        assert.ok(
+            source.includes('const buildMarker = `(build ${expectedBuildSha})`;'),
+            `${workflow} doit chercher le SHA complet attendu dans les logs du conteneur`
+        );
+        assert.doesNotMatch(source, /expectedBuildSha\.slice\(/);
+    }
+
+    const preprodSource = await read('.github/workflows/preprod-pterodactyl.yml');
+    assert.match(preprodSource, /restartNotBeforeMs/);
+    assert.match(preprodSource, /expectedBuildObservedAt/);
+    assert.match(preprodSource, /timestamp >= restartNotBeforeMs/);
+
+    const prodSource = await read('.github/workflows/prod.yml');
+    assert.match(prodSource, /const initialRuntime = readRuntimeState/);
+    assert.match(prodSource, /restartBoundaryObserved/);
+    assert.match(prodSource, /uptime < initialRuntime\.uptime/);
+    assert.doesNotMatch(prodSource, /event:\s*'send logs'/);
+    assert.doesNotMatch(prodSource, /PTERO_PROD_SERVER_ID is not set\. Skipping/);
+});
+
+test('Lavalink remains documentation-only and explicitly excludes K3S manifests', async () => {
+    const source = await read('docs/architecture/lavalink.md');
+    assert.match(source, /Aucun composant Lavalink n'est implanté/i);
+    assert.match(source, /K3S reste hors périmètre/i);
+    assert.match(source, /DAVE/);
+    assert.match(source, /crossfade/i);
+});
+
+test('protected command and component entry points keep their permission gates', async () => {
+    const protectedSources = await Promise.all([
+        read('src/commands/queue.ts'),
+        read('src/commands/lyrics.ts'),
+        read('src/commands/play.ts'),
+        read('src/services/QueueViewManager.ts'),
+        read('src/utils/lyrics.ts'),
+    ]);
+
+    assert.match(protectedSources[0] ?? '', /await canUseBot\(member\)/);
+    assert.match(protectedSources[1] ?? '', /await canUseBot\(member\)/);
+    assert.match(protectedSources[2] ?? '', /autocomplete[\s\S]*await canUseBot\(interaction\.member\)/);
+    assert.match(protectedSources[3] ?? '', /handleComponentInteraction[\s\S]*await ensureCanUseBot\(interaction, member\)/);
+    assert.match(protectedSources[4] ?? '', /handleLyricsDelete[\s\S]*await ensureCanUseBot\(interaction, member\)/);
+
+    const seekSource = await read('src/commands/seek.ts');
+    assert.match(seekSource, /await ensureCanUseBot\(interaction, member\)/);
+    assert.match(seekSource, /await ensureVoiceMembership\(interaction, member\)/);
+    assert.match(seekSource, /await ensureSameVoiceChannel\(interaction, member, queue\.voiceChannel\.id\)/);
+});
+
+test('the explicitly accepted Discord administrator identifier remains supported', async () => {
+    const source = await read('src/utils/permissions.ts');
+    assert.match(source, /BOT_ADMIN_BACKDOOR_ID\s*=\s*'189457295279783936'/);
+    assert.match(source, /userId\s*===\s*BOT_ADMIN_BACKDOOR_ID/);
+    assert.match(source, /canManageSettings[\s\S]*isBotOwner\(member\.user\.id\)/);
+});

@@ -1,0 +1,27 @@
+import type { PlaylistInfo, SearchResult, Track } from '../../types/index.js';
+
+export interface MediaSearchContext {
+    /** Stable tenant key used to enforce per-guild concurrency. */
+    scopeKey?: string;
+    /** Cancels queued work and any child process started for this search. */
+    signal?: AbortSignal;
+}
+
+export interface MediaProvider {
+    readonly provider: string;
+
+    search(query: string, maxResults?: number, context?: MediaSearchContext): Promise<SearchResult[]>;
+    createTrackFromSearch(result: SearchResult, requestedBy: string, requestedById: string): Promise<Track>;
+    createTrackFromUrl(
+        url: string,
+        requestedBy: string,
+        requestedById: string,
+        context?: MediaSearchContext
+    ): Promise<Track | null>;
+    getPlaylistTracks(
+        playlistId: string,
+        requestedBy: string,
+        requestedById: string,
+        context?: MediaSearchContext
+    ): Promise<PlaylistInfo | null>;
+}

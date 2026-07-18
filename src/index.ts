@@ -23,7 +23,7 @@ function formatBuildSuffix(): string {
         return '';
     }
 
-    return ` (build ${buildSha.slice(0, 7)})`;
+    return ` (build ${buildSha})`;
 }
 
 function registerConsoleControlCommands(): void {
