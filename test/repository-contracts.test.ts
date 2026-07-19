@@ -17,9 +17,24 @@ test('deployment workflows cannot skip the shared quality gate', async () => {
         assert.doesNotMatch(source, /No test\/\*\.test\.ts files found|compgen/);
         assert.match(source, /needs:\s+quality/);
         assert.match(source, /dist\/doctor\.js/);
-        assert.match(source, /aquasecurity\/trivy-action/);
         assert.ok(source.includes(`if: github.ref == '${expectedRef}'`));
-        assert.match(source, /ignore-unfixed:\s*false/);
+        const trivyGate = source.match(
+            /      - name: Scan and block all high and critical vulnerabilities[\s\S]*?(?=\n      - name: Push validated image)/
+        )?.[0];
+        assert.ok(trivyGate, `${workflow} doit contenir un gate Trivy avant le push`);
+        assert.match(trivyGate, /uses:\s+aquasecurity\/trivy-action@[0-9a-f]{40}/i);
+        assert.match(trivyGate, /image-ref:\s+\$\{\{ steps\.image\.outputs\.image \}\}:\$\{\{ github\.sha \}\}/);
+        assert.match(trivyGate, /scanners:\s*vuln/);
+        assert.match(trivyGate, /severity:\s*HIGH,CRITICAL/);
+        assert.match(trivyGate, /ignore-unfixed:\s*false/);
+        assert.match(trivyGate, /exit-code:\s*'1'/);
+        assert.doesNotMatch(trivyGate, /continue-on-error:|\n\s+if:/);
+        assert.doesNotMatch(source, /ignore-unfixed:\s*true/);
+        const pushStep = source.match(
+            /      - name: Push validated image[\s\S]*?(?=\n  restart:)/
+        )?.[0];
+        assert.ok(pushStep, `${workflow} doit pousser uniquement après le gate Trivy`);
+        assert.doesNotMatch(pushStep, /continue-on-error:|\n\s+if:/);
     }
 });
 
@@ -51,6 +66,22 @@ test('third-party GitHub actions are pinned to immutable commit SHAs', async () 
             assert.match(reference, /@[0-9a-f]{40}$/i, `${reference} n'est pas épinglée par SHA`);
         }
     }
+});
+
+test('the runtime image pins its base and excludes vulnerable build tooling', async () => {
+    const source = await read('Dockerfile');
+
+    assert.match(source, /ARG NODE_BASE=node:24-trixie-slim@sha256:[0-9a-f]{64}/);
+    assert.deepEqual(source.match(/^FROM .+$/gm), [
+        'FROM ${NODE_BASE} AS build',
+        'FROM ${NODE_BASE} AS runtime',
+    ]);
+    assert.match(source, /ARG YTDLP_VERSION=2026\.07\.04/);
+    const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
+    assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
+    assert.match(runtimeStage, /pip uninstall --yes setuptools/);
+    assert.match(runtimeStage, /pip uninstall --yes pip/);
+    assert.match(runtimeStage, /rm -rf \/usr\/local\/lib\/node_modules\/npm \/usr\/local\/bin\/npm \/usr\/local\/bin\/npx/);
 });
 
 test('deployment readiness is bound to the exact GitHub build before Discord Ready', async () => {

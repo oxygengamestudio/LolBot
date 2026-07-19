@@ -1,4 +1,6 @@
-FROM node:24-bookworm-slim AS build
+ARG NODE_BASE=node:24-trixie-slim@sha256:ae91dcc111a68c9d2d81ff2a17bda61be126426176fde6fe7d08ab13b7f50573
+
+FROM ${NODE_BASE} AS build
 
 WORKDIR /opt/lolbot
 
@@ -12,14 +14,14 @@ RUN npm ci
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:24-bookworm-slim AS runtime
+FROM ${NODE_BASE} AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/oxygengamestudio/LolBot" \
     org.opencontainers.image.description="LolBot Discord music bot Pterodactyl image"
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG BOT_BUILD_SHA=local
-ARG YTDLP_VERSION=2026.03.03
+ARG YTDLP_VERSION=2026.07.04
 
 ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
@@ -30,8 +32,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 python3-venv tini \
     && python3 -m venv /opt/yt-dlp \
     && /opt/yt-dlp/bin/pip install --no-cache-dir "yt-dlp==${YTDLP_VERSION}" \
+    && /opt/yt-dlp/bin/python -m pip uninstall --yes setuptools \
+    && /opt/yt-dlp/bin/python -m pip uninstall --yes pip \
     && printf '%s\n' '#!/bin/sh' 'exec /opt/yt-dlp/bin/python -m yt_dlp "$@"' > /usr/local/bin/yt-dlp \
     && chmod 0755 /usr/local/bin/yt-dlp \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/lolbot
