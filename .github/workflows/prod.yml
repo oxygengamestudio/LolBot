@@ -186,20 +186,32 @@ jobs:
             Accept: 'Application/vnd.pterodactyl.v1+json',
           };
 
-          async function request(path, init = {}) {
-            const response = await fetch(`${apiBase}${path}`, {
-              ...init,
-              signal: init.signal ?? AbortSignal.timeout(15_000),
-              headers: {
-                ...apiHeaders,
-                ...(init.headers ?? {}),
-              },
-            });
-            if (!response.ok) {
-              const detail = (await response.text()).slice(0, 1_000);
-              throw new Error(`Pterodactyl ${path} failed with HTTP ${response.status}: ${detail}`);
+          async function request(path, init = {}, retries = 0) {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                const response = await fetch(`${apiBase}${path}`, {
+                  ...init,
+                  signal: init.signal ?? AbortSignal.timeout(15_000),
+                  headers: {
+                    ...apiHeaders,
+                    ...(init.headers ?? {}),
+                  },
+                });
+                if (!response.ok) {
+                  const detail = (await response.text()).slice(0, 1_000);
+                  throw new Error(`Pterodactyl ${path} failed with HTTP ${response.status}: ${detail}`);
+                }
+                return response.status === 204 ? null : response.json();
+              } catch (error) {
+                if (attempt >= retries) throw error;
+                const delayMs = Math.min(1_000 * (2 ** attempt), 4_000);
+                console.warn(
+                  `Pterodactyl ${path} temporarily unavailable `
+                  + `(attempt ${attempt + 1}/${retries + 1}); retrying in ${delayMs}ms.`
+                );
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+              }
             }
-            return response.status === 204 ? null : response.json();
           }
 
           function readRuntimeState(payload) {
@@ -211,8 +223,8 @@ jobs:
             return { state, uptime };
           }
 
-          const initialRuntime = readRuntimeState(await request('/resources'));
-          const websocketPayload = await request('/websocket');
+          const initialRuntime = readRuntimeState(await request('/resources', {}, 3));
+          const websocketPayload = await request('/websocket', {}, 3);
           const websocketUrl = websocketPayload?.data?.socket;
           const websocketToken = websocketPayload?.data?.token;
           if (!websocketUrl || !websocketToken) {
@@ -285,10 +297,13 @@ jobs:
               if (!restartRequested || polling || settled) return;
               polling = true;
               try {
-                const runtime = readRuntimeState(await request('/resources'));
+                const runtime = readRuntimeState(await request('/resources', {}, 0));
                 observeRuntime(runtime.state, runtime.uptime);
               } catch (error) {
-                fail(error);
+                console.warn(
+                  'Pterodactyl resource poll temporarily unavailable; '
+                  + `waiting for the next bounded poll: ${error instanceof Error ? error.message : error}`
+                );
               } finally {
                 polling = false;
               }
@@ -307,7 +322,7 @@ jobs:
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ signal: 'restart' }),
-                }).then(() => {
+                }, 0).then(() => {
                   restartAccepted = true;
                   console.log('Pterodactyl production restart signal accepted.');
                   maybeComplete();

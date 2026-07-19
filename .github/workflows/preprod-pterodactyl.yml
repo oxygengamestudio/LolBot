@@ -166,6 +166,11 @@ jobs:
 
           before_resources="$(mktemp)"
           curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
             "${api_base}/servers/${server_identifier}/resources" \
             --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
             --header "Accept: Application/vnd.pterodactyl.v1+json" \
@@ -194,13 +199,21 @@ jobs:
           fi
 
           restart_observed=false
+          state=unknown
+          uptime="$before_uptime"
           for attempt in $(seq 1 30); do
             resources_json="$(mktemp)"
-            curl --silent --show-error --fail-with-body \
+            if ! curl --silent --show-error --fail-with-body \
+              --connect-timeout 5 \
+              --max-time 10 \
               "${api_base}/servers/${server_identifier}/resources" \
               --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
               --header "Accept: Application/vnd.pterodactyl.v1+json" \
-              --output "$resources_json"
+              --output "$resources_json"; then
+              echo "Pterodactyl resources temporarily unavailable (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
             state="$(jq -r '.attributes.current_state' "$resources_json")"
             uptime="$(jq -r '.attributes.resources.uptime // 0' "$resources_json")"
             [[ "$uptime" =~ ^[0-9]+$ ]]
@@ -217,6 +230,11 @@ jobs:
 
           websocket_json="$(mktemp)"
           curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
             "${api_base}/servers/${server_identifier}/websocket" \
             --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
             --header "Accept: Application/vnd.pterodactyl.v1+json" \

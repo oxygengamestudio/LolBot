@@ -146,11 +146,71 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.match(preprodSource, /restartNotBeforeMs/);
     assert.match(preprodSource, /expectedBuildObservedAt/);
     assert.match(preprodSource, /timestamp >= restartNotBeforeMs/);
+    assert.match(preprodSource, /Pterodactyl resources temporarily unavailable/);
+    assert.match(preprodSource, /--connect-timeout 5/);
+    assert.match(preprodSource, /--max-time 10/);
+    assert.match(preprodSource, /for attempt in \$\(seq 1 30\); do/);
+    const preprodInitialResources = preprodSource.slice(
+        preprodSource.indexOf('before_resources="$(mktemp)"'),
+        preprodSource.indexOf('before_uptime=', preprodSource.indexOf('before_resources="$(mktemp)"'))
+    );
+    assert.match(preprodInitialResources, /--retry 4/);
+    assert.equal(preprodInitialResources.match(/--retry(?!-)/g)?.length, 1);
+    assert.match(preprodInitialResources, /--connect-timeout 5/);
+    assert.match(preprodInitialResources, /--max-time 20/);
+    const preprodPowerRequest = preprodSource.slice(
+        preprodSource.indexOf('status_code="$(curl'),
+        preprodSource.indexOf('if [ "$status_code" = "204" ]')
+    );
+    assert.ok(preprodPowerRequest.length > 0, 'la requête de redémarrage préprod doit rester identifiable');
+    assert.doesNotMatch(preprodPowerRequest, /--retry(?:-|\s)/);
+    const preprodResourcePoll = preprodSource.slice(
+        preprodSource.indexOf('for attempt in $(seq 1 30); do'),
+        preprodSource.indexOf('websocket_json="$(mktemp)"')
+    );
+    assert.doesNotMatch(preprodResourcePoll, /--retry(?:-|\s)/);
+    assert.match(preprodResourcePoll, /--connect-timeout 5/);
+    assert.match(preprodResourcePoll, /--max-time 10/);
+    const preprodWebsocket = preprodSource.slice(
+        preprodSource.indexOf('websocket_json="$(mktemp)"'),
+        preprodSource.indexOf('export PTERO_WS_URL=')
+    );
+    assert.match(preprodWebsocket, /--retry 4/);
+    assert.equal(preprodWebsocket.match(/--retry(?!-)/g)?.length, 1);
+    assert.match(preprodWebsocket, /--connect-timeout 5/);
+    assert.match(preprodWebsocket, /--max-time 20/);
 
     const prodSource = await read('.github/workflows/prod.yml');
     assert.match(prodSource, /const initialRuntime = readRuntimeState/);
     assert.match(prodSource, /restartBoundaryObserved/);
     assert.match(prodSource, /uptime < initialRuntime\.uptime/);
+    assert.match(prodSource, /async function request\(path, init = \{\}, retries = 0\)/);
+    assert.match(prodSource, /request\('\/resources', \{\}, 3\)/);
+    assert.match(prodSource, /request\('\/websocket', \{\}, 3\)/);
+    assert.match(prodSource, /readRuntimeState\(await request\('\/resources', \{\}, 0\)\)/);
+    assert.match(prodSource, /Pterodactyl resource poll temporarily unavailable/);
+    assert.match(prodSource, /if \(attempt >= retries\) throw error/);
+    assert.match(prodSource, /AbortSignal\.timeout\(15_000\)/);
+    assert.match(prodSource, /setTimeout\([^]*?, 180_000\)/);
+    const prodPowerRequest = prodSource.slice(
+        prodSource.indexOf("void request('/power'"),
+        prodSource.indexOf(".catch(fail);", prodSource.indexOf("void request('/power'"))
+    );
+    assert.ok(prodPowerRequest.length > 0, 'la requête de redémarrage prod doit rester identifiable');
+    assert.match(prodPowerRequest, /\}, 0\)\.then\(\(\) => \{/);
+    const maybeComplete = prodSource.slice(
+        prodSource.indexOf('const maybeComplete = () => {'),
+        prodSource.indexOf('const observeRuntime =', prodSource.indexOf('const maybeComplete = () => {'))
+    );
+    assert.match(
+        maybeComplete,
+        /!restartAccepted \|\| !restartBoundaryObserved \|\| currentState !== 'running'/
+    );
+    const appendFreshLog = prodSource.slice(
+        prodSource.indexOf('const appendFreshLog = (output) => {'),
+        prodSource.indexOf('const timeout = setTimeout', prodSource.indexOf('const appendFreshLog = (output) => {'))
+    );
+    assert.match(appendFreshLog, /if \(!restartBoundaryObserved\) return/);
     assert.doesNotMatch(prodSource, /event:\s*'send logs'/);
     assert.doesNotMatch(prodSource, /PTERO_PROD_SERVER_ID is not set\. Skipping/);
 });
