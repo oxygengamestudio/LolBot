@@ -73,8 +73,15 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.image }}:${{ github.sha }}
         run: docker run --rm --entrypoint node "$IMAGE_REF" dist/doctor.js
 
+      - name: Setup Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.72.0
+          cache: true
+          token: ${{ github.token }}
+
       - name: Scan image for high and critical vulnerabilities
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ steps.image.outputs.image }}:${{ github.sha }}
           scanners: vuln
@@ -82,6 +89,7 @@ jobs:
           ignore-unfixed: false
           exit-code: '1'
           timeout: 10m
+          skip-setup-trivy: true
 
       - name: Push validated image
         run: |
