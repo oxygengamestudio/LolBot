@@ -105,6 +105,7 @@ See `PTERODACTYL.md` for the prod/preprod workflows, GitHub Secrets, and restart
 The bot code is bundled inside the image under `/opt/lolbot`, while persistent runtime data goes through `DATA_DIR` (default `/home/container/data` in the egg). The image runs as a non-root user and does not copy `.env` into the build context.
 
 The egg intentionally exposes only runtime-safe variables. `YTDLP_EXTRA_ARGS` stays blocked by default and requires `YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true` if you explicitly choose to allow arbitrary yt-dlp flags.
+`DISCORD_TOKEN`, `GOOGLE_API_KEY`, and `GENIUS_CLIENT_SECRET` are hidden and read-only for panel sub-users.
 
 ## Stress Test (Single Instance, Multi Guild)
 

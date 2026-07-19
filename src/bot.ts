@@ -39,6 +39,7 @@ import {
     SETTINGS_SELECT_IDS,
 } from './utils/settings-ui.js';
 import { logger } from './utils/Logger.js';
+import { runtimeReadiness } from './runtimeReadiness.js';
 import { acquireProcessLock } from './utils/processLock.js';
 import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
 import { resolveLocale, t } from './utils/i18n.js';
@@ -205,6 +206,7 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
     ],
 });
+runtimeReadiness.setDiscordReadyProbe(() => client.isReady());
 
 log.info('Client Discord créé');
 log.info(`Node runtime: ${process.version}`);
@@ -264,6 +266,7 @@ function getInviteLink(): string {
 // Événement: Bot prêt
 client.once(Events.ClientReady, async (readyClient) => {
     log.info(`Bot connecté en tant que ${readyClient.user.tag}`);
+    runtimeReadiness.notifyDiscordStateChanged();
     log.info(`Présent sur ${readyClient.guilds.cache.size} serveur(s)`);
 
     log.info(`Lien d'invitation du bot: ${getInviteLink()}`);

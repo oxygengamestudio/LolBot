@@ -163,6 +163,8 @@ POST /api/client/servers/{server}/command
 
 The running bot handles that stdin command and writes ANSI clear-screen sequences to the Pterodactyl console. If the clear command fails because the server is not currently accepting commands, the workflow still continues with the restart.
 
+After the restart, CI sends a random one-use challenge and waits for the expected full build SHA and a live Discord Ready state. The readiness probe is operational rather than cryptographic and requires no additional secret.
+
 If `PTERO_PROD_SERVER_ID` or `PTERO_PREPROD_SERVER_ID` is a full UUID, the workflow automatically uses the short identifier before calling the Client API.
 
 ## systemctl

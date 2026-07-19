@@ -168,6 +168,8 @@ jobs:
 
           export PTERO_RESOLVED_SERVER_IDENTIFIER="$server_identifier"
           node --input-type=module <<'NODE'
+          import { randomBytes } from 'node:crypto';
+
           const panelUrl = process.env.PTERO_URL;
           const apiKey = process.env.PTERO_CLIENT_API_KEY;
           const serverIdentifier = process.env.PTERO_RESOLVED_SERVER_IDENTIFIER;
@@ -179,6 +181,18 @@ jobs:
           if (!expectedBuildSha || !/^[0-9a-f]{40}$/i.test(expectedBuildSha)) {
             throw new Error('Expected GitHub build SHA unavailable');
           }
+
+          const challenge = randomBytes(32).toString('hex');
+          const normalizedBuildSha = expectedBuildSha.toLowerCase();
+          const expectedReadinessLine =
+            ` INFO  [Readiness] challenge=${challenge} `
+            + `build=${normalizedBuildSha} discordReady=true`;
+          const isExpectedReadiness = (line) => {
+            if (line.length !== 23 + expectedReadinessLine.length) return false;
+            const timestamp = line.slice(0, 23);
+            if (!Number.isFinite(Date.parse(`${timestamp.replace(' ', 'T')}Z`))) return false;
+            return line.slice(23) === expectedReadinessLine;
+          };
 
           const apiBase = `${panelUrl.replace(/\/+$/, '')}/api/client/servers/${encodeURIComponent(serverIdentifier)}`;
           const apiHeaders = {
@@ -233,19 +247,21 @@ jobs:
 
           await new Promise((resolve, reject) => {
             const socket = new WebSocket(websocketUrl);
-            const buildMarker = `(build ${expectedBuildSha})`;
             let settled = false;
             let restartRequested = false;
             let restartAccepted = false;
             let restartBoundaryObserved = false;
             let currentState = initialRuntime.state;
             let currentUptime = initialRuntime.uptime;
-            let freshLogs = '';
+            let readinessObserved = false;
+            let challengeTimer;
             let polling = false;
 
             const cleanup = () => {
               clearTimeout(timeout);
               clearInterval(pollTimer);
+              clearInterval(challengeTimer);
+              challengeTimer = undefined;
             };
             const fail = (error) => {
               if (settled) return;
@@ -263,10 +279,25 @@ jobs:
             };
             const maybeComplete = () => {
               if (!restartAccepted || !restartBoundaryObserved || currentState !== 'running') return;
-              const buildIndex = freshLogs.indexOf(buildMarker);
-              const readyIndex = freshLogs.indexOf('Bot connecté en tant que', Math.max(0, buildIndex));
-              if (buildIndex >= 0 && readyIndex > buildIndex) {
+              if (readinessObserved) {
                 succeed();
+                return;
+              }
+              if (!challengeTimer) {
+                const sendChallenge = () => {
+                  if (settled) return;
+                  try {
+                    socket.send(JSON.stringify({
+                      event: 'send command',
+                      args: [`lolbot:ready ${challenge}`],
+                    }));
+                  } catch (error) {
+                    fail(error);
+                  }
+                };
+                sendChallenge();
+                if (settled) return;
+                challengeTimer = setInterval(sendChallenge, 5_000);
               }
             };
             const observeRuntime = (state, uptime = currentUptime) => {
@@ -275,15 +306,10 @@ jobs:
               if (restartRequested && (
                 state !== 'running'
                 || uptime < initialRuntime.uptime
-                || (initialRuntime.state !== 'running' && state === 'running')
+                || (initialRuntime.state === 'offline' && state === 'running')
               )) {
                 restartBoundaryObserved = true;
               }
-              maybeComplete();
-            };
-            const appendFreshLog = (output) => {
-              if (!restartBoundaryObserved) return;
-              freshLogs = `${freshLogs}${output}\n`.slice(-1_000_000);
               maybeComplete();
             };
 
@@ -339,7 +365,16 @@ jobs:
                 const output = Array.isArray(payload.args)
                   ? payload.args.join('\n')
                   : String(payload.args ?? '');
-                appendFreshLog(output);
+                for (const line of output.split(/\r?\n/)) {
+                  const plainLine = line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+                  if (isExpectedReadiness(plainLine)) {
+                    readinessObserved = true;
+                    clearInterval(challengeTimer);
+                    challengeTimer = undefined;
+                    maybeComplete();
+                    return;
+                  }
+                }
               }
             });
             socket.addEventListener('error', () => {
@@ -353,6 +388,6 @@ jobs:
           });
 
           console.log(
-            `Pterodactyl production restart, fresh build ${expectedBuildSha} and Discord Ready confirmed.`
+            `Pterodactyl production restart and Discord Ready ${expectedBuildSha} confirmed.`
           );
           NODE

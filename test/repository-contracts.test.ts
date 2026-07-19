@@ -135,17 +135,19 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
         const source = await read(`.github/workflows/${workflow}`);
 
         assert.match(source, /EXPECTED_BUILD_SHA:\s*\$\{\{\s*github\.sha\s*\}\}/);
-        assert.ok(
-            source.includes('const buildMarker = `(build ${expectedBuildSha})`;'),
-            `${workflow} doit chercher le SHA complet attendu dans les logs du conteneur`
-        );
+        assert.match(source, /randomBytes\(32\)\.toString\('hex'\)/);
+        assert.match(source, /event:\s*'send command'/);
+        assert.match(source, /lolbot:ready \$\{challenge\}/);
+        assert.match(source, /build=\$\{normalizedBuildSha\} discordReady=true/);
+        assert.doesNotMatch(source, /ATTESTATION_SECRET|createHmac|timingSafeEqual|mac=/);
         assert.doesNotMatch(source, /expectedBuildSha\.slice\(/);
+        assert.doesNotMatch(source, /line\.includes\(buildMarker\)/);
+        assert.doesNotMatch(source, /line\.includes\('Bot connecté en tant que'\)/);
+        assert.doesNotMatch(source, /event:\s*'send logs'/);
     }
 
     const preprodSource = await read('.github/workflows/preprod-pterodactyl.yml');
-    assert.match(preprodSource, /restartNotBeforeMs/);
-    assert.match(preprodSource, /expectedBuildObservedAt/);
-    assert.match(preprodSource, /timestamp >= restartNotBeforeMs/);
+    assert.match(preprodSource, /isExpectedReadiness\(plainLine\)/);
     assert.match(preprodSource, /Pterodactyl resources temporarily unavailable/);
     assert.match(preprodSource, /--connect-timeout 5/);
     assert.match(preprodSource, /--max-time 10/);
@@ -161,6 +163,13 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.match(preprodSource, /before_state="\$\(jq -r '[^']*current_state/);
     assert.match(preprodSource, /if \[ "\$before_state" = "offline" \]; then\s+restart_observed=true/);
     assert.doesNotMatch(preprodSource, /if \[ "\$before_state" != "running" \]; then\s+restart_observed=true/);
+    assert.match(preprodSource, /const maxConnectionAttempts = 8/);
+    assert.match(preprodSource, /const attemptTimeout = setTimeout\(\(\) => retry\(\), 15_000\)/);
+    assert.match(preprodSource, /reconnectTimer = setTimeout\(connect, delayMs\)/);
+    assert.match(preprodSource, /socket\.addEventListener\('error', retry\)/);
+    assert.match(preprodSource, /socket\.addEventListener\('close', retry\)/);
+    assert.match(preprodSource, /socket\.addEventListener\('message', \(message\) => \{\s+if \(terminal \|\| settled\) return/);
+    assert.doesNotMatch(preprodSource, /reject\(new Error\('Pterodactyl websocket readiness probe failed'\)\)/);
     const preprodPowerRequest = preprodSource.slice(
         preprodSource.indexOf('status_code="$(curl'),
         preprodSource.indexOf('if [ "$status_code" = "204" ]')
@@ -187,6 +196,7 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.match(prodSource, /const initialRuntime = readRuntimeState/);
     assert.match(prodSource, /restartBoundaryObserved/);
     assert.match(prodSource, /uptime < initialRuntime\.uptime/);
+    assert.match(prodSource, /initialRuntime\.state === 'offline' && state === 'running'/);
     assert.match(prodSource, /async function request\(path, init = \{\}, retries = 0\)/);
     assert.match(prodSource, /request\('\/resources', \{\}, 3\)/);
     assert.match(prodSource, /request\('\/websocket', \{\}, 3\)/);
@@ -209,13 +219,48 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
         maybeComplete,
         /!restartAccepted \|\| !restartBoundaryObserved \|\| currentState !== 'running'/
     );
-    const appendFreshLog = prodSource.slice(
-        prodSource.indexOf('const appendFreshLog = (output) => {'),
-        prodSource.indexOf('const timeout = setTimeout', prodSource.indexOf('const appendFreshLog = (output) => {'))
-    );
-    assert.match(appendFreshLog, /if \(!restartBoundaryObserved\) return/);
-    assert.doesNotMatch(prodSource, /event:\s*'send logs'/);
+    assert.match(maybeComplete, /if \(readinessObserved\) \{\s+succeed\(\);\s+return/);
+    assert.match(prodSource, /isExpectedReadiness\(plainLine\)/);
     assert.doesNotMatch(prodSource, /PTERO_PROD_SERVER_ID is not set\. Skipping/);
+});
+
+test('runtime readiness is wired to bootstrap input and Discord Ready without an extra secret', async () => {
+    const indexSource = await read('src/index.ts');
+    const botSource = await read('src/bot.ts');
+    const readinessSource = await read('src/runtimeReadiness.ts');
+
+    assert.match(indexSource, /runtimeReadiness\.handleControlCommand\(line\.trim\(\)\)/);
+    assert.match(indexSource, /createInterface\(\{ input: process\.stdin, crlfDelay: Infinity, terminal: false \}\)/);
+    assert.match(botSource, /runtimeReadiness\.setDiscordReadyProbe\(\(\) => client\.isReady\(\)\)/);
+    assert.match(botSource, /ClientReady[\s\S]*runtimeReadiness\.notifyDiscordStateChanged\(\)/);
+    assert.match(readinessSource, /\^lolbot:ready \(\[0-9a-f\]\{64\}\)\$/);
+    assert.match(readinessSource, /BUILD_SHA_PATTERN\.test\(candidate\)/);
+    assert.match(readinessSource, /discordReady=true/);
+    assert.doesNotMatch(indexSource + botSource + readinessSource, /ATTESTATION_SECRET|createHmac/);
+});
+
+test('Pterodactyl keeps every application secret hidden from sub-users', async () => {
+    const egg = JSON.parse(await read('pterodactyl/egg-lolbot.json')) as {
+        variables?: Array<{
+            env_variable?: string;
+            user_viewable?: boolean;
+            user_editable?: boolean;
+            rules?: string;
+        }>;
+    };
+    const variables = new Map((egg.variables ?? []).map((variable) => [variable.env_variable, variable]));
+
+    for (const name of [
+        'DISCORD_TOKEN',
+        'GOOGLE_API_KEY',
+        'GENIUS_CLIENT_SECRET',
+    ]) {
+        const variable = variables.get(name);
+        assert.ok(variable, `${name} doit exister dans l'œuf Pterodactyl`);
+        assert.equal(variable.user_viewable, false, `${name} ne doit pas être visible`);
+        assert.equal(variable.user_editable, false, `${name} ne doit pas être éditable`);
+    }
+    assert.equal(variables.has('RUNTIME_ATTESTATION_SECRET'), false);
 });
 
 test('Lavalink remains documentation-only and explicitly excludes K3S manifests', async () => {

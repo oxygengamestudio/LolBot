@@ -179,8 +179,6 @@ jobs:
           before_uptime="$(jq -r '.attributes.resources.uptime // 0' "$before_resources")"
           test "$before_state" != "unknown"
           [[ "$before_uptime" =~ ^[0-9]+$ ]]
-          export RESTART_NOT_BEFORE_MS="$(date -u +%s%3N)"
-
           response_body="$(mktemp)"
           status_code="$(curl --silent --show-error \
             --request POST \
@@ -248,80 +246,143 @@ jobs:
           export PTERO_WS_URL="$(jq -r '.data.socket' "$websocket_json")"
           export PTERO_WS_TOKEN="$(jq -r '.data.token' "$websocket_json")"
           node --input-type=module <<'NODE'
+          import { randomBytes } from 'node:crypto';
+
           const url = process.env.PTERO_WS_URL;
           const token = process.env.PTERO_WS_TOKEN;
           const expectedBuildSha = process.env.EXPECTED_BUILD_SHA;
-          const restartNotBeforeMs = Number(process.env.RESTART_NOT_BEFORE_MS);
           if (!url || !token || url === 'null' || token === 'null') {
             throw new Error('Pterodactyl websocket credentials unavailable');
           }
           if (!expectedBuildSha || !/^[0-9a-f]{40}$/i.test(expectedBuildSha)) {
             throw new Error('Expected GitHub build SHA unavailable');
           }
-          if (!Number.isFinite(restartNotBeforeMs)) {
-            throw new Error('Restart timestamp unavailable');
-          }
 
-          const timestampFromLogLine = (line) => {
-            const match = line.match(/(20\d{2}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}\.\d{3})/);
-            return match ? Date.parse(`${match[1]}T${match[2]}Z`) : NaN;
+          const challenge = randomBytes(32).toString('hex');
+          const normalizedBuildSha = expectedBuildSha.toLowerCase();
+          const expectedReadinessLine =
+            ` INFO  [Readiness] challenge=${challenge} `
+            + `build=${normalizedBuildSha} discordReady=true`;
+          const isExpectedReadiness = (line) => {
+            if (line.length !== 23 + expectedReadinessLine.length) return false;
+            const timestamp = line.slice(0, 23);
+            if (!Number.isFinite(Date.parse(`${timestamp.replace(' ', 'T')}Z`))) return false;
+            return line.slice(23) === expectedReadinessLine;
           };
 
           await new Promise((resolve, reject) => {
-            const socket = new WebSocket(url);
-            let ready = false;
-            let expectedBuildObservedAt = 0;
+            const maxConnectionAttempts = 8;
+            let connectionAttempt = 0;
+            let currentSocket;
+            let currentChallengeTimer;
+            let reconnectTimer;
+            let settled = false;
+
+            const closeCurrentSocket = () => {
+              try { currentSocket?.close(); } catch { /* best effort */ }
+              currentSocket = undefined;
+            };
+            const cleanup = () => {
+              clearTimeout(timeout);
+              clearTimeout(reconnectTimer);
+              clearInterval(currentChallengeTimer);
+              currentChallengeTimer = undefined;
+              closeCurrentSocket();
+            };
+            const fail = (error) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            };
+            const succeed = () => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve();
+            };
             const timeout = setTimeout(() => {
-              socket.close();
-              reject(new Error(
+              fail(new Error(
                 `Build ${expectedBuildSha} and Discord Ready markers not observed in order within 120 seconds`
               ));
             }, 120_000);
 
-            socket.addEventListener('open', () => {
-              socket.send(JSON.stringify({ event: 'auth', args: [token] }));
-            });
-            socket.addEventListener('message', (message) => {
-              let payload;
-              try { payload = JSON.parse(String(message.data)); } catch { return; }
-              if (payload.event === 'auth success') {
-                socket.send(JSON.stringify({ event: 'send logs', args: [null] }));
-                return;
-              }
-              if (payload.event !== 'console output') return;
-              const output = Array.isArray(payload.args) ? payload.args.join('\n') : String(payload.args ?? '');
-              const buildMarker = `(build ${expectedBuildSha})`;
-              for (const line of output.split(/\r?\n/)) {
-                const timestamp = timestampFromLogLine(line);
-                if (line.includes(buildMarker) && timestamp >= restartNotBeforeMs) {
-                  expectedBuildObservedAt = Math.max(expectedBuildObservedAt, timestamp);
-                }
-                if (
-                  line.includes('Bot connecté en tant que') &&
-                  expectedBuildObservedAt > 0 &&
-                  timestamp >= expectedBuildObservedAt
-                ) {
-                  ready = true;
-                  clearTimeout(timeout);
-                  socket.close();
-                  resolve();
+            const connect = () => {
+              if (settled) return;
+              connectionAttempt += 1;
+              const socket = new WebSocket(url);
+              currentSocket = socket;
+              let terminal = false;
+              const attemptTimeout = setTimeout(() => retry(), 15_000);
+
+              const retry = () => {
+                if (terminal || settled) return;
+                terminal = true;
+                clearTimeout(attemptTimeout);
+                clearInterval(currentChallengeTimer);
+                currentChallengeTimer = undefined;
+                try { socket.close(); } catch { /* best effort */ }
+                if (connectionAttempt >= maxConnectionAttempts) {
+                  fail(new Error(
+                    `Pterodactyl websocket readiness probe failed after ${maxConnectionAttempts} attempts`
+                  ));
                   return;
                 }
-              }
-            });
-            socket.addEventListener('error', () => {
-              clearTimeout(timeout);
-              reject(new Error('Pterodactyl websocket readiness probe failed'));
-            });
-            socket.addEventListener('close', () => {
-              if (ready) return;
-              clearTimeout(timeout);
-              reject(new Error(
-                expectedBuildObservedAt > 0
-                  ? 'Pterodactyl websocket closed before Discord Ready for the expected build'
-                  : `Pterodactyl websocket closed before expected build ${expectedBuildSha}`
-              ));
-            });
+                const delayMs = Math.min(1_000 * (2 ** (connectionAttempt - 1)), 8_000);
+                console.warn(
+                  `Pterodactyl websocket temporarily unavailable `
+                  + `(attempt ${connectionAttempt}/${maxConnectionAttempts}); retrying in ${delayMs}ms.`
+                );
+                reconnectTimer = setTimeout(connect, delayMs);
+              };
+
+              socket.addEventListener('open', () => {
+                if (terminal || settled) return;
+                try {
+                  socket.send(JSON.stringify({ event: 'auth', args: [token] }));
+                } catch {
+                  retry();
+                }
+              });
+              socket.addEventListener('message', (message) => {
+                if (terminal || settled) return;
+                let payload;
+                try { payload = JSON.parse(String(message.data)); } catch { return; }
+                if (payload.event === 'auth success') {
+                  clearTimeout(attemptTimeout);
+                  const sendChallenge = () => {
+                    if (terminal || settled) return;
+                    try {
+                      socket.send(JSON.stringify({
+                        event: 'send command',
+                        args: [`lolbot:ready ${challenge}`],
+                      }));
+                    } catch {
+                      retry();
+                    }
+                  };
+                  sendChallenge();
+                  if (terminal || settled) return;
+                  currentChallengeTimer = setInterval(sendChallenge, 5_000);
+                  return;
+                }
+                if (payload.event !== 'console output') return;
+                const output = Array.isArray(payload.args) ? payload.args.join('\n') : String(payload.args ?? '');
+                for (const line of output.split(/\r?\n/)) {
+                  const plainLine = line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+                  if (isExpectedReadiness(plainLine)) {
+                    clearInterval(currentChallengeTimer);
+                    currentChallengeTimer = undefined;
+                    succeed();
+                    return;
+                  }
+                }
+              });
+              socket.addEventListener('error', retry);
+              socket.addEventListener('close', retry);
+            };
+
+            connect();
           });
           console.log(`Pterodactyl running and Discord Ready confirmed for build ${expectedBuildSha}.`);
           NODE

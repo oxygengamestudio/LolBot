@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { runtimeReadiness } from './runtimeReadiness.js';
 
 type PackageMetadata = {
     name?: string;
@@ -28,14 +30,14 @@ function formatBuildSuffix(): string {
 
 function registerConsoleControlCommands(): void {
     const clearCommand = 'lolbot:clear-console';
+    const input = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
 
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: Buffer | string) => {
-        for (const line of chunk.toString().split(/\r?\n/)) {
-            if (line.trim() === clearCommand) {
-                process.stdout.write('\x1b[H\x1b[2J\x1b[3J');
-            }
+    input.on('line', (line) => {
+        if (line.trim() === clearCommand) {
+            process.stdout.write('\x1b[H\x1b[2J\x1b[3J');
+            return;
         }
+        runtimeReadiness.handleControlCommand(line.trim());
     });
 }
 
