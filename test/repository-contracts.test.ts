@@ -158,6 +158,9 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.equal(preprodInitialResources.match(/--retry(?!-)/g)?.length, 1);
     assert.match(preprodInitialResources, /--connect-timeout 5/);
     assert.match(preprodInitialResources, /--max-time 20/);
+    assert.match(preprodSource, /before_state="\$\(jq -r '[^']*current_state/);
+    assert.match(preprodSource, /if \[ "\$before_state" = "offline" \]; then\s+restart_observed=true/);
+    assert.doesNotMatch(preprodSource, /if \[ "\$before_state" != "running" \]; then\s+restart_observed=true/);
     const preprodPowerRequest = preprodSource.slice(
         preprodSource.indexOf('status_code="$(curl'),
         preprodSource.indexOf('if [ "$status_code" = "204" ]')

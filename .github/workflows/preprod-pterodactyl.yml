@@ -175,7 +175,9 @@ jobs:
             --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
             --header "Accept: Application/vnd.pterodactyl.v1+json" \
             --output "$before_resources"
+          before_state="$(jq -r '.attributes.current_state // "unknown"' "$before_resources")"
           before_uptime="$(jq -r '.attributes.resources.uptime // 0' "$before_resources")"
+          test "$before_state" != "unknown"
           [[ "$before_uptime" =~ ^[0-9]+$ ]]
           export RESTART_NOT_BEFORE_MS="$(date -u +%s%3N)"
 
@@ -199,6 +201,9 @@ jobs:
           fi
 
           restart_observed=false
+          if [ "$before_state" = "offline" ]; then
+            restart_observed=true
+          fi
           state=unknown
           uptime="$before_uptime"
           for attempt in $(seq 1 30); do
