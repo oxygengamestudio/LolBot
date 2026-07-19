@@ -1,9 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
-
-const require = createRequire(import.meta.url);
 
 export interface DoctorCheck {
     name: string;
@@ -20,7 +17,7 @@ interface CommandResult {
 
 export interface DoctorDependencies {
     runCommand?: (command: string, args: string[]) => CommandResult;
-    loadModule?: (moduleName: string) => unknown;
+    loadModule?: (moduleName: string) => unknown | Promise<unknown>;
     nodeVersion?: string;
 }
 
@@ -58,9 +55,15 @@ function commandCheck(
     };
 }
 
-function moduleCheck(name: string, moduleName: string, loadModule: (moduleName: string) => unknown): DoctorCheck {
+async function moduleCheck(
+    name: string,
+    moduleName: string,
+    loadModule: (moduleName: string) => unknown | Promise<unknown>,
+    validate?: (loaded: unknown) => void | Promise<void>,
+): Promise<DoctorCheck> {
     try {
-        loadModule(moduleName);
+        const loaded = await loadModule(moduleName);
+        await validate?.(loaded);
         return { name, ok: true, detail: `${moduleName} chargé` };
     } catch (error) {
         return {
@@ -71,13 +74,46 @@ function moduleCheck(name: string, moduleName: string, loadModule: (moduleName: 
     }
 }
 
-export function collectDoctorChecks(dependencies: DoctorDependencies = {}): DoctorCheck[] {
+async function validateVoiceCipher(loaded: unknown): Promise<void> {
+    const backend = loaded as {
+        xchacha20poly1305?: (
+            key: Uint8Array,
+            nonce: Uint8Array,
+            additionalData: Uint8Array,
+        ) => {
+            encrypt: (plaintext: Uint8Array) => Uint8Array;
+            decrypt: (ciphertext: Uint8Array) => Uint8Array;
+        };
+    };
+    if (typeof backend.xchacha20poly1305 !== 'function') {
+        throw new Error('backend XChaCha20-Poly1305 indisponible');
+    }
+
+    const key = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const nonce = Uint8Array.from({ length: 24 }, (_, index) => index + 32);
+    const additionalData = Uint8Array.from([0x80, 0x78, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    const plaintext = Uint8Array.from([0xf8, 0xff, 0xfe, 0x01, 0x02, 0x03]);
+    const cipher = backend.xchacha20poly1305(key, nonce, additionalData);
+    const decrypted = cipher.decrypt(cipher.encrypt(plaintext));
+    if (decrypted.length !== plaintext.length || decrypted.some((byte, index) => byte !== plaintext[index])) {
+        throw new Error('échec du round-trip XChaCha20-Poly1305');
+    }
+}
+
+export async function collectDoctorChecks(dependencies: DoctorDependencies = {}): Promise<DoctorCheck[]> {
     const runCommand = dependencies.runCommand ?? defaultRunCommand;
-    const loadModule = dependencies.loadModule ?? ((moduleName: string) => require(moduleName));
+    const loadModule = dependencies.loadModule ?? ((moduleName: string) => import(moduleName));
     const nodeVersion = dependencies.nodeVersion ?? process.versions.node;
     const [major, minor] = nodeVersion.split('.').map((part) => Number.parseInt(part, 10));
     const supportedNode = Number.isFinite(major) && Number.isFinite(minor)
         && (major > 22 || (major === 22 && minor >= 12));
+
+    const moduleChecks = await Promise.all([
+        moduleCheck('opus-native', '@discordjs/opus', loadModule),
+        moduleCheck('opus-fallback', 'opusscript', loadModule),
+        moduleCheck('dave-native', '@snazzah/davey', loadModule),
+        moduleCheck('voice-crypto', '@noble/ciphers/chacha.js', loadModule, validateVoiceCipher),
+    ]);
 
     return [
         {
@@ -87,10 +123,7 @@ export function collectDoctorChecks(dependencies: DoctorDependencies = {}): Doct
         },
         commandCheck('ffmpeg', 'ffmpeg', ['-version'], runCommand),
         commandCheck('yt-dlp', 'yt-dlp', ['--version'], runCommand),
-        moduleCheck('opus-native', '@discordjs/opus', loadModule),
-        moduleCheck('opus-fallback', 'opusscript', loadModule),
-        moduleCheck('dave-native', '@snazzah/davey', loadModule),
-        moduleCheck('voice-crypto', 'sodium-native', loadModule),
+        ...moduleChecks,
     ];
 }
 
@@ -100,8 +133,8 @@ export function formatDoctorReport(checks: DoctorCheck[]): string {
         .join('\n');
 }
 
-export function runDoctor(dependencies: DoctorDependencies = {}): number {
-    const checks = collectDoctorChecks(dependencies);
+export async function runDoctor(dependencies: DoctorDependencies = {}): Promise<number> {
+    const checks = await collectDoctorChecks(dependencies);
     console.log(formatDoctorReport(checks));
     const requiredChecks = checks.filter((check) => [
         'node',
@@ -118,5 +151,5 @@ export function runDoctor(dependencies: DoctorDependencies = {}): number {
 
 const executedPath = process.argv[1] ? resolve(process.argv[1]) : '';
 if (executedPath === resolve(fileURLToPath(import.meta.url))) {
-    process.exitCode = runDoctor();
+    process.exitCode = await runDoctor();
 }

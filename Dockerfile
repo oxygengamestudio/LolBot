@@ -26,7 +26,7 @@ ENV NODE_ENV=production \
     DATA_DIR=/home/container/data \
     BOT_BUILD_SHA=${BOT_BUILD_SHA}
 
-RUN apk add --no-cache ca-certificates ffmpeg gcompat tini \
+RUN apk add --no-cache ca-certificates ffmpeg tini \
     && case "${TARGETARCH}" in \
         amd64) asset='yt-dlp_musllinux'; checksum='f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e' ;; \
         arm64) asset='yt-dlp_musllinux_aarch64'; checksum='9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7' ;; \

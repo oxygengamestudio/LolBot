@@ -16,7 +16,7 @@ function assertRuntimeImageContract(source: string): void {
 
     const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
     assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
-    assert.match(runtimeStage, /apk add --no-cache ca-certificates ffmpeg gcompat tini/);
+    assert.match(runtimeStage, /apk add --no-cache ca-certificates ffmpeg tini/);
     assert.ok(runtimeStage.includes(
         "amd64) asset='yt-dlp_musllinux'; checksum='f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e' ;;"
     ));
@@ -111,6 +111,23 @@ test('the runtime image contract rejects a disabled yt-dlp checksum pipeline', a
 
     assert.notEqual(disabledVerification, source, 'la mutation de contrôle doit être appliquée');
     assert.throws(() => assertRuntimeImageContract(disabledVerification));
+});
+
+test('voice encryption uses the portable pinned noble backend on Alpine', async () => {
+    const manifest = JSON.parse(await read('package.json')) as {
+        dependencies?: Record<string, string>;
+    };
+    const lock = JSON.parse(await read('package-lock.json')) as {
+        packages?: Record<string, { version?: string; dependencies?: Record<string, string> }>;
+    };
+
+    assert.equal(manifest.dependencies?.['@noble/ciphers'], '2.2.0');
+    assert.equal(manifest.dependencies?.['sodium-native'], undefined);
+    assert.equal(manifest.dependencies?.['libsodium-wrappers'], undefined);
+    assert.equal(lock.packages?.['']?.dependencies?.['@noble/ciphers'], '2.2.0');
+    assert.equal(lock.packages?.['node_modules/@noble/ciphers']?.version, '2.2.0');
+    assert.equal(lock.packages?.['node_modules/sodium-native'], undefined);
+    assert.equal(lock.packages?.['node_modules/libsodium-wrappers'], undefined);
 });
 
 test('deployment readiness is bound to the exact GitHub build before Discord Ready', async () => {
