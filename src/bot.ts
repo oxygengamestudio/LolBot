@@ -12,6 +12,7 @@
     ModalSubmitInteraction,
     RoleSelectMenuInteraction,
     StringSelectMenuInteraction,
+    Status,
     Routes,
 } from 'discord.js';
 import dns from 'node:dns';
@@ -206,7 +207,23 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
     ],
 });
-runtimeReadiness.setDiscordReadyProbe(() => client.isReady());
+let initialDiscordReadyObserved = false;
+let discordRuntimeReady = false;
+const markDiscordRuntimeUnavailable = (): void => {
+    discordRuntimeReady = false;
+    runtimeReadiness.notifyDiscordStateChanged();
+};
+const refreshDiscordRuntimeReady = (): void => {
+    discordRuntimeReady = initialDiscordReadyObserved
+        && client.ws.shards.size > 0
+        && client.ws.shards.every((shard) => shard.status === Status.Ready);
+    runtimeReadiness.notifyDiscordStateChanged();
+};
+runtimeReadiness.setDiscordReadyProbe(() => discordRuntimeReady);
+client.on(Events.ShardDisconnect, markDiscordRuntimeUnavailable);
+client.on(Events.ShardReconnecting, markDiscordRuntimeUnavailable);
+client.on(Events.ShardReady, refreshDiscordRuntimeReady);
+client.on(Events.ShardResume, refreshDiscordRuntimeReady);
 
 log.info('Client Discord créé');
 log.info(`Node runtime: ${process.version}`);
@@ -265,8 +282,9 @@ function getInviteLink(): string {
 
 // Événement: Bot prêt
 client.once(Events.ClientReady, async (readyClient) => {
+    initialDiscordReadyObserved = true;
+    refreshDiscordRuntimeReady();
     log.info(`Bot connecté en tant que ${readyClient.user.tag}`);
-    runtimeReadiness.notifyDiscordStateChanged();
     log.info(`Présent sur ${readyClient.guilds.cache.size} serveur(s)`);
 
     log.info(`Lien d'invitation du bot: ${getInviteLink()}`);

@@ -163,8 +163,8 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.match(preprodSource, /before_state="\$\(jq -r '[^']*current_state/);
     assert.match(preprodSource, /if \[ "\$before_state" = "offline" \]; then\s+restart_observed=true/);
     assert.doesNotMatch(preprodSource, /if \[ "\$before_state" != "running" \]; then\s+restart_observed=true/);
-    assert.match(preprodSource, /const maxConnectionAttempts = 8/);
-    assert.match(preprodSource, /const attemptTimeout = setTimeout\(\(\) => retry\(\), 15_000\)/);
+    assert.match(preprodSource, /const maxConnectionAttempts = 2/);
+    assert.match(preprodSource, /const attemptTimeout = setTimeout\(\(\) => retry\(\), 10_000\)/);
     assert.match(preprodSource, /reconnectTimer = setTimeout\(connect, delayMs\)/);
     assert.match(preprodSource, /socket\.addEventListener\('error', retry\)/);
     assert.match(preprodSource, /socket\.addEventListener\('close', retry\)/);
@@ -191,6 +191,20 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.equal(preprodWebsocket.match(/--retry(?!-)/g)?.length, 1);
     assert.match(preprodWebsocket, /--connect-timeout 5/);
     assert.match(preprodWebsocket, /--max-time 20/);
+    assert.match(preprodSource, /Direct Wings websocket unavailable; using the Pterodactyl file API readiness fallback/);
+    assert.match(preprodSource, /openssl rand -hex 32/);
+    assert.match(preprodSource, /lolbot:ready \$\{readiness_challenge\}/);
+    assert.match(preprodSource, /servers\/\$\{server_identifier\}\/startup/);
+    assert.match(preprodSource, /attributes\.env_variable == "DATA_DIR"/);
+    assert.match(preprodSource, /posix\.resolve\(root, process\.env\.PTERO_DATA_DIR\)/);
+    assert.match(preprodSource, /servers\/\$\{server_identifier\}\/files\/contents/);
+    assert.match(preprodSource, /--data-urlencode "file=\$\{readiness_file\}"/);
+    assert.match(preprodSource, /if ! command_status="\$\(curl/);
+    assert.match(preprodSource, /if ! receipt_status="\$\(curl/);
+    assert.match(preprodSource, /\.challenge == \$challenge/);
+    assert.match(preprodSource, /\.buildSha == \$build/);
+    assert.match(preprodSource, /\.discordReady == true/);
+    assert.match(preprodSource, /\.expiresAtMs[\s\S]*>= \$nowMs/);
 
     const prodSource = await read('.github/workflows/prod.yml');
     assert.match(prodSource, /const initialRuntime = readRuntimeState/);
@@ -231,11 +245,22 @@ test('runtime readiness is wired to bootstrap input and Discord Ready without an
 
     assert.match(indexSource, /runtimeReadiness\.handleControlCommand\(line\.trim\(\)\)/);
     assert.match(indexSource, /createInterface\(\{ input: process\.stdin, crlfDelay: Infinity, terminal: false \}\)/);
-    assert.match(botSource, /runtimeReadiness\.setDiscordReadyProbe\(\(\) => client\.isReady\(\)\)/);
-    assert.match(botSource, /ClientReady[\s\S]*runtimeReadiness\.notifyDiscordStateChanged\(\)/);
+    assert.match(botSource, /runtimeReadiness\.setDiscordReadyProbe\(\(\) => discordRuntimeReady\)/);
+    assert.match(botSource, /markDiscordRuntimeUnavailable[\s\S]*discordRuntimeReady = false/);
+    assert.match(botSource, /client\.ws\.shards\.every\(\(shard\) => shard\.status === Status\.Ready\)/);
+    assert.doesNotMatch(botSource, /setDiscordReadyProbe\(\(\) => client\.isReady\(\)\)/);
+    assert.match(botSource, /ClientReady[\s\S]*initialDiscordReadyObserved = true;[\s\S]*refreshDiscordRuntimeReady\(\)/);
+    assert.match(botSource, /client\.on\(Events\.ShardDisconnect, markDiscordRuntimeUnavailable\)/);
+    assert.match(botSource, /client\.on\(Events\.ShardResume, refreshDiscordRuntimeReady\)/);
     assert.match(readinessSource, /\^lolbot:ready \(\[0-9a-f\]\{64\}\)\$/);
     assert.match(readinessSource, /BUILD_SHA_PATTERN\.test\(candidate\)/);
     assert.match(readinessSource, /discordReady=true/);
+    assert.match(readinessSource, /runtime-readiness\.json/);
+    assert.match(readinessSource, /writeFileSync\(temporaryPath/);
+    assert.match(readinessSource, /renameSync\(temporaryPath, targetPath\)/);
+    assert.match(readinessSource, /mode: 0o600/);
+    assert.match(readinessSource, /expiresAtMs: generatedAt\.getTime\(\) \+ RECEIPT_TTL_MS/);
+    assert.match(readinessSource, /clearRuntimeReadinessReceipt/);
     assert.doesNotMatch(indexSource + botSource + readinessSource, /ATTESTATION_SECRET|createHmac/);
 });
 

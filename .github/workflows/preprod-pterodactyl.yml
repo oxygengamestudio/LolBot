@@ -232,7 +232,8 @@ jobs:
           test "$restart_observed" = "true"
 
           websocket_json="$(mktemp)"
-          curl --silent --show-error --fail-with-body \
+          websocket_available=true
+          if ! curl --silent --show-error --fail-with-body \
             --retry 4 \
             --retry-all-errors \
             --retry-delay 2 \
@@ -241,11 +242,15 @@ jobs:
             "${api_base}/servers/${server_identifier}/websocket" \
             --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
             --header "Accept: Application/vnd.pterodactyl.v1+json" \
-            --output "$websocket_json"
+            --output "$websocket_json"; then
+            websocket_available=false
+            echo "Pterodactyl websocket credentials temporarily unavailable; using the file API fallback."
+          fi
 
-          export PTERO_WS_URL="$(jq -r '.data.socket' "$websocket_json")"
-          export PTERO_WS_TOKEN="$(jq -r '.data.token' "$websocket_json")"
-          node --input-type=module <<'NODE'
+          if [ "$websocket_available" = "true" ]; then
+            export PTERO_WS_URL="$(jq -r '.data.socket' "$websocket_json")"
+            export PTERO_WS_TOKEN="$(jq -r '.data.token' "$websocket_json")"
+            if node --input-type=module <<'NODE'
           import { randomBytes } from 'node:crypto';
 
           const url = process.env.PTERO_WS_URL;
@@ -271,7 +276,7 @@ jobs:
           };
 
           await new Promise((resolve, reject) => {
-            const maxConnectionAttempts = 8;
+            const maxConnectionAttempts = 2;
             let connectionAttempt = 0;
             let currentSocket;
             let currentChallengeTimer;
@@ -313,7 +318,7 @@ jobs:
               const socket = new WebSocket(url);
               currentSocket = socket;
               let terminal = false;
-              const attemptTimeout = setTimeout(() => retry(), 15_000);
+              const attemptTimeout = setTimeout(() => retry(), 10_000);
 
               const retry = () => {
                 if (terminal || settled) return;
@@ -386,3 +391,107 @@ jobs:
           });
           console.log(`Pterodactyl running and Discord Ready confirmed for build ${expectedBuildSha}.`);
           NODE
+            then
+              exit 0
+            fi
+          fi
+
+          echo "Direct Wings websocket unavailable; using the Pterodactyl file API readiness fallback."
+          startup_body="$(mktemp)"
+          curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
+            "${api_base}/servers/${server_identifier}/startup" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --output "$startup_body"
+          export PTERO_DATA_DIR="$(jq -er '
+            .data[]
+            | select(.attributes.env_variable == "DATA_DIR")
+            | ((.attributes.server_value | select(type == "string" and length > 0))
+              // .attributes.default_value)
+            | select(type == "string" and length > 0)
+          ' "$startup_body" | head -n 1)"
+          readiness_file="$(node --input-type=module -e '
+            import { posix } from "node:path";
+            const root = "/home/container";
+            const resolved = posix.resolve(root, process.env.PTERO_DATA_DIR);
+            if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+              throw new Error("DATA_DIR must stay under /home/container for Pterodactyl readiness");
+            }
+            const relative = posix.relative(root, resolved);
+            process.stdout.write(`/${relative ? `${relative}/` : ""}runtime-readiness.json`);
+          ')"
+          readiness_challenge="$(openssl rand -hex 32)"
+          [[ "$readiness_challenge" =~ ^[0-9a-f]{64}$ ]]
+          normalized_build_sha="${EXPECTED_BUILD_SHA,,}"
+          [[ "$normalized_build_sha" =~ ^[0-9a-f]{40}$ ]]
+          readiness_command="$(jq -cn --arg command "lolbot:ready ${readiness_challenge}" '{command: $command}')"
+          readiness_confirmed=false
+
+          for attempt in $(seq 1 30); do
+            command_body="$(mktemp)"
+            if ! command_status="$(curl --silent --show-error \
+              --request POST \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "${api_base}/servers/${server_identifier}/command" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --header "Content-Type: application/json" \
+              --data "$readiness_command" \
+              --output "$command_body" \
+              --write-out "%{http_code}")"; then
+              echo "Readiness command network error (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
+
+            if [ "$command_status" != "204" ]; then
+              echo "Readiness command temporarily unavailable with HTTP ${command_status} (attempt ${attempt}/30)."
+              sleep 4
+              continue
+            fi
+
+            receipt_body="$(mktemp)"
+            if ! receipt_status="$(curl --silent --show-error \
+              --get \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "${api_base}/servers/${server_identifier}/files/contents" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --data-urlencode "file=${readiness_file}" \
+              --output "$receipt_body" \
+              --write-out "%{http_code}")"; then
+              echo "Readiness receipt network error (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
+
+            now_ms="$(($(date +%s) * 1000))"
+
+            if [ "$receipt_status" = "200" ] && jq -e \
+              --arg challenge "$readiness_challenge" \
+              --arg build "$normalized_build_sha" \
+              --argjson nowMs "$now_ms" \
+              '(.schemaVersion == 1)
+                and (.challenge == $challenge)
+                and (.buildSha == $build)
+                and (.discordReady == true)
+                and (.generatedAt | type == "string")
+                and (.expiresAtMs | type == "number" and . >= $nowMs)' \
+              "$receipt_body" >/dev/null; then
+              readiness_confirmed=true
+              break
+            fi
+
+            echo "Exact readiness receipt not available yet (attempt ${attempt}/30); retrying."
+            sleep 4
+          done
+
+          test "$readiness_confirmed" = "true"
+          echo "Pterodactyl running and Discord Ready confirmed for build ${EXPECTED_BUILD_SHA} through the file API fallback."
