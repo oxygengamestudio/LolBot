@@ -43,6 +43,7 @@ import { logger } from './utils/Logger.js';
 import { runtimeReadiness } from './runtimeReadiness.js';
 import { acquireProcessLock } from './utils/processLock.js';
 import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
+import { loginDiscordWithRetry } from './utils/discordLogin.js';
 import { resolveLocale, t } from './utils/i18n.js';
 import { safeContent } from './utils/text.js';
 import fs from 'fs';
@@ -1176,7 +1177,17 @@ log.info('Dependances requises: FFmpeg (https://ffmpeg.org/) et yt-dlp (https://
 
 // Connexion du bot
 log.info('Démarrage du bot...');
-void client.login(config.discord.token).catch((error) => {
+void loginDiscordWithRetry(
+    () => client.login(config.discord.token),
+    {
+        onRetry: ({ attempt, nextAttempt, maxAttempts, delayMs, code }) => {
+            log.warn(
+                `Connexion Discord temporairement indisponible (${code ?? 'erreur réseau'}, tentative ${attempt}/${maxAttempts}); `
+                + `nouvel essai ${nextAttempt}/${maxAttempts} dans ${delayMs}ms.`
+            );
+        },
+    }
+).catch((error) => {
     log.error('Connexion Discord impossible:', error);
     void gracefulShutdown('loginFailed', 1);
 });
