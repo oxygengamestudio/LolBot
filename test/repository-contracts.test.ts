@@ -6,6 +6,35 @@ async function read(path: string): Promise<string> {
     return readFile(new URL(`../${path}`, import.meta.url), 'utf8');
 }
 
+function assertRuntimeImageContract(source: string): void {
+    assert.match(source, /ARG NODE_BASE=node:24\.18\.0-alpine3\.24@sha256:[0-9a-f]{64}/);
+    assert.deepEqual(source.match(/^FROM .+$/gm), [
+        'FROM ${NODE_BASE} AS build',
+        'FROM ${NODE_BASE} AS runtime',
+    ]);
+    assert.match(source, /ARG YTDLP_VERSION=2026\.07\.04/);
+
+    const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
+    assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
+    assert.match(runtimeStage, /apk add --no-cache ca-certificates ffmpeg gcompat tini/);
+    assert.ok(runtimeStage.includes(
+        "amd64) asset='yt-dlp_musllinux'; checksum='f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e' ;;"
+    ));
+    assert.ok(runtimeStage.includes(
+        "arm64) asset='yt-dlp_musllinux_aarch64'; checksum='9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7' ;;"
+    ));
+    assert.ok(runtimeStage.includes(
+        '&& wget -q -O /usr/local/bin/yt-dlp \\\n'
+        + '        "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${asset}" \\\n'
+        + '    && echo "${checksum}  /usr/local/bin/yt-dlp" | sha256sum -c - \\\n'
+        + '    && chmod 0755 /usr/local/bin/yt-dlp'
+    ), 'le binaire téléchargé doit être vérifié avec le checksum sélectionné avant chmod');
+    assert.doesNotMatch(runtimeStage, /(?:^|\n)\s*&&\s*(?::|true)\b|\|\|\s*(?::|true)\b/);
+    assert.match(runtimeStage, /rm -rf \/usr\/local\/lib\/node_modules\/npm \/usr\/local\/lib\/node_modules\/corepack/);
+    assert.match(runtimeStage, /\/opt\/yarn-v\*/);
+    assert.doesNotMatch(runtimeStage, /apt-get|DEBIAN_FRONTEND|python3|pip install/);
+}
+
 test('deployment workflows cannot skip the shared quality gate', async () => {
     const expectedRefs = new Map([
         ['preprod-pterodactyl.yml', 'refs/heads/pre-prod'],
@@ -70,18 +99,18 @@ test('third-party GitHub actions are pinned to immutable commit SHAs', async () 
 
 test('the runtime image pins its base and excludes vulnerable build tooling', async () => {
     const source = await read('Dockerfile');
+    assertRuntimeImageContract(source);
+});
 
-    assert.match(source, /ARG NODE_BASE=node:24-trixie-slim@sha256:[0-9a-f]{64}/);
-    assert.deepEqual(source.match(/^FROM .+$/gm), [
-        'FROM ${NODE_BASE} AS build',
-        'FROM ${NODE_BASE} AS runtime',
-    ]);
-    assert.match(source, /ARG YTDLP_VERSION=2026\.07\.04/);
-    const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
-    assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
-    assert.match(runtimeStage, /pip uninstall --yes setuptools/);
-    assert.match(runtimeStage, /pip uninstall --yes pip/);
-    assert.match(runtimeStage, /rm -rf \/usr\/local\/lib\/node_modules\/npm \/usr\/local\/bin\/npm \/usr\/local\/bin\/npx/);
+test('the runtime image contract rejects a disabled yt-dlp checksum pipeline', async () => {
+    const source = await read('Dockerfile');
+    const disabledVerification = source.replace(
+        '    && echo "${checksum}  /usr/local/bin/yt-dlp" | sha256sum -c - \\\n',
+        '    && : "sha256sum -c -" \\\n',
+    );
+
+    assert.notEqual(disabledVerification, source, 'la mutation de contrôle doit être appliquée');
+    assert.throws(() => assertRuntimeImageContract(disabledVerification));
 });
 
 test('deployment readiness is bound to the exact GitHub build before Discord Ready', async () => {

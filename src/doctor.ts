@@ -89,6 +89,8 @@ export function collectDoctorChecks(dependencies: DoctorDependencies = {}): Doct
         commandCheck('yt-dlp', 'yt-dlp', ['--version'], runCommand),
         moduleCheck('opus-native', '@discordjs/opus', loadModule),
         moduleCheck('opus-fallback', 'opusscript', loadModule),
+        moduleCheck('dave-native', '@snazzah/davey', loadModule),
+        moduleCheck('voice-crypto', 'sodium-native', loadModule),
     ];
 }
 
@@ -101,7 +103,13 @@ export function formatDoctorReport(checks: DoctorCheck[]): string {
 export function runDoctor(dependencies: DoctorDependencies = {}): number {
     const checks = collectDoctorChecks(dependencies);
     console.log(formatDoctorReport(checks));
-    const requiredChecks = checks.filter((check) => ['node', 'ffmpeg', 'yt-dlp'].includes(check.name));
+    const requiredChecks = checks.filter((check) => [
+        'node',
+        'ffmpeg',
+        'yt-dlp',
+        'dave-native',
+        'voice-crypto',
+    ].includes(check.name));
     const hasOpusEncoder = checks.some(
         (check) => (check.name === 'opus-native' || check.name === 'opus-fallback') && check.ok
     );

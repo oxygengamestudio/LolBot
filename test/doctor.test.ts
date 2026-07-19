@@ -16,7 +16,7 @@ test('doctor accepts the supported runtime and both Opus encoders', () => {
         loadModule: () => ({}),
     });
 
-    assert.equal(checks.length, 5);
+    assert.equal(checks.length, 7);
     assert.ok(checks.every((check) => check.ok));
     assert.match(formatDoctorReport(checks), /OK opus-native/);
     assert.equal(runDoctor({
@@ -41,6 +41,8 @@ test('doctor fails when a required binary is unavailable but accepts the Opus fa
     assert.equal(checks.find((check) => check.name === 'yt-dlp')?.ok, false);
     assert.equal(checks.find((check) => check.name === 'opus-native')?.ok, false);
     assert.equal(checks.find((check) => check.name === 'opus-fallback')?.ok, true);
+    assert.equal(checks.find((check) => check.name === 'dave-native')?.ok, true);
+    assert.equal(checks.find((check) => check.name === 'voice-crypto')?.ok, true);
     assert.equal(runDoctor({
         nodeVersion: '22.12.0',
         runCommand: successfulCommands,
@@ -50,6 +52,19 @@ test('doctor fails when a required binary is unavailable but accepts the Opus fa
         },
     }), 0);
 });
+
+for (const requiredNativeModule of ['@snazzah/davey', 'sodium-native']) {
+    test(`doctor rejects a runtime whose required native module ${requiredNativeModule} cannot load`, () => {
+        assert.equal(runDoctor({
+            nodeVersion: '24.0.0',
+            runCommand: successfulCommands,
+            loadModule: (name) => {
+                if (name === requiredNativeModule) throw new Error('missing native compatibility');
+                return {};
+            },
+        }), 1);
+    });
+}
 
 test('doctor rejects Node versions older than the package engine floor', () => {
     const checks = collectDoctorChecks({
