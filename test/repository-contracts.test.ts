@@ -153,10 +153,7 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
         const source = await read(`.github/workflows/${workflow}`);
 
         assert.match(source, /EXPECTED_BUILD_SHA:\s*\$\{\{\s*github\.sha\s*\}\}/);
-        assert.match(source, /randomBytes\(32\)\.toString\('hex'\)/);
-        assert.match(source, /event:\s*'send command'/);
-        assert.match(source, /lolbot:ready \$\{challenge\}/);
-        assert.match(source, /build=\$\{normalizedBuildSha\} discordReady=true/);
+        assert.match(source, /lolbot:ready/);
         assert.doesNotMatch(source, /ATTESTATION_SECRET|createHmac|timingSafeEqual|mac=/);
         assert.doesNotMatch(source, /expectedBuildSha\.slice\(/);
         assert.doesNotMatch(source, /line\.includes\(buildMarker\)/);
@@ -165,6 +162,10 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     }
 
     const preprodSource = await read('.github/workflows/preprod-pterodactyl.yml');
+    assert.match(preprodSource, /randomBytes\(32\)\.toString\('hex'\)/);
+    assert.match(preprodSource, /event:\s*'send command'/);
+    assert.match(preprodSource, /lolbot:ready \$\{challenge\}/);
+    assert.match(preprodSource, /build=\$\{normalizedBuildSha\} discordReady=true/);
     assert.match(preprodSource, /isExpectedReadiness\(plainLine\)/);
     assert.match(preprodSource, /Pterodactyl resources temporarily unavailable/);
     assert.match(preprodSource, /--connect-timeout 5/);
@@ -229,34 +230,33 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.doesNotMatch(preprodSource, /cat\s+"?\$receipt_body"?/);
 
     const prodSource = await read('.github/workflows/prod.yml');
-    assert.match(prodSource, /const initialRuntime = readRuntimeState/);
-    assert.match(prodSource, /restartBoundaryObserved/);
-    assert.match(prodSource, /uptime < initialRuntime\.uptime/);
-    assert.match(prodSource, /initialRuntime\.state === 'offline' && state === 'running'/);
-    assert.match(prodSource, /async function request\(path, init = \{\}, retries = 0\)/);
-    assert.match(prodSource, /request\('\/resources', \{\}, 3\)/);
-    assert.match(prodSource, /request\('\/websocket', \{\}, 3\)/);
-    assert.match(prodSource, /readRuntimeState\(await request\('\/resources', \{\}, 0\)\)/);
-    assert.match(prodSource, /Pterodactyl resource poll temporarily unavailable/);
-    assert.match(prodSource, /if \(attempt >= retries\) throw error/);
-    assert.match(prodSource, /AbortSignal\.timeout\(15_000\)/);
-    assert.match(prodSource, /setTimeout\([^]*?, 180_000\)/);
+    assert.match(prodSource, /openssl rand -hex 32/);
+    assert.match(prodSource, /lolbot:ready \$\{readiness_challenge\}/);
+    assert.match(prodSource, /if \[ "\$before_state" = "offline" \]; then\s+restart_observed=true/);
+    assert.match(prodSource, /if \[ "\$state" != "running" \] \|\| \[ "\$uptime" -lt "\$before_uptime" \]; then/);
     const prodPowerRequest = prodSource.slice(
-        prodSource.indexOf("void request('/power'"),
-        prodSource.indexOf(".catch(fail);", prodSource.indexOf("void request('/power'"))
+        prodSource.indexOf('status_code="$(curl'),
+        prodSource.indexOf('if [ "$status_code" = "204" ]')
     );
     assert.ok(prodPowerRequest.length > 0, 'la requête de redémarrage prod doit rester identifiable');
-    assert.match(prodPowerRequest, /\}, 0\)\.then\(\(\) => \{/);
-    const maybeComplete = prodSource.slice(
-        prodSource.indexOf('const maybeComplete = () => {'),
-        prodSource.indexOf('const observeRuntime =', prodSource.indexOf('const maybeComplete = () => {'))
+    assert.doesNotMatch(prodPowerRequest, /--retry(?:-|\s)/);
+    assert.match(prodPowerRequest, /--connect-timeout 5/);
+    assert.match(prodPowerRequest, /--max-time 10/);
+    const prodResourcePoll = prodSource.slice(
+        prodSource.indexOf('for attempt in $(seq 1 30); do'),
+        prodSource.indexOf('startup_body="$(mktemp)"')
     );
-    assert.match(
-        maybeComplete,
-        /!restartAccepted \|\| !restartBoundaryObserved \|\| currentState !== 'running'/
-    );
-    assert.match(maybeComplete, /if \(readinessObserved\) \{\s+succeed\(\);\s+return/);
-    assert.match(prodSource, /isExpectedReadiness\(plainLine\)/);
+    assert.doesNotMatch(prodResourcePoll, /--retry(?:-|\s)/);
+    assert.match(prodSource, /servers\/\$\{server_identifier\}\/startup/);
+    assert.match(prodSource, /posix\.resolve\(root, process\.env\.PTERO_DATA_DIR\)/);
+    assert.match(prodSource, /servers\/\$\{server_identifier\}\/files\/contents/);
+    assert.match(prodSource, /\.challenge == \$challenge/);
+    assert.match(prodSource, /\.buildSha == \$build/);
+    assert.match(prodSource, /\.discordReady == true/);
+    assert.match(prodSource, /\.expiresAtMs[\s\S]*>= \$nowMs/);
+    assert.match(prodSource, /Pterodactyl production running and Discord Ready confirmed/);
+    assert.doesNotMatch(prodSource, /new WebSocket|\/websocket/);
+    assert.doesNotMatch(prodSource, /cat\s+"?\$receipt_body"?/);
     assert.doesNotMatch(prodSource, /PTERO_PROD_SERVER_ID is not set\. Skipping/);
 });
 
