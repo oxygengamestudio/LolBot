@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
+    "audit:high": "node scripts/audit-high.mjs",
     "build": "tsc",
     "doctor": "node dist/doctor.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -31,6 +32,7 @@
     "typescript": "^6.0.3"
   },
   "overrides": {
+    "brace-expansion": "1.1.18",
     "lodash": "^4.17.23",
     "tar": "^7.5.20",
     "undici": "^6.27.0",

@@ -16,7 +16,7 @@ import { logger } from '../utils/Logger.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
 import type { GuildQueue } from '../types/index.js';
 import { safeContent } from '../utils/text.js';
-import { ensureCanUseBot, ensureSameVoiceChannel } from '../utils/commandHelpers.js';
+import { ensureCanUseBot, ensureSameVoiceChannel, replyEphemeral } from '../utils/commandHelpers.js';
 
 const log = logger.createModuleLogger('NowPlaying');
 
@@ -25,6 +25,7 @@ class NowPlayingManager {
     private pendingUpdates: Map<string, GuildQueue> = new Map();
     private retryTimers: Map<string, NodeJS.Timeout> = new Map();
     private retryAttempts: Map<string, number> = new Map();
+    private nowPlayingDeletes: Map<string, Promise<void>> = new Map();
     private updatesInFlight = 0;
     private readonly maxConcurrentUpdates = 2;
     private readonly maxRetryAttempts = 5;
@@ -45,7 +46,10 @@ class NowPlayingManager {
         queueManager.on('trackPaused', (queue: GuildQueue) => this.scheduleUpdate(queue));
         queueManager.on('queueStopped', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueEmpty', (queue: GuildQueue) => this.deleteNowPlaying(queue));
-        queueManager.on('queueDeleted', (guildId: string) => this.stopUpdateInterval(guildId));
+        queueManager.on('queueDeleted', (guildId: string, queue?: GuildQueue) => {
+            this.stopUpdateInterval(guildId);
+            if (queue) void this.deleteNowPlaying(queue);
+        });
     }
 
     private async onTrackStart(queue: GuildQueue): Promise<void> {
@@ -131,14 +135,36 @@ class NowPlayingManager {
         log.debug('Suppression du message Now Playing');
         this.stopUpdateInterval(queue.guildId);
 
-        if (queue.nowPlayingMessage) {
+        const messageAtEntry = queue.nowPlayingMessage;
+        const pendingDelete = this.nowPlayingDeletes.get(queue.guildId);
+        if (pendingDelete) {
+            await pendingDelete;
+            if (messageAtEntry && queue.nowPlayingMessage === messageAtEntry) {
+                await this.deleteNowPlaying(queue);
+            }
+            return;
+        }
+
+        const message = messageAtEntry;
+        queue.nowPlayingMessage = null;
+        if (!message) return;
+
+        const deletion = (async () => {
             try {
-                await queue.nowPlayingMessage.delete();
+                await message.delete();
                 log.info('Message Now Playing supprime');
             } catch {
                 log.trace('Message deja supprime');
             }
-            queue.nowPlayingMessage = null;
+        })();
+        this.nowPlayingDeletes.set(queue.guildId, deletion);
+
+        try {
+            await deletion;
+        } finally {
+            if (this.nowPlayingDeletes.get(queue.guildId) === deletion) {
+                this.nowPlayingDeletes.delete(queue.guildId);
+            }
         }
     }
 
@@ -154,9 +180,13 @@ class NowPlayingManager {
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
+        const sourceLine = track.provider === 'soundcloud'
+            ? `☁️ SoundCloud${track.channelTitle ? ` · ${safeContent(track.channelTitle)}` : ''}`
+            : null;
         const info = [
             `**${statusLabel}**`,
             `### [${safeContent(track.title)}](${track.url})`,
+            sourceLine,
             progressLine,
             '',
             `**${t(locale, 'nowPlaying.field.info')}**`,
@@ -167,7 +197,7 @@ class NowPlayingManager {
             queue.isPaused
                 ? t(locale, 'nowPlaying.footer.paused')
                 : t(locale, 'nowPlaying.footer.playing'),
-        ].join('\n');
+        ].filter((line): line is string => line !== null).join('\n');
 
         const displayComponents: any[] = [
             {
@@ -433,15 +463,14 @@ class NowPlayingManager {
             return;
         }
 
+        if (interaction.customId === 'np_stop') {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        }
+
         const locale = await resolveLocale(guildId, interaction.locale);
         const queue = queueManager.getQueue(guildId);
         if (!queue) {
-            await interaction.reply({
-                content: t(locale, 'queue.noQueue'),
-                flags: MessageFlags.Ephemeral,
-                allowedMentions: { parse: [] },
-            });
-            this.deleteEphemeralAfterDelay(interaction);
+            await replyEphemeral(interaction, t(locale, 'queue.noQueue'));
             return;
         }
 
@@ -498,14 +527,13 @@ class NowPlayingManager {
                     const shouldStay = settings.stayConnected || settings.stayConnectedAlways;
                     if (shouldStay) {
                         queueManager.stop(guildId);
-                        await this.deleteNowPlaying(queue);
                     } else {
                         queueManager.deleteQueue(guildId, true);
                     }
+                    await this.deleteNowPlaying(queue);
                 }
-                await interaction.reply({
+                await interaction.editReply({
                     content: '⏹️',
-                    flags: MessageFlags.Ephemeral,
                     allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);

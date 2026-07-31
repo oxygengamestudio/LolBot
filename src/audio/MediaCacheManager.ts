@@ -601,12 +601,16 @@ export class MediaCacheManager {
 
     private async resolveStream(trackOrId: Track | string, signal?: AbortSignal): Promise<ResolvedStream | null> {
         const identity = this.normalizeIdentity(trackOrId);
-        if (identity.provider !== 'youtube') {
+        const track = typeof trackOrId === 'string' ? null : trackOrId;
+        if (identity.provider !== 'youtube' && identity.provider !== 'soundcloud') {
             log.debug(`Cache provider non pris en charge: ${identity.provider}`);
             return null;
         }
+        if (identity.provider === 'soundcloud' && !track?.canonicalUrl && !track?.url) {
+            log.debug('Cache SoundCloud ignore sans URL canonique');
+            return null;
+        }
 
-        const track = typeof trackOrId === 'string' ? null : trackOrId;
         const selectors = [
             'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             'bestaudio/best',

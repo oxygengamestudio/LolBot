@@ -563,7 +563,10 @@ export class AudioWrapper extends EventEmitter {
         }
 
         try {
-            const sponsorSegments = await this.getSponsorSegmentsFast(track.id, sponsorBlockEnabled);
+            const sponsorSegments = await this.getSponsorSegmentsFast(
+                track.id,
+                this.shouldUseSponsorBlock(track, sponsorBlockEnabled)
+            );
             this.applySponsorAdjustedDuration(track, sponsorSegments);
             const effectiveStartSeconds = this.getSponsorAdjustedStart(startSeconds, sponsorSegments);
             if (effectiveStartSeconds > startSeconds + 0.25) {
@@ -983,11 +986,18 @@ export class AudioWrapper extends EventEmitter {
             if (host.includes('googlevideo.com')) {
                 return true;
             }
+            if (host === 'sndcdn.com' || host.endsWith('.sndcdn.com')) {
+                return true;
+            }
 
             return parsed.pathname.includes('.m4a') || parsed.pathname.includes('.webm');
         } catch {
             return false;
         }
+    }
+
+    private shouldUseSponsorBlock(track: Track, enabled: boolean): boolean {
+        return enabled && (!track.provider || track.provider === 'youtube');
     }
 
     private async waitForProcessStreamReady(

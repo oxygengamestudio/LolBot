@@ -167,13 +167,9 @@ class QueueManager extends EventEmitter {
                     log.trace('Connexion déjà détruite');
                 }
             }
-            if (queue.nowPlayingMessage) {
-                log.trace('Suppression du message Now Playing');
-                queue.nowPlayingMessage.delete().catch(() => {});
-            }
             this.clearLyrics(queue);
             this.queues.delete(guildId);
-            this.emit('queueDeleted', guildId);
+            this.emit('queueDeleted', guildId, queue);
             log.info(`Queue supprimée pour guild: ${guildId}`);
             this.intentionalConnectionDestroy.delete(guildId);
             this.lastTrackEndEvent.delete(guildId);

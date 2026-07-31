@@ -1,10 +1,8 @@
 import { config } from '../config.js';
 import type { PlaylistInfo, SearchResult, Track, YouTubeVideoInfo } from '../types/index.js';
 import { httpRequest } from '../utils/httpClient.js';
-import { spawn } from 'child_process';
-import { existsSync } from 'fs';
-import { join } from 'path';
 import type { MediaProvider, MediaSearchContext } from './providers/MediaProvider.js';
+import { ytdlpRunner } from './providers/YtdlpRunner.js';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const OFFICIAL_KEYWORDS = [
@@ -171,7 +169,9 @@ export class YouTubeService implements MediaProvider {
     private readonly dataApiCooldownMs = 5 * 60 * 1000;
     private dataApiConsecutiveFailures = 0;
     private dataApiUnavailableUntil = 0;
-    private warnedUnsafeYtdlpExtraArgsIgnored = false;
+    matchesUrl(url: string): boolean {
+        return this.isYouTubeUrl(url);
+    }
 
     async search(query: string, maxResults = 10, context?: MediaSearchContext): Promise<SearchResult[]> {
         const ranked = await this.searchWithRanking(query, maxResults, context);
@@ -359,7 +359,7 @@ export class YouTubeService implements MediaProvider {
             },
             signal,
         });
-        const html = typeof response.body === 'string' ? response.body : response.body.toString('utf8');
+        const html = response.body;
         const initialData = this.extractYtInitialData(html);
         if (!initialData) {
             return [];
@@ -1306,182 +1306,8 @@ export class YouTubeService implements MediaProvider {
         return this.shortsMarkerPattern.test(this.normalizeSearchText(text));
     }
 
-    private getYtdlpPath(): string {
-        const envYtdlp = process.env.YTDLP_PATH;
-        if (envYtdlp) {
-            return envYtdlp;
-        }
-
-        const localYtdlpPath = join(config.paths.data, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-        return existsSync(localYtdlpPath) ? localYtdlpPath : 'yt-dlp';
-    }
-
     private runYtdlpJson(args: string[], signal?: AbortSignal): Promise<any> {
-        return this.runYtdlpText(args, signal).then((payload) => {
-            const trimmed = payload.trim();
-            if (!trimmed) {
-                throw new Error('yt-dlp returned no JSON payload');
-            }
-
-            try {
-                return JSON.parse(trimmed);
-            } catch {
-                throw new Error('yt-dlp returned invalid JSON');
-            }
-        });
-    }
-
-    private runYtdlpText(args: string[], signal?: AbortSignal): Promise<string> {
-        return new Promise((resolve, reject) => {
-            if (signal?.aborted) {
-                reject(createAbortError());
-                return;
-            }
-
-            const ytdlp = spawn(this.getYtdlpPath(), [...this.getYtdlpRuntimeArgs(), ...args], {
-                stdio: ['ignore', 'pipe', 'pipe'],
-                windowsHide: true,
-            });
-
-            const timeoutMs = 20_000;
-            const killGraceMs = 2_000;
-            const maxStdoutBytes = 8 * 1024 * 1024;
-            const maxStderrBytes = 512 * 1024;
-            const stdoutChunks: Buffer[] = [];
-            const stderrChunks: Buffer[] = [];
-            let stdoutBytes = 0;
-            let stderrBytes = 0;
-            let settled = false;
-            let terminalError: Error | undefined;
-            let killTimer: NodeJS.Timeout | undefined;
-
-            const cleanup = (): void => {
-                clearTimeout(timeout);
-                if (signal) {
-                    signal.removeEventListener('abort', onAbort);
-                }
-            };
-
-            const terminate = (): void => {
-                if (ytdlp.exitCode !== null || ytdlp.killed) {
-                    return;
-                }
-                ytdlp.kill('SIGTERM');
-                killTimer = setTimeout(() => {
-                    if (ytdlp.exitCode === null) {
-                        ytdlp.kill('SIGKILL');
-                    }
-                }, killGraceMs);
-                killTimer.unref?.();
-            };
-
-            const finish = (error?: Error): void => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                cleanup();
-                if (error) {
-                    reject(error);
-                    return;
-                }
-                resolve(Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'));
-            };
-
-            const failAndTerminate = (error: Error): void => {
-                if (settled || terminalError) {
-                    return;
-                }
-                terminalError = error;
-                terminate();
-                ytdlp.stdout?.resume();
-                ytdlp.stderr?.resume();
-            };
-
-            const onAbort = (): void => {
-                failAndTerminate(createAbortError());
-            };
-
-            const timeout = setTimeout(() => {
-                failAndTerminate(new Error(`yt-dlp timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-            timeout.unref?.();
-
-            ytdlp.stdout?.on('data', (data) => {
-                if (settled || terminalError) {
-                    return;
-                }
-                const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
-                stdoutBytes += chunk.length;
-                if (stdoutBytes > maxStdoutBytes) {
-                    failAndTerminate(new Error(`yt-dlp stdout exceeded ${maxStdoutBytes} bytes`));
-                    return;
-                }
-                stdoutChunks.push(chunk);
-            });
-
-            ytdlp.stderr?.on('data', (data) => {
-                if (settled || terminalError) {
-                    return;
-                }
-                const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
-                stderrBytes += chunk.length;
-                if (stderrBytes > maxStderrBytes) {
-                    failAndTerminate(new Error(`yt-dlp stderr exceeded ${maxStderrBytes} bytes`));
-                    return;
-                }
-                stderrChunks.push(chunk);
-            });
-
-            signal?.addEventListener('abort', onAbort, { once: true });
-
-            ytdlp.once('error', (error) => {
-                if (ytdlp.pid === undefined) finish(error);
-                else failAndTerminate(error);
-            });
-            ytdlp.on('close', (code) => {
-                if (killTimer) {
-                    clearTimeout(killTimer);
-                }
-                if (settled) {
-                    return;
-                }
-                if (terminalError) {
-                    finish(terminalError);
-                    return;
-                }
-                if (code !== 0) {
-                    const stderr = Buffer.concat(stderrChunks, stderrBytes).toString('utf8');
-                    finish(new Error(`yt-dlp exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
-                    return;
-                }
-
-                finish();
-            });
-        });
-    }
-
-    private getYtdlpRuntimeArgs(): string[] {
-        const args: string[] = [];
-        if (process.env.YTDLP_COOKIES_FROM_BROWSER) {
-            args.push('--cookies-from-browser', process.env.YTDLP_COOKIES_FROM_BROWSER);
-        } else if (process.env.YTDLP_COOKIES) {
-            args.push('--cookies', process.env.YTDLP_COOKIES);
-        }
-
-        const raw = process.env.YTDLP_EXTRA_ARGS?.trim();
-        if (!raw) return args;
-        if (!config.audio.allowUnsafeYtdlpExtraArgs) {
-            if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
-                this.warnedUnsafeYtdlpExtraArgsIgnored = true;
-                console.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only in a trusted environment.');
-            }
-            return args;
-        }
-
-        const matches = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-        args.push(...matches.map((arg) => arg.replace(/^['"]|['"]$/g, '')));
-        return args;
+        return ytdlpRunner.runJson(args, signal);
     }
 
     private normalizeVideoId(value: unknown): string | null {

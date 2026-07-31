@@ -476,7 +476,7 @@ queueManager.on('trackFailed', (queue, track, code) => {
     void (async () => {
         const locale = await resolveLocale(queue.guildId);
         await queue.textChannel.send({
-            content: `❌ ${t(locale, 'play.videoLoadFailed')} — **${safeContent(track.title)}** (${code})`,
+            content: `❌ ${t(locale, 'play.mediaLoadFailed')} — **${safeContent(track.title)}** (${code})`,
             allowedMentions: { parse: [] },
         });
     })().catch((error) => {

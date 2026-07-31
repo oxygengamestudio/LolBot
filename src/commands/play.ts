@@ -14,6 +14,7 @@
     VoiceChannel,
 } from 'discord.js';
 import { youtubeService } from '../services/YouTubeService.js';
+import { soundCloudService } from '../services/SoundCloudService.js';
 import { queueManager } from '../services/QueueManager.js';
 import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
@@ -36,6 +37,7 @@ const PLAY_PLAYLIST_PREFIX = 'play_playlist';
 
 type AutocompleteOption = { name: string; value: string };
 type PlayInteraction = ChatInputCommandInteraction | StringSelectMenuInteraction | ButtonInteraction;
+export type PlayInputKind = 'youtube' | 'soundcloud' | 'unsupported-soundcloud' | 'unsupported-url' | 'search';
 type AutocompleteState = {
     lastApiCallAt: number;
     lastQuery: string;
@@ -72,14 +74,14 @@ const pendingPlaylistChoices = new Map<string, PendingPlaylistChoice>();
 
 export const data = new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a track from YouTube')
-    .setDescriptionLocalizations(commandDescriptionLocalizations('Joue une musique depuis YouTube', 'Play a track from YouTube'))
+    .setDescription('Play from YouTube or SoundCloud')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Joue une piste YouTube ou SoundCloud', 'Play from YouTube or SoundCloud'))
     .setDMPermission(false)
     .addStringOption(option =>
         option
             .setName('query')
-            .setDescription('YouTube URL or search terms')
-            .setDescriptionLocalizations(commandDescriptionLocalizations('URL YouTube ou termes de recherche', 'YouTube URL or search terms'))
+            .setDescription('YouTube/SoundCloud URL or YouTube search terms')
+            .setDescriptionLocalizations(commandDescriptionLocalizations('URL YouTube/SoundCloud ou recherche YouTube', 'YouTube/SoundCloud URL or YouTube search terms'))
             .setRequired(true)
             .setAutocomplete(true)
     );
@@ -179,12 +181,25 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
 
     try {
-        if (youtubeService.isYouTubeUrl(query)) {
-            log.debug('Detecte comme URL YouTube');
-            await handleYouTubeUrl(interaction, query, member, targetChannel, textChannel, locale);
-        } else {
-            log.debug('Detecte comme recherche (auto)');
-            await handleSearchAuto(interaction, query, member, targetChannel, textChannel, locale);
+        switch (classifyPlayInput(query)) {
+            case 'youtube':
+                log.debug('Detecte comme URL YouTube');
+                await handleYouTubeUrl(interaction, query, member, targetChannel, textChannel, locale);
+                break;
+            case 'soundcloud':
+                log.debug('Detecte comme URL SoundCloud');
+                await handleSoundCloudUrl(interaction, query, member, targetChannel, textChannel, locale);
+                break;
+            case 'unsupported-soundcloud':
+                await rejectPlayInput(interaction, locale, 'play.soundcloudTrackOnly');
+                break;
+            case 'unsupported-url':
+                await rejectPlayInput(interaction, locale, 'play.unsupportedUrl');
+                break;
+            case 'search':
+                log.debug('Detecte comme recherche YouTube (auto)');
+                await handleSearchAuto(interaction, query, member, targetChannel, textChannel, locale);
+                break;
         }
     } catch (error) {
         log.error('Erreur:', error);
@@ -194,6 +209,42 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         });
         deleteEphemeralAfterDelay(interaction);
     }
+}
+
+export function classifyPlayInput(query: string): PlayInputKind {
+    const normalized = query.trim();
+    if (youtubeService.isYouTubeUrl(normalized)) return 'youtube';
+
+    const soundCloudKind = soundCloudService.classifyUrl(normalized);
+    if (soundCloudKind === 'track' || soundCloudKind === 'short') return 'soundcloud';
+    if (soundCloudKind === 'unsupported') return 'unsupported-soundcloud';
+
+    try {
+        new URL(normalized);
+        return 'unsupported-url';
+    } catch {
+        if (looksLikeWebUrl(normalized)) return 'unsupported-url';
+    }
+    return 'search';
+}
+
+function looksLikeWebUrl(value: string): boolean {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return true;
+    if (/^www\.[^\s/]+(?:\/|$)/i.test(value)) return true;
+    return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?\//i.test(value);
+}
+
+async function rejectPlayInput(
+    interaction: ChatInputCommandInteraction,
+    locale: 'en' | 'fr',
+    key: string
+): Promise<void> {
+    await interaction.editReply({
+        content: t(locale, key),
+        components: [],
+        allowedMentions: { parse: [] },
+    });
+    deleteEphemeralAfterDelay(interaction);
 }
 
 export async function handleSelection(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -533,7 +584,7 @@ async function addPlaylistToQueue(
         if (startResult.status !== 'started') {
             log.warn(`Impossible de demarrer la playlist: ${startResult.status === 'failed' ? startResult.code : startResult.status}`);
             await interaction.editReply({
-                content: t(locale, 'play.videoLoadFailed'),
+                content: t(locale, 'play.mediaLoadFailed'),
                 components: [],
                 allowedMentions: { parse: [] },
             });
@@ -572,7 +623,7 @@ async function addVideoUrlToQueue(
     if (!track) {
         log.error('Impossible de charger la video');
         await interaction.editReply({
-            content: t(locale, 'play.videoLoadFailed'),
+            content: t(locale, 'play.mediaLoadFailed'),
             components: [],
             allowedMentions: { parse: [] },
         });
@@ -581,6 +632,36 @@ async function addVideoUrlToQueue(
     }
 
     log.info(`Track cree: ${track.title}`);
+    await addTrackToQueue(interaction, track, voiceChannel, textChannel, locale);
+}
+
+async function handleSoundCloudUrl(
+    interaction: ChatInputCommandInteraction,
+    url: string,
+    member: GuildMember,
+    voiceChannel: VoiceChannel | StageChannel,
+    textChannel: TextChannel,
+    locale: 'en' | 'fr'
+): Promise<void> {
+    const track = await soundCloudService.createTrackFromUrl(
+        url,
+        member.displayName,
+        member.id,
+        { scopeKey: interaction.guildId! }
+    );
+
+    if (!track) {
+        log.warn('Impossible de charger la piste SoundCloud');
+        await interaction.editReply({
+            content: t(locale, 'play.mediaLoadFailed'),
+            components: [],
+            allowedMentions: { parse: [] },
+        });
+        deleteEphemeralAfterDelay(interaction);
+        return;
+    }
+
+    log.info(`Piste SoundCloud creee: ${track.title}`);
     await addTrackToQueue(interaction, track, voiceChannel, textChannel, locale);
 }
 
@@ -699,7 +780,7 @@ async function addTrackToQueue(
         if (startResult.status !== 'started') {
             log.warn(`Impossible de demarrer la piste: ${startResult.status === 'failed' ? startResult.code : startResult.status}`);
             await interaction.editReply({
-                content: t(locale, 'play.videoLoadFailed'),
+                content: t(locale, 'play.mediaLoadFailed'),
                 components: [],
                 allowedMentions: { parse: [] },
             });
@@ -757,7 +838,14 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
         return;
     }
 
-    if (query.length < 2 && !youtubeService.isYouTubeUrl(query)) {
+    const inputKind = classifyPlayInput(query);
+    if (inputKind !== 'search') {
+        cancelAutocomplete(key);
+        await safeAutocompleteRespond(interaction, [], true);
+        return;
+    }
+
+    if (query.length < 2) {
         cancelAutocomplete(key);
         await safeAutocompleteRespond(interaction, [
             {
@@ -765,11 +853,6 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
                 value: AUTOCOMPLETE_HINT_REFINE,
             },
         ]);
-        return;
-    }
-
-    if (youtubeService.isYouTubeUrl(query)) {
-        cancelAutocomplete(key);
         return;
     }
 

@@ -7,17 +7,21 @@ export interface MediaSearchContext {
     signal?: AbortSignal;
 }
 
-export interface MediaProvider {
+export interface UrlMediaProvider {
     readonly provider: string;
 
-    search(query: string, maxResults?: number, context?: MediaSearchContext): Promise<SearchResult[]>;
-    createTrackFromSearch(result: SearchResult, requestedBy: string, requestedById: string): Promise<Track>;
+    matchesUrl(url: string): boolean;
     createTrackFromUrl(
         url: string,
         requestedBy: string,
         requestedById: string,
         context?: MediaSearchContext
     ): Promise<Track | null>;
+}
+
+export interface MediaProvider extends UrlMediaProvider {
+    search(query: string, maxResults?: number, context?: MediaSearchContext): Promise<SearchResult[]>;
+    createTrackFromSearch(result: SearchResult, requestedBy: string, requestedById: string): Promise<Track>;
     getPlaylistTracks(
         playlistId: string,
         requestedBy: string,

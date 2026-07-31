@@ -119,3 +119,22 @@ test('warmups are globally bounded and stale guild work is cancelled before publ
     await cancelled;
     assert.equal(wrapper.isTrackWarm('guild-leave', 'leave'), false);
 });
+
+test('SoundCloud direct streams are trusted only on sndcdn and never use SponsorBlock', () => {
+    const soundCloudTrack: Track = {
+        ...track('soundcloud:2011421339'),
+        provider: 'soundcloud',
+        sourceId: '2011421339',
+        canonicalUrl: 'https://soundcloud.com/skorxh/audio-dealer',
+        url: 'https://soundcloud.com/skorxh/audio-dealer',
+    };
+
+    assert.equal(wrapper.isLikelyDirectStreamUrl('https://cf-media.sndcdn.com/example.128.mp3'), true);
+    assert.equal(wrapper.isLikelyDirectStreamUrl('https://cf-hls-media.sndcdn.com/media/playlist.m3u8'), true);
+    assert.equal(wrapper.isLikelyDirectStreamUrl('https://sndcdn.com/audio'), true);
+    assert.equal(wrapper.isLikelyDirectStreamUrl('https://evil-sndcdn.com/audio.mp3'), false);
+    assert.equal(wrapper.isLikelyDirectStreamUrl('https://example.com/audio.mp3'), false);
+    assert.equal(wrapper.shouldUseSponsorBlock(soundCloudTrack, true), false);
+    assert.equal(wrapper.shouldUseSponsorBlock(track('youtube-track'), true), true);
+    assert.equal(wrapper.shouldUseSponsorBlock(track('youtube-track'), false), false);
+});

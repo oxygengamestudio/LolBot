@@ -2,6 +2,8 @@
 
 Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, GitHub Actions et Pterodactyl.
 
+`/play` accepte les recherches et liens YouTube ainsi que les liens de pistes SoundCloud publiques individuelles, y compris les liens courts `on.soundcloud.com`. La recherche SoundCloud, les profils, playlists/sets et liens privés ne sont pas pris en charge. SoundCloud réutilise le binaire `yt-dlp` existant et ne nécessite aucune variable d'environnement supplémentaire.
+
 ## Requirements
 
 - Node.js >= 22.12.0

@@ -35,7 +35,7 @@ jobs:
         run: npm ci
 
       - name: Audit all locked dependencies
-        run: npm audit --audit-level=high
+        run: npm run audit:high
 
       - name: Typecheck
         run: npm run typecheck

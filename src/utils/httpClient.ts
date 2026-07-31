@@ -16,12 +16,12 @@ export interface HttpRequestOptions {
     timeoutMs?: number;
     maxRedirects?: number;
     maxBytes?: number;
-    responseType?: 'text' | 'buffer';
+    responseType?: 'text' | 'buffer' | 'none';
     decompress?: boolean;
     signal?: AbortSignal;
 }
 
-export interface HttpResponse<TBody extends string | Buffer> {
+export interface HttpResponse<TBody extends string | Buffer | null> {
     statusCode: number;
     headers: IncomingHttpHeaders;
     body: TBody;
@@ -46,9 +46,12 @@ function getDecodedStream(res: IncomingMessage): NodeJS.ReadableStream {
     return res;
 }
 
+export function httpRequest(options: HttpRequestOptions & { responseType: 'none' }): Promise<HttpResponse<null>>;
+export function httpRequest(options: HttpRequestOptions & { responseType: 'buffer' }): Promise<HttpResponse<Buffer>>;
+export function httpRequest(options: HttpRequestOptions & { responseType?: 'text' }): Promise<HttpResponse<string>>;
 export async function httpRequest(
     options: HttpRequestOptions
-): Promise<HttpResponse<string | Buffer>> {
+): Promise<HttpResponse<string | Buffer | null>> {
     const {
         url,
         method = 'GET',
@@ -85,7 +88,7 @@ async function requestInternal(
     options: Required<Omit<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>> &
         Pick<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>,
     redirectCount: number
-): Promise<HttpResponse<string | Buffer>> {
+): Promise<HttpResponse<string | Buffer | null>> {
     const {
         url,
         method = 'GET',
@@ -124,7 +127,7 @@ async function requestInternal(
         }
 
         let settled = false;
-        const finishResolve = (value: HttpResponse<string | Buffer>) => {
+        const finishResolve = (value: HttpResponse<string | Buffer | null>) => {
             if (settled) return;
             settled = true;
             signal?.removeEventListener('abort', onAbort);
@@ -178,6 +181,17 @@ async function requestInternal(
             if (statusCode < 200 || statusCode >= 300) {
                 res.resume();
                 finishReject(new Error(`HTTP ${statusCode} from ${sanitizeUrlForLogs(url)}`));
+                return;
+            }
+
+            if (responseType === 'none') {
+                res.destroy();
+                finishResolve({
+                    statusCode,
+                    headers: res.headers,
+                    body: null,
+                    finalUrl: parsed.toString(),
+                });
                 return;
             }
 

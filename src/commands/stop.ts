@@ -1,8 +1,9 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
+import { nowPlayingManager } from '../services/NowPlayingManager.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
-import { ensureCanUseBot, ensureSameVoiceChannel, ensureVoiceMembership, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
+import { deleteEphemeralAfterDelay, ensureCanUseBot, ensureSameVoiceChannel, ensureVoiceMembership, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('StopCmd');
@@ -19,6 +20,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         return;
     }
 
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const member = interaction.member as GuildMember;
     const locale = await getInteractionLocale(interaction);
 
@@ -40,11 +42,15 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     if (shouldStay) {
         log.info('Arrêt de la lecture (bot reste connecté)');
         queueManager.stop(interaction.guildId!);
-        await replyEphemeral(interaction, `⏹️ ${t(locale, 'stop.stay')}`);
+        await nowPlayingManager.deleteNowPlaying(queue);
+        await interaction.editReply({ content: `⏹️ ${t(locale, 'stop.stay')}`, allowedMentions: { parse: [] } });
+        deleteEphemeralAfterDelay(interaction);
         return;
     }
 
     log.info('Arrêt de la lecture et déconnexion');
     queueManager.deleteQueue(interaction.guildId!, true);
-    await replyEphemeral(interaction, `⏹️ ${t(locale, 'stop.leave')}`);
+    await nowPlayingManager.deleteNowPlaying(queue);
+    await interaction.editReply({ content: `⏹️ ${t(locale, 'stop.leave')}`, allowedMentions: { parse: [] } });
+    deleteEphemeralAfterDelay(interaction);
 }

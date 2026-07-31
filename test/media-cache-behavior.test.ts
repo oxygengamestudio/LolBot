@@ -32,6 +32,16 @@ function track(id: string): Track {
     };
 }
 
+function soundCloudTrack(id = '2011421339'): Track {
+    return {
+        ...track(`soundcloud:${id}`),
+        provider: 'soundcloud',
+        sourceId: id,
+        canonicalUrl: 'https://soundcloud.com/skorxh/audio-dealer',
+        url: 'https://soundcloud.com/skorxh/audio-dealer',
+    };
+}
+
 function fileName(cacheKey: string, container: 'ogg' | 'webm' = 'ogg'): string {
     return `media-${Buffer.from(cacheKey).toString('base64url')}.${container}`;
 }
@@ -248,4 +258,25 @@ test('an unlink awaiting physical confirmation is not credited to a new output',
     assert.equal(reservation, 768 * 1024);
     manager.reservedOutputBytes -= reservation;
     manager.pendingUnlinkedBytes = 0;
+});
+
+test('SoundCloud cache resolution requires a Track URL and keeps provider identity', async () => {
+    const root = join(testDataDir, 'soundcloud-provider');
+    const manager = await managerFor(root) as any;
+    const observedArgs: string[][] = [];
+    manager.runYtdlpText = async (args: string[]) => {
+        observedArgs.push(args);
+        return 'https://cf-media.sndcdn.com/example.128.mp3';
+    };
+
+    const scTrack = soundCloudTrack();
+    const resolved = await manager.resolveStream(scTrack);
+    assert.equal(resolved?.url, 'https://cf-media.sndcdn.com/example.128.mp3');
+    assert.ok(observedArgs[0].includes('https://soundcloud.com/skorxh/audio-dealer'));
+    assert.equal(manager.normalizeIdentity(scTrack).cacheKey, 'soundcloud:2011421339');
+    assert.equal(manager.normalizeIdentity(scTrack.id).cacheKey, 'soundcloud:2011421339');
+
+    observedArgs.length = 0;
+    assert.equal(await manager.resolveStream('soundcloud:2011421339'), null);
+    assert.equal(observedArgs.length, 0, 'une URL SoundCloud ne doit jamais être reconstruite depuis le seul identifiant');
 });

@@ -70,7 +70,7 @@ test('deployment workflows cannot skip the shared quality gate', async () => {
 test('the quality gate runs audit, tests, typecheck, build, and CodeQL', async () => {
     const source = await read('.github/workflows/quality.yml');
     for (const command of [
-        'npm audit --audit-level=high',
+        'npm run audit:high',
         'npm run typecheck',
         'npm run test:coverage',
         'npm run build',
@@ -81,6 +81,12 @@ test('the quality gate runs audit, tests, typecheck, build, and CodeQL', async (
     }
     assert.doesNotMatch(source, /permissions:[\s\S]{0,80}security-events:\s*write[\s\S]*jobs:/);
     assert.match(source, /codeql:[\s\S]*permissions:[\s\S]*security-events:\s*write/);
+
+    const auditGate = await read('scripts/audit-high.mjs');
+    assert.match(auditGate, /GHSA-mh99-v99m-4gvg/);
+    assert.match(auditGate, /PATCHED_BRACE_VERSION = '1\.1\.18'/);
+    assert.match(auditGate, /EXPANSION_MAX_LENGTH/);
+    assert.match(auditGate, /Blocking HIGH\/CRITICAL audit findings/);
 });
 
 test('third-party GitHub actions are pinned to immutable commit SHAs', async () => {
