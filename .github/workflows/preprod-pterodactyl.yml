@@ -432,6 +432,8 @@ jobs:
           [[ "$normalized_build_sha" =~ ^[0-9a-f]{40}$ ]]
           readiness_command="$(jq -cn --arg command "lolbot:ready ${readiness_challenge}" '{command: $command}')"
           readiness_confirmed=false
+          receipt_status="not-requested"
+          receipt_body=""
 
           for attempt in $(seq 1 30); do
             command_body="$(mktemp)"
@@ -494,5 +496,15 @@ jobs:
             sleep 4
           done
 
-          test "$readiness_confirmed" = "true"
+          if [ "$readiness_confirmed" != "true" ]; then
+            if [ "$receipt_status" = "200" ] && [ -n "$receipt_body" ] && jq -e 'type == "object"' "$receipt_body" >/dev/null 2>&1; then
+              observed_build="$(jq -r 'if ((.buildSha | type) == "string" and (.buildSha | test("^[0-9a-fA-F]{40}$"))) then (.buildSha | ascii_downcase) else "invalid-or-missing" end' "$receipt_body")"
+              observed_discord_ready="$(jq -r 'if (.discordReady | type) == "boolean" then (.discordReady | tostring) else "invalid-or-missing" end' "$receipt_body")"
+              observed_generated_at="$(jq -r 'if ((.generatedAt | type) == "string" and (.generatedAt | test("^[0-9TZ:.-]{20,32}$"))) then .generatedAt else "invalid-or-missing" end' "$receipt_body")"
+              echo "Readiness mismatch: expected build ${EXPECTED_BUILD_SHA}; observed build ${observed_build}, discordReady=${observed_discord_ready}, generatedAt=${observed_generated_at}."
+            else
+              echo "Readiness receipt unavailable after retries (HTTP ${receipt_status})."
+            fi
+            exit 1
+          fi
           echo "Pterodactyl running and Discord Ready confirmed for build ${EXPECTED_BUILD_SHA} through the file API fallback."

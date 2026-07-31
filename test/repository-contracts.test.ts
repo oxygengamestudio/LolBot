@@ -223,6 +223,10 @@ test('deployment readiness is bound to the exact GitHub build before Discord Rea
     assert.match(preprodSource, /\.buildSha == \$build/);
     assert.match(preprodSource, /\.discordReady == true/);
     assert.match(preprodSource, /\.expiresAtMs[\s\S]*>= \$nowMs/);
+    assert.match(preprodSource, /Readiness mismatch: expected build \$\{EXPECTED_BUILD_SHA\}; observed build \$\{observed_build\}/);
+    assert.match(preprodSource, /Readiness receipt unavailable after retries \(HTTP \$\{receipt_status\}\)/);
+    assert.match(preprodSource, /\.buildSha \| test\("\^\[0-9a-fA-F\]\{40\}\$"\)/);
+    assert.doesNotMatch(preprodSource, /cat\s+"?\$receipt_body"?/);
 
     const prodSource = await read('.github/workflows/prod.yml');
     assert.match(prodSource, /const initialRuntime = readRuntimeState/);
