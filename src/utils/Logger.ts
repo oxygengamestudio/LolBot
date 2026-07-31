@@ -1,5 +1,3 @@
-import { config } from '../config.js';
-
 export enum LogLevel {
     NONE = 0,
     ERROR = 1,
@@ -20,6 +18,17 @@ const LOG_COLORS: Record<LogLevel, string> = {
 
 const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
+
+function sanitizeLogText(value: string): string {
+    return value.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, (character) => {
+        switch (character) {
+            case '\n': return '\\n';
+            case '\r': return '\\r';
+            case '\t': return '\\t';
+            default: return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`;
+        }
+    });
+}
 
 class Logger {
     private level: LogLevel;
@@ -74,20 +83,22 @@ class Logger {
         const timestamp = this.formatTimestamp();
         const levelName = LogLevel[level].padEnd(5);
         const levelColor = LOG_COLORS[level] || '';
-        const moduleColor = this.getModuleColor(module);
+        const safeModule = sanitizeLogText(module);
+        const safeMessage = sanitizeLogText(message);
+        const moduleColor = this.getModuleColor(safeModule);
 
-        let formatted = `${BOLD}${timestamp}${RESET} ${levelColor}${levelName}${RESET} ${moduleColor}[${module}]${RESET} ${message}`;
+        let formatted = `${BOLD}${timestamp}${RESET} ${levelColor}${levelName}${RESET} ${moduleColor}[${safeModule}]${RESET} ${safeMessage}`;
 
         if (data !== undefined) {
             if (data instanceof Error) {
-                formatted += ` ${data.message}`;
+                formatted += ` ${sanitizeLogText(data.message)}`;
                 if (data.stack) {
-                    formatted += '\n' + data.stack;
+                    formatted += '\n' + sanitizeLogText(data.stack);
                 }
             } else if (typeof data === 'object') {
                 formatted += '\n' + JSON.stringify(data, null, 2);
             } else {
-                formatted += ` ${data}`;
+                formatted += ` ${sanitizeLogText(String(data))}`;
             }
         }
 

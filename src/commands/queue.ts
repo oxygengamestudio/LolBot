@@ -3,6 +3,7 @@ import { queueViewManager } from '../services/QueueViewManager.js';
 import { logger } from '../utils/Logger.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
 import { replyEphemeral } from '../utils/commandHelpers.js';
+import { canUseBot } from '../utils/permissions.js';
 
 const log = logger.createModuleLogger('QueueCmd');
 
@@ -18,6 +19,12 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         return;
     }
 
-    log.debug(`Commande queue par ${(interaction.member as GuildMember).user.tag}`);
+    const member = interaction.member as GuildMember;
+    if (!(await canUseBot(member))) {
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.noPermission')}`, false);
+        return;
+    }
+
+    log.debug(`Commande queue par ${member.user.tag}`);
     await queueViewManager.show(interaction);
 }

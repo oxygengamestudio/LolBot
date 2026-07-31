@@ -5,7 +5,6 @@
     VoiceConnectionStatus,
     entersState,
     VoiceConnection,
-    AudioPlayer,
     NoSubscriberBehavior,
     VoiceConnectionState,
     AudioPlayerState,
@@ -21,26 +20,58 @@ import { mediaCacheManager } from '../audio/MediaCacheManager.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
+import { runtimeTelemetry } from './RuntimeTelemetry.js';
 
 const log = logger.createModuleLogger('QueueManager');
+
+export type PlaybackStartFailureCode =
+    | 'queue_missing'
+    | 'voice_join_failed'
+    | 'resource_failed'
+    | 'player_unavailable'
+    | 'start_timeout'
+    | 'cancelled';
+
+export type PlaybackStartResult =
+    | { status: 'started'; track: Track }
+    | { status: 'queue_empty' }
+    | {
+        status: 'failed';
+        code: PlaybackStartFailureCode;
+        retryable: boolean;
+        track?: Track;
+    };
+
+type PlaybackRecoveryContext = {
+    signal: AbortSignal;
+    transitionNonce: number;
+    track: Track | null;
+};
 
 class QueueManager extends EventEmitter {
     private queues: Map<string, GuildQueue> = new Map();
     private voiceChannelMonitors: Map<string, NodeJS.Timeout> = new Map();
-    private crossfadeMonitors: Map<string, NodeJS.Timeout> = new Map();
-    private intentionalConnectionDestroy: Map<string, VoiceConnection> = new Map();
+    private intentionalConnectionDestroy: Map<string, Set<VoiceConnection>> = new Map();
     private activeResources: Map<string, AudioResource> = new Map();
-    private resourceSwapInProgress: Set<string> = new Set();
+    private pendingPlaybackStarts: Map<string, { queue: GuildQueue; track: Track; resource: AudioResource }> = new Map();
     private retiredResources: Map<string, NodeJS.Timeout> = new Map();
     private transitionNonces: Map<string, number> = new Map();
+    private sessionAbortControllers: Map<string, AbortController> = new Map();
+    private bufferingWatchdogs: Map<string, NodeJS.Timeout> = new Map();
     private warmedTrackByGuild: Map<string, string> = new Map();
     private lastTrackEndEvent: Map<string, { trackId: string | null; at: number }> = new Map();
     private transitionLocks: Map<string, Promise<void>> = new Map();
-    private crossfadeAttemptsInFlight: Set<string> = new Set();
-    private readonly crossfadeSeconds = 3;
-    private readonly crossfadePrepareLeadSeconds = 1.5;
-    private readonly pipelineTeardownWaitMs = 120;
+    private connectionAttempts: Map<string, Promise<VoiceConnection | null>> = new Map();
+    private reconnectAttemptsInFlight: Map<
+        string,
+        { promise: Promise<boolean>; signal: AbortSignal }
+    > = new Map();
+    private readonly playbackStartTimeoutMs = 15_000;
+    private readonly bufferingTimeoutMs = 10_000;
     private readonly retiredResourceRetentionMs = 10_000;
+    private readonly voiceDebugLogs = ['1', 'true', 'yes', 'on'].includes(
+        (process.env.VOICE_DEBUG_LOGS ?? '').toLowerCase()
+    );
 
     constructor() {
         super();
@@ -95,11 +126,10 @@ class QueueManager extends EventEmitter {
             reconnectAttempts: 0,
             shouldKeepConnection: false,
             isManualDisconnect: false,
-            crossfadeInProgress: false,
-            crossfadeTargetTrackId: null,
             lastStartMetrics: null,
         };
 
+        this.beginQueueSession(guildId);
         this.queues.set(guildId, queue);
         log.info(`Queue créée pour guild: ${guildId}`);
         return queue;
@@ -112,12 +142,14 @@ class QueueManager extends EventEmitter {
         log.debug(`Suppression de queue pour guild: ${guildId}`);
         const queue = this.queues.get(guildId);
         this.stopVoiceChannelMonitor(guildId);
-        this.stopCrossfadeMonitor(guildId);
+        this.clearBufferingWatchdog(guildId);
+        this.invalidateQueueSession(guildId);
         if (queue) {
             queue.isManualDisconnect = manualDisconnect;
             queue.isReconnecting = false;
             queue.reconnectAttempts = 0;
             this.teardownActiveResource(guildId);
+            this.pendingPlaybackStarts.delete(guildId);
             this.clearGuildWarmup(guildId);
 
             // Nettoyer les ressources
@@ -135,20 +167,15 @@ class QueueManager extends EventEmitter {
                     log.trace('Connexion déjà détruite');
                 }
             }
-            if (queue.nowPlayingMessage) {
-                log.trace('Suppression du message Now Playing');
-                queue.nowPlayingMessage.delete().catch(() => {});
-            }
             this.clearLyrics(queue);
             this.queues.delete(guildId);
-            this.emit('queueDeleted', guildId);
+            this.emit('queueDeleted', guildId, queue);
             log.info(`Queue supprimée pour guild: ${guildId}`);
             this.intentionalConnectionDestroy.delete(guildId);
-            this.transitionNonces.delete(guildId);
             this.lastTrackEndEvent.delete(guildId);
-            this.crossfadeAttemptsInFlight.delete(guildId);
             this.transitionLocks.delete(guildId);
-            this.resourceSwapInProgress.delete(guildId);
+            this.connectionAttempts.delete(guildId);
+            this.reconnectAttemptsInFlight.delete(guildId);
             this.clearRetiredResources(guildId);
             void audioWrapper.cleanupGuildTemp(guildId);
             void this.pruneCache();
@@ -161,6 +188,24 @@ class QueueManager extends EventEmitter {
      * Rejoint un canal vocal et configure le lecteur audio
      */
     async joinChannel(queue: GuildQueue): Promise<VoiceConnection | null> {
+        const existingAttempt = this.connectionAttempts.get(queue.guildId);
+        if (existingAttempt) {
+            log.debug(`Connexion vocale déjà en cours pour guild: ${queue.guildId}`);
+            return existingAttempt;
+        }
+
+        const attempt = this.joinChannelInternal(queue);
+        this.connectionAttempts.set(queue.guildId, attempt);
+        try {
+            return await attempt;
+        } finally {
+            if (this.connectionAttempts.get(queue.guildId) === attempt) {
+                this.connectionAttempts.delete(queue.guildId);
+            }
+        }
+    }
+
+    private async joinChannelInternal(queue: GuildQueue): Promise<VoiceConnection | null> {
         log.info(`Tentative de connexion au canal vocal: ${queue.voiceChannel.name} (${queue.voiceChannel.id})`);
         log.debug('Paramètres de connexion:', {
             channelId: queue.voiceChannel.id,
@@ -170,11 +215,16 @@ class QueueManager extends EventEmitter {
 
         this.ensurePlayer(queue);
 
-        const maxAttempts = 3;
-        const readyTimeoutMs = 10_000;
+        const maxAttempts = queue.isReconnecting ? 1 : 3;
+        const readyTimeoutMs = queue.isReconnecting ? 5_000 : 10_000;
         let lastError: unknown = null;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            if (this.queues.get(queue.guildId) !== queue) {
+                log.trace('Connexion vocale abandonnée: queue remplacée ou supprimée');
+                return null;
+            }
+
             if (queue.connection && queue.connection.state.status !== VoiceConnectionStatus.Destroyed) {
                 this.destroyConnection(queue.guildId, queue.connection);
                 queue.connection = null;
@@ -199,12 +249,20 @@ class QueueManager extends EventEmitter {
 
                 await entersState(connection, VoiceConnectionStatus.Ready, readyTimeoutMs);
 
+                if (this.queues.get(queue.guildId) !== queue || queue.isManualDisconnect) {
+                    this.destroyConnection(queue.guildId, connection);
+                    if (queue.connection === connection) {
+                        queue.connection = null;
+                    }
+                    return null;
+                }
+
                 if (queue.player) {
                     const subscription = connection.subscribe(queue.player);
                     if (subscription) {
                         log.debug('Subscription créée avec succès');
                     } else {
-                        log.warn('Échec de la création de la subscription!');
+                        throw new Error('Échec de la création de la subscription audio');
                     }
                 }
 
@@ -253,6 +311,41 @@ class QueueManager extends EventEmitter {
         const queue = this.queues.get(guildId);
         if (!queue) {
             return;
+        }
+
+        const botUserId = newState.client.user?.id ?? oldState.client.user?.id;
+        const isBotVoiceState = !!botUserId && (oldState.id === botUserId || newState.id === botUserId);
+        if (isBotVoiceState && oldState.channelId === queue.voiceChannel.id) {
+            if (newState.channelId && newState.channelId !== queue.voiceChannel.id && newState.channel?.isVoiceBased()) {
+                queue.voiceChannel = newState.channel as VoiceChannel | StageChannel;
+                this.startVoiceChannelMonitor(queue);
+                log.info(`Bot déplacé vers le canal vocal: ${queue.voiceChannel.name} (${queue.voiceChannel.id})`);
+                return;
+            }
+
+            if (!newState.channelId && !queue.isManualDisconnect) {
+                if (queue.isReconnecting || this.connectionAttempts.has(guildId)) {
+                    log.trace('Déconnexion vocale déjà en cours de récupération, événement ignoré');
+                    return;
+                }
+
+                const resumeOffset = queue.currentTrack ? this.getCurrentTime(guildId) : 0;
+                log.warn('Bot retiré du canal vocal, tentative de reconnexion...');
+                const reconnect = this.reconnectWithBackoff(queue, resumeOffset);
+                const reconnectSignal = this.reconnectAttemptsInFlight.get(guildId)?.signal;
+                void reconnect.then((reconnected) => {
+                    if (
+                        !reconnected &&
+                        reconnectSignal &&
+                        !reconnectSignal.aborted &&
+                        !queue.isManualDisconnect &&
+                        this.queues.get(guildId) === queue
+                    ) {
+                        this.deleteQueue(guildId, false);
+                    }
+                });
+                return;
+            }
         }
 
         if (oldState.channelId !== queue.voiceChannel.id && newState.channelId !== queue.voiceChannel.id) {
@@ -322,16 +415,35 @@ class QueueManager extends EventEmitter {
             log.debug(`Player audio: ${oldState.status} -> ${newState.status}`);
         });
 
-        player.on(AudioPlayerStatus.Idle, () => {
-            if (this.resourceSwapInProgress.has(queue.guildId)) {
-                log.trace('Player idle ignoré (swap de ressource en cours)');
+        player.on(AudioPlayerStatus.Idle, (oldState: AudioPlayerState) => {
+            this.clearBufferingWatchdog(queue.guildId);
+            const retiredResource = 'resource' in oldState ? oldState.resource : null;
+            const activeResource = this.activeResources.get(queue.guildId);
+            if (
+                retiredResource &&
+                (this.shouldIgnorePlayerResourceError(queue.guildId, retiredResource) ||
+                    (activeResource && retiredResource !== activeResource))
+            ) {
+                log.trace('Player idle ignoré (ancienne ressource)');
                 return;
             }
             log.debug('Player passé en Idle');
             this.handleTrackEnd(queue);
         });
 
-        player.on(AudioPlayerStatus.Playing, () => {
+        player.on(AudioPlayerStatus.Playing, (_oldState: AudioPlayerState, newState: AudioPlayerPlayingState) => {
+            this.clearBufferingWatchdog(queue.guildId);
+            if (this.activeResources.get(queue.guildId) !== newState.resource) {
+                log.trace('Événement Playing ignoré pour une ancienne ressource');
+                return;
+            }
+            if (!this.promotePendingStart(queue, newState.resource)) {
+                const pending = this.pendingPlaybackStarts.get(queue.guildId);
+                if (pending?.resource === newState.resource) {
+                    log.trace('Événement Playing ignoré pour une ressource obsolète');
+                    return;
+                }
+            }
             log.info(`Lecture demarree: ${queue.currentTrack?.title}`);
             queue.isPlaying = true;
             queue.isPaused = false;
@@ -339,7 +451,6 @@ class QueueManager extends EventEmitter {
                 queue.startedAt = Date.now();
             }
             queue.pausedAt = null;
-            this.startCrossfadeMonitor(queue);
             this.emit('trackStart', queue);
         });
 
@@ -347,12 +458,12 @@ class QueueManager extends EventEmitter {
             log.debug('Player mis en pause');
             queue.isPaused = true;
             queue.pausedAt = Date.now();
-            this.stopCrossfadeMonitor(queue.guildId);
             this.emit('trackPaused', queue);
         });
 
         player.on(AudioPlayerStatus.Buffering, () => {
             log.debug('Player en buffering...');
+            this.startBufferingWatchdog(queue);
         });
 
         player.on(AudioPlayerStatus.AutoPaused, () => {
@@ -387,9 +498,11 @@ class QueueManager extends EventEmitter {
             });
         });
 
-        connection.on('debug', (message) => {
-            log.trace(`[voice] ${message}`);
-        });
+        if (this.voiceDebugLogs) {
+            connection.on('debug', (message) => {
+                log.trace(`[voice] ${message}`);
+            });
+        }
 
         connection.on('error', (error) => {
             log.error('Erreur de connexion vocale:', error);
@@ -400,6 +513,10 @@ class QueueManager extends EventEmitter {
             if (!activeQueue || activeQueue.connection !== connection) {
                 return;
             }
+            if (activeQueue.isReconnecting) {
+                log.trace('Déconnexion ignorée, reconnexion déjà active');
+                return;
+            }
             if (activeQueue.isManualDisconnect) {
                 log.trace('Déconnexion manuelle détectée, aucun reconnect');
                 return;
@@ -407,17 +524,35 @@ class QueueManager extends EventEmitter {
 
             log.warn('Connexion vocale déconnectée, tentative de récupération...');
             const resumeOffset = activeQueue.currentTrack ? this.getCurrentTime(queue.guildId) : 0;
+            const recovery = this.captureRecoveryContext(activeQueue);
             try {
-                await Promise.race([
-                    entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-                    entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-                    entersState(connection, VoiceConnectionStatus.Ready, 5_000),
-                ]);
-                log.info('Reconnexion de Discord en cours...');
+                await entersState(connection, VoiceConnectionStatus.Ready, 900);
+                if (!this.isRecoveryCurrent(activeQueue, recovery)) {
+                    log.trace('Récupération Discord ignorée: session remplacée');
+                    return;
+                }
+                if (activeQueue.connection === connection && activeQueue.player) {
+                    if (!connection.subscribe(activeQueue.player)) {
+                        throw new Error('Subscription audio impossible après récupération Discord');
+                    }
+                }
+                log.info('Connexion vocale récupérée par Discord');
             } catch (error) {
+                if (!this.isRecoveryCurrent(activeQueue, recovery)) {
+                    log.trace('Échec de récupération Discord ignoré: session remplacée');
+                    return;
+                }
                 log.warn('Récupération simple échouée, tentative de reconnexion complète', error);
-                const reconnected = await this.reconnectWithBackoff(activeQueue, resumeOffset);
-                if (!reconnected) {
+                const reconnect = this.reconnectWithBackoff(activeQueue, resumeOffset);
+                const reconnectSignal = this.reconnectAttemptsInFlight.get(queue.guildId)?.signal;
+                const reconnected = await reconnect;
+                if (
+                    !reconnected &&
+                    reconnectSignal &&
+                    !reconnectSignal.aborted &&
+                    !activeQueue.isManualDisconnect &&
+                    this.queues.get(queue.guildId) === activeQueue
+                ) {
                     this.deleteQueue(queue.guildId, false);
                 }
             }
@@ -434,10 +569,26 @@ class QueueManager extends EventEmitter {
                 return;
             }
 
+            if (activeQueue.isReconnecting) {
+                log.trace('Connexion détruite pendant une reconnexion déjà active');
+                return;
+            }
+
             log.info('Connexion vocale détruite involontairement');
-            void this.reconnectWithBackoff(activeQueue, activeQueue.currentTrack ? this.getCurrentTime(queue.guildId) : 0)
+            const reconnect = this.reconnectWithBackoff(
+                activeQueue,
+                activeQueue.currentTrack ? this.getCurrentTime(queue.guildId) : 0
+            );
+            const reconnectSignal = this.reconnectAttemptsInFlight.get(queue.guildId)?.signal;
+            void reconnect
                 .then((reconnected) => {
-                    if (!reconnected) {
+                    if (
+                        !reconnected &&
+                        reconnectSignal &&
+                        !reconnectSignal.aborted &&
+                        !activeQueue.isManualDisconnect &&
+                        this.queues.get(queue.guildId) === activeQueue
+                    ) {
                         this.deleteQueue(queue.guildId, false);
                     }
                 });
@@ -458,11 +609,43 @@ class QueueManager extends EventEmitter {
     }
 
     private async reconnectWithBackoff(queue: GuildQueue, resumeOffset: number): Promise<boolean> {
-        if (queue.isManualDisconnect || queue.isReconnecting) {
+        const existing = this.reconnectAttemptsInFlight.get(queue.guildId);
+        if (existing && !existing.signal.aborted) {
+            return existing.promise;
+        }
+
+        const signal = this.beginQueueSession(queue.guildId);
+        const recovery: PlaybackRecoveryContext = {
+            signal,
+            transitionNonce: this.transitionNonces.get(queue.guildId) ?? 0,
+            track: queue.currentTrack,
+        };
+        const attempt = this.reconnectWithBackoffInternal(queue, resumeOffset, recovery);
+        this.reconnectAttemptsInFlight.set(queue.guildId, { promise: attempt, signal });
+        try {
+            return await attempt;
+        } finally {
+            if (this.reconnectAttemptsInFlight.get(queue.guildId)?.promise === attempt) {
+                queue.isReconnecting = false;
+                queue.reconnectAttempts = 0;
+                this.reconnectAttemptsInFlight.delete(queue.guildId);
+            }
+        }
+    }
+
+    private async reconnectWithBackoffInternal(
+        queue: GuildQueue,
+        resumeOffset: number,
+        recovery: PlaybackRecoveryContext
+    ): Promise<boolean> {
+        if (!this.isRecoveryCurrent(queue, recovery)) {
             return false;
         }
 
         queue.isReconnecting = true;
+        if (queue.connection && queue.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            this.destroyConnection(queue.guildId, queue.connection);
+        }
         queue.connection = null;
 
         const hasPlayableWork = !!queue.currentTrack || queue.tracks.length > 0 || queue.shouldKeepConnection;
@@ -474,55 +657,86 @@ class QueueManager extends EventEmitter {
         try {
             for (let attempt = 1; attempt <= config.audio.voiceReconnectMaxAttempts; attempt += 1) {
                 if (attempt > 1) {
-                    const delayMs = Math.min(
+                    const baseDelayMs = Math.min(
                         config.audio.voiceReconnectMaxDelayMs,
                         config.audio.voiceReconnectBaseDelayMs * 2 ** (attempt - 2)
                     );
+                    const jitterMs = Math.floor(Math.random() * Math.max(1, Math.floor(baseDelayMs * 0.25)));
+                    const delayMs = Math.min(config.audio.voiceReconnectMaxDelayMs, baseDelayMs + jitterMs);
                     await new Promise((resolve) => setTimeout(resolve, delayMs));
                 }
 
-                if (queue.isManualDisconnect || !this.queues.has(queue.guildId)) {
+                if (!this.isRecoveryCurrent(queue, recovery)) {
                     return false;
                 }
 
                 queue.reconnectAttempts = attempt;
+                runtimeTelemetry.recordReconnectAttempt();
                 const connection = await this.joinChannel(queue);
                 if (!connection) {
                     log.warn(`Tentative de reconnexion échouée (#${attempt}/${config.audio.voiceReconnectMaxAttempts})`);
                     continue;
                 }
 
+                if (!this.isRecoveryCurrent(queue, recovery)) {
+                    log.trace('Connexion récupérée mais session remplacée, reprise abandonnée');
+                    return false;
+                }
+
                 queue.isReconnecting = false;
                 queue.reconnectAttempts = 0;
 
+                if (queue.currentTrack && this.reattachActivePlayback(queue, resumeOffset, recovery)) {
+                    return true;
+                }
                 if (queue.currentTrack) {
-                    return this.resumeCurrentTrack(queue, resumeOffset);
+                    return this.resumeCurrentTrack(queue, resumeOffset, recovery);
                 }
                 if (queue.tracks.length > 0) {
-                    return this.playNext(queue.guildId);
+                    return (await this.playNext(queue.guildId)).status === 'started';
                 }
                 return true;
             }
         } finally {
-            queue.isReconnecting = false;
+            if (this.isRecoveryCurrent(queue, recovery)) {
+                queue.isReconnecting = false;
+            }
         }
 
         return false;
     }
 
-    private async resumeCurrentTrack(queue: GuildQueue, resumeOffset: number): Promise<boolean> {
-        if (!queue.currentTrack || !queue.player) {
+    private async resumeCurrentTrack(
+        queue: GuildQueue,
+        resumeOffset: number,
+        recovery: PlaybackRecoveryContext = this.captureRecoveryContext(queue)
+    ): Promise<boolean> {
+        const expectedTrack = recovery.track;
+        if (!expectedTrack || !queue.player || !this.isRecoveryCurrent(queue, recovery)) {
             return false;
         }
 
         const settings = await guildSettingsManager.getSettings(queue.guildId);
+        if (!this.isRecoveryCurrent(queue, recovery)) {
+            return false;
+        }
         const resource = await audioWrapper.createResource(
             queue.guildId,
-            queue.currentTrack,
+            expectedTrack,
             Math.max(0, resumeOffset),
-            settings.sponsorBlockEnabled
+            settings.sponsorBlockEnabled,
+            queue.volume
         );
         if (!resource) {
+            return false;
+        }
+
+        if (!this.isRecoveryCurrent(queue, recovery)) {
+            log.trace('Ressource de reprise obsolète détruite avant installation', {
+                guildId: queue.guildId,
+                track: expectedTrack.title,
+            });
+            audioWrapper.teardownResource(resource);
             return false;
         }
 
@@ -536,7 +750,66 @@ class QueueManager extends EventEmitter {
         queue.isPaused = false;
         queue.isStopping = false;
         await this.replaceActiveResource(queue, resource);
-        this.startCrossfadeMonitor(queue);
+        const started = await this.waitForPlaybackStart(queue, resource, recovery.signal);
+        if (!started && this.activeResources.get(queue.guildId) === resource) {
+            this.teardownActiveResource(queue.guildId);
+        }
+        return started && this.isRecoveryCurrent(queue, recovery);
+    }
+
+    private reattachActivePlayback(
+        queue: GuildQueue,
+        resumeOffset: number,
+        recovery: PlaybackRecoveryContext
+    ): boolean {
+        if (!this.isRecoveryCurrent(queue, recovery)) {
+            return false;
+        }
+        if (!queue.currentTrack || !queue.player || !queue.connection) {
+            return false;
+        }
+        if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
+            return false;
+        }
+        if (this.getActiveResourceTrackId(queue.guildId) !== queue.currentTrack.id) {
+            return false;
+        }
+
+        const status = queue.player.state.status;
+        if (status === AudioPlayerStatus.Idle) {
+            return false;
+        }
+
+        try {
+            queue.connection.subscribe(queue.player);
+        } catch (error) {
+            log.trace('Ré-attache du player impossible', error);
+            return false;
+        }
+
+        const currentOffset = this.getCurrentTime(queue.guildId);
+        const safeOffset = Math.max(0, currentOffset, resumeOffset);
+        queue.startedAt = Date.now() - safeOffset * 1000;
+        queue.totalPausedTime = 0;
+        queue.pausedAt = status === AudioPlayerStatus.Paused ? Date.now() : null;
+        queue.isPaused = status === AudioPlayerStatus.Paused;
+        queue.isPlaying = true;
+        queue.isStopping = false;
+        queue.isManualDisconnect = false;
+        queue.autoPausedByEmptyChannel = false;
+
+        if (status === AudioPlayerStatus.AutoPaused) {
+            queue.player.unpause();
+            queue.isPaused = false;
+            queue.pausedAt = null;
+        }
+
+        if (!this.isRecoveryCurrent(queue, recovery)) {
+            return false;
+        }
+
+        this.emit('trackStart', queue);
+        log.info(`Lecture ré-attachée après reconnexion: ${queue.currentTrack.title}`);
         return true;
     }
 
@@ -550,7 +823,6 @@ class QueueManager extends EventEmitter {
             log.warn(`Queue non trouvée pour guild: ${guildId}`);
             return -1;
         }
-        const wasIdle = !queue.currentTrack && !queue.isPlaying && queue.tracks.length === 0;
         if (queue.tracks.length >= config.audio.maxQueueTracks) {
             log.warn(`Queue pleine (${config.audio.maxQueueTracks}), impossible d'ajouter: ${track.title}`);
             return 0;
@@ -564,9 +836,7 @@ class QueueManager extends EventEmitter {
         log.info(`Piste ajoutée à la queue (total: ${queue.tracks.length})`);
         log.trace('Détails de la piste:', track);
 
-        if (!wasIdle) {
-            this.refreshWarmup(queue);
-        }
+        this.refreshWarmup(queue);
 
         return 1;
     }
@@ -581,7 +851,6 @@ class QueueManager extends EventEmitter {
             log.warn(`Queue non trouvée pour guild: ${guildId}`);
             return -1;
         }
-        const wasIdle = !queue.currentTrack && !queue.isPlaying && queue.tracks.length === 0;
         const availableSlots = Math.max(0, config.audio.maxQueueTracks - queue.tracks.length);
         if (availableSlots == 0) {
             log.warn(`Queue pleine (${config.audio.maxQueueTracks}), aucune piste ajoutee`);
@@ -596,9 +865,7 @@ class QueueManager extends EventEmitter {
 
         log.info(`${tracksToAdd.length} pistes ajoutées à la queue (total: ${queue.tracks.length})`);
 
-        if (!wasIdle) {
-            this.refreshWarmup(queue);
-        }
+        this.refreshWarmup(queue);
 
         return tracksToAdd.length;
     }
@@ -606,7 +873,7 @@ class QueueManager extends EventEmitter {
     /**
      * Joue la prochaine piste de la file d'attente
      */
-    async playNext(guildId: string): Promise<boolean> {
+    async playNext(guildId: string): Promise<PlaybackStartResult> {
         return this.runWithTransitionLock(guildId, async () => this.playNextInternal(guildId));
     }
 
@@ -630,16 +897,16 @@ class QueueManager extends EventEmitter {
         });
     }
 
-    private async playNextInternal(guildId: string): Promise<boolean> {
+    private async playNextInternal(guildId: string): Promise<PlaybackStartResult> {
         const requestStartedAt = Date.now();
         log.debug(`playNext appele pour guild: ${guildId}`);
         const queue = this.queues.get(guildId);
         if (!queue) {
             log.warn('Queue non trouvee');
-            return false;
+            return { status: 'failed', code: 'queue_missing', retryable: false };
         }
         const transitionNonce = this.bumpTransitionNonce(guildId);
-        const isSessionStart = !queue.currentTrack;
+        const sessionSignal = this.getQueueSessionSignal(guildId);
 
         if (queue.tracks.length === 0) {
             log.info('File d\'attente vide');
@@ -647,9 +914,6 @@ class QueueManager extends EventEmitter {
             queue.isPlaying = false;
             queue.shouldKeepConnection = false;
             queue.autoPausedByEmptyChannel = false;
-            queue.crossfadeInProgress = false;
-            queue.crossfadeTargetTrackId = null;
-            this.stopCrossfadeMonitor(guildId);
             this.clearLyrics(queue);
             this.clearGuildWarmup(guildId);
             void audioWrapper.cleanupGuildTemp(guildId);
@@ -661,29 +925,17 @@ class QueueManager extends EventEmitter {
                 this.deleteQueue(guildId, false);
             }
 
-            return false;
+            return { status: 'queue_empty' };
         }
 
         if (queue.currentTrack) {
             this.clearLyrics(queue, queue.currentTrack.id);
         }
 
-        const track = queue.tracks.shift()!;
-        queue.currentTrack = track;
-        queue.totalPausedTime = 0;
-        queue.isStopping = false;
-        queue.isManualDisconnect = false;
-        queue.shouldKeepConnection = true;
-        queue.crossfadeInProgress = false;
-        queue.crossfadeTargetTrackId = null;
-        queue.autoPausedByEmptyChannel = false;
+        const track = queue.tracks[0]!;
 
         log.info(`Prochaine piste: ${track.title}`);
         log.trace('Details:', track);
-
-        if (isSessionStart) {
-            await audioWrapper.cleanupGuildTemp(guildId);
-        }
 
         const warmHit = audioWrapper.isTrackWarm(guildId, track.id);
         log.debug(`warmup_${warmHit ? 'hit' : 'miss'}: ${track.title}`);
@@ -691,101 +943,293 @@ class QueueManager extends EventEmitter {
 
         let joinMs: number | null = null;
         const warmupMs: number | null = warmHit ? 0 : null;
-        let resource: AudioResource | null = null;
         let connection: VoiceConnection | null = null;
+        let resource: AudioResource | null = null;
         const hasReadyConnection =
             !!queue.connection &&
             queue.connection.state.status !== VoiceConnectionStatus.Destroyed &&
             queue.connection.state.status === VoiceConnectionStatus.Ready;
 
+        const resourceStartedAt = Date.now();
+        const settings = await guildSettingsManager.getSettings(guildId);
+        const resourcePromise = audioWrapper.createResource(
+            guildId,
+            track,
+            0,
+            settings.sponsorBlockEnabled,
+            settings.volume
+        );
+
         if (!hasReadyConnection) {
             const joinStartedAt = Date.now();
-            connection = await this.joinChannel(queue);
+            const [joinedConnection, resourceResult] = await Promise.all([
+                this.joinChannel(queue),
+                resourcePromise,
+            ]);
+            connection = joinedConnection;
+            resource = resourceResult;
             joinMs = Date.now() - joinStartedAt;
-
-            if (!connection) {
-                log.error('Impossible de rejoindre le canal vocal');
-                queue.lastStartMetrics = {
-                    joinMs,
-                    warmupMs,
-                    resourceMs: null,
-                    warmHit,
-                    sourceMode: 'unknown',
-                };
-                return false;
-            }
-
-            const resourceStartedAt = Date.now();
-            const settings = await guildSettingsManager.getSettings(guildId);
-            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
-            const resourceMs = Date.now() - resourceStartedAt;
-            log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
-            queue.lastStartMetrics = {
-                joinMs,
-                warmupMs,
-                resourceMs,
-                warmHit,
-                sourceMode: audioWrapper.getLastSourceMode(guildId),
-            };
         } else {
             connection = queue.connection;
             joinMs = 0;
-            const resourceStartedAt = Date.now();
-            const settings = await guildSettingsManager.getSettings(guildId);
-            resource = await audioWrapper.createResource(guildId, track, 0, settings.sponsorBlockEnabled);
-            const resourceMs = Date.now() - resourceStartedAt;
-            log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
-            queue.lastStartMetrics = {
-                joinMs,
-                warmupMs,
-                resourceMs,
-                warmHit,
-                sourceMode: audioWrapper.getLastSourceMode(guildId),
-            };
+            resource = await resourcePromise;
+        }
+
+        const resourceMs = Date.now() - resourceStartedAt;
+        log.debug(`resource_create_ms=${resourceMs} (track: ${track.title})`);
+        queue.lastStartMetrics = {
+            joinMs,
+            warmupMs,
+            resourceMs,
+            warmHit,
+            sourceMode: audioWrapper.getLastSourceMode(guildId),
+        };
+
+        if (!connection) {
+            log.error('Impossible de rejoindre le canal vocal');
+            if (resource) {
+                audioWrapper.teardownResource(resource);
+            }
+            return { status: 'failed', code: 'voice_join_failed', retryable: true, track };
         }
 
         this.attachWarmupMetrics(guildId, track, warmHit, warmupPromise);
 
-        if (!this.isTransitionCurrent(guildId, transitionNonce)) {
+        if (
+            sessionSignal.aborted ||
+            this.queues.get(guildId) !== queue ||
+            !this.isTransitionCurrent(guildId, transitionNonce)
+        ) {
             log.debug(`Transition obsolete ignoree pour ${guildId}`);
             if (resource) {
                 audioWrapper.teardownResource(resource);
             }
-            return false;
+            return { status: 'failed', code: 'cancelled', retryable: true, track };
+        }
+
+        if (!resource) {
+            log.warn(`Première résolution audio échouée, nouvelle tentative: ${track.title}`);
+            audioWrapper.clearFromCache(guildId, track.id);
+            resource = await audioWrapper.createResource(
+                guildId,
+                track,
+                0,
+                settings.sponsorBlockEnabled,
+                settings.volume
+            );
+        }
+
+        const volume = Math.max(0, Math.min(200, settings.volume));
+        queue.volume = volume;
+
+        if (!queue.player) {
+            log.error('Player non disponible!');
+            audioWrapper.teardownResource(resource);
+            return { status: 'failed', code: 'player_unavailable', retryable: true, track };
         }
 
         if (!resource) {
             log.error(`Impossible de creer la ressource pour: ${track.title}`);
-            return this.playNextInternal(guildId);
+            queue.tracks.shift();
+            this.emit('trackFailed', queue, track, 'resource_failed');
+            if (queue.tracks.length > 0) {
+                await this.playNextInternal(guildId);
+                return { status: 'failed', code: 'resource_failed', retryable: true, track };
+            }
+            await this.playNextInternal(guildId);
+            return { status: 'failed', code: 'resource_failed', retryable: true, track };
         }
 
-        const settings = await guildSettingsManager.getSettings(guildId);
-        const volume = Math.max(0, Math.min(200, settings.volume));
-        queue.volume = volume;
-        if (resource.volume) {
-            resource.volume.setVolume(volume / 100);
+        const started = await this.startTrackResource(
+            queue,
+            track,
+            resource,
+            volume,
+            transitionNonce,
+            sessionSignal
+        );
+        if (
+            sessionSignal.aborted ||
+            this.queues.get(guildId) !== queue ||
+            !this.isTransitionCurrent(guildId, transitionNonce)
+        ) {
+            return { status: 'failed', code: 'cancelled', retryable: true, track };
         }
 
-        log.debug('Ressource audio creee avec succes');
-        log.trace('Type de ressource:', {
-            playbackDuration: resource.playbackDuration,
-            started: resource.started,
-            ended: resource.ended,
-        });
+        if (!started && this.isTransitionCurrent(guildId, transitionNonce) && !sessionSignal.aborted) {
+            log.warn(`Lecture non confirmée, seconde ressource: ${track.title}`);
+            runtimeTelemetry.recordPlaybackRetry();
+            audioWrapper.clearFromCache(guildId, track.id);
+            const retryResource = await audioWrapper.createResource(
+                guildId,
+                track,
+                0,
+                settings.sponsorBlockEnabled,
+                settings.volume
+            );
+            if (retryResource) {
+                const retryStarted = await this.startTrackResource(
+                    queue,
+                    track,
+                    retryResource,
+                    volume,
+                    transitionNonce,
+                    sessionSignal
+                );
+                if (retryStarted) {
+                    this.refreshWarmup(queue);
+                    log.debug(`request_to_play_ms=${Date.now() - requestStartedAt} (guild: ${guildId}, retry=true)`);
+                    runtimeTelemetry.recordPlaybackStart(Date.now() - requestStartedAt, joinMs, resourceMs);
+                    return { status: 'started', track };
+                }
+            }
+        }
 
-        if (queue.player) {
-            await this.replaceActiveResource(queue, resource);
-            log.debug('Lancement de la lecture...');
-            log.trace(`Etat du player apres play(): ${queue.player.state.status}`);
-        } else {
-            log.error('Player non disponible!');
-            audioWrapper.teardownResource(resource);
-            return false;
+        if (!started) {
+            if (
+                sessionSignal.aborted ||
+                this.queues.get(guildId) !== queue ||
+                !this.isTransitionCurrent(guildId, transitionNonce)
+            ) {
+                return { status: 'failed', code: 'cancelled', retryable: true, track };
+            }
+            if (this.queues.get(guildId) === queue && queue.currentTrack === track) {
+                queue.currentTrack = null;
+            }
+            const trackIndex = queue.tracks.findIndex((candidate) => candidate === track || candidate.id === track.id);
+            if (trackIndex >= 0) {
+                queue.tracks.splice(trackIndex, 1);
+            }
+            this.emit('trackFailed', queue, track, 'start_timeout');
+            if (queue.tracks.length > 0 && !sessionSignal.aborted) {
+                await this.playNextInternal(guildId);
+                return { status: 'failed', code: 'start_timeout', retryable: true, track };
+            }
+            await this.playNextInternal(guildId);
+            return { status: 'failed', code: 'start_timeout', retryable: true, track };
         }
 
         this.refreshWarmup(queue);
         log.debug(`request_to_play_ms=${Date.now() - requestStartedAt} (guild: ${guildId})`);
+        runtimeTelemetry.recordPlaybackStart(Date.now() - requestStartedAt, joinMs, resourceMs);
 
+        return { status: 'started', track };
+    }
+
+    private async startTrackResource(
+        queue: GuildQueue,
+        track: Track,
+        resource: AudioResource,
+        volume: number,
+        transitionNonce: number,
+        sessionSignal: AbortSignal
+    ): Promise<boolean> {
+        if (
+            sessionSignal.aborted ||
+            this.queues.get(queue.guildId) !== queue ||
+            !this.isTransitionCurrent(queue.guildId, transitionNonce) ||
+            !queue.player
+        ) {
+            audioWrapper.teardownResource(resource);
+            return false;
+        }
+
+        if (resource.volume) {
+            resource.volume.setVolume(volume / 100);
+        }
+
+        queue.totalPausedTime = 0;
+        queue.isStopping = false;
+        queue.isManualDisconnect = false;
+        queue.shouldKeepConnection = true;
+        queue.autoPausedByEmptyChannel = false;
+        queue.startedAt = null;
+        queue.pausedAt = null;
+
+        this.pendingPlaybackStarts.set(queue.guildId, { queue, track, resource });
+        await this.replaceActiveResource(queue, resource);
+        const started = await this.waitForPlaybackStart(queue, resource, sessionSignal);
+        if (started) {
+            return this.promotePendingStart(queue, resource) || queue.currentTrack === track;
+        }
+
+        const pending = this.pendingPlaybackStarts.get(queue.guildId);
+        if (pending?.resource === resource) {
+            this.pendingPlaybackStarts.delete(queue.guildId);
+        }
+        if (this.queues.get(queue.guildId) === queue && queue.currentTrack === track) {
+            queue.isPlaying = false;
+            queue.isPaused = false;
+            queue.startedAt = null;
+            queue.pausedAt = null;
+        }
+        if (this.activeResources.get(queue.guildId) === resource) {
+            this.teardownActiveResource(queue.guildId);
+        }
+        return false;
+    }
+
+    private async waitForPlaybackStart(
+        queue: GuildQueue,
+        resource: AudioResource,
+        sessionSignal: AbortSignal = this.getQueueSessionSignal(queue.guildId)
+    ): Promise<boolean> {
+        if (!queue.player || sessionSignal.aborted) {
+            return false;
+        }
+
+        const startController = new AbortController();
+        const abortHandler = () => startController.abort();
+        const timeout = setTimeout(() => startController.abort(), this.playbackStartTimeoutMs);
+        timeout.unref?.();
+        sessionSignal.addEventListener('abort', abortHandler, { once: true });
+        try {
+            if (sessionSignal.aborted) {
+                startController.abort();
+            }
+            await entersState(queue.player, AudioPlayerStatus.Playing, startController.signal);
+            return (
+                !sessionSignal.aborted &&
+                this.queues.get(queue.guildId) === queue &&
+                this.activeResources.get(queue.guildId) === resource &&
+                queue.player.state.status === AudioPlayerStatus.Playing
+            );
+        } catch (error) {
+            log.warn(`Démarrage audio non confirmé après ${this.playbackStartTimeoutMs}ms`, {
+                guildId: queue.guildId,
+                track: queue.currentTrack?.title ?? null,
+                message: (error as Error)?.message ?? String(error),
+            });
+            return false;
+        } finally {
+            clearTimeout(timeout);
+            sessionSignal.removeEventListener('abort', abortHandler);
+        }
+    }
+
+    private promotePendingStart(queue: GuildQueue, resource: AudioResource): boolean {
+        const pending = this.pendingPlaybackStarts.get(queue.guildId);
+        if (!pending) {
+            return false;
+        }
+        if (
+            pending.queue !== queue ||
+            pending.resource !== resource ||
+            this.activeResources.get(queue.guildId) !== resource ||
+            this.queues.get(queue.guildId) !== queue ||
+            queue.player?.state.status !== AudioPlayerStatus.Playing
+        ) {
+            return false;
+        }
+
+        const queuedIndex = queue.tracks.findIndex(
+            (candidate) => candidate === pending.track || candidate.id === pending.track.id
+        );
+        if (queuedIndex >= 0) {
+            queue.tracks.splice(queuedIndex, 1);
+        }
+        queue.currentTrack = pending.track;
+        this.pendingPlaybackStarts.delete(queue.guildId);
         return true;
     }
 
@@ -808,6 +1252,10 @@ class QueueManager extends EventEmitter {
                     selfMute: false,
                 });
                 if (rejoined) {
+                    await entersState(queue.connection, VoiceConnectionStatus.Ready, 10_000);
+                    if (queue.player && !queue.connection.subscribe(queue.player)) {
+                        throw new Error('Subscription audio impossible après déplacement');
+                    }
                     log.info(`Déplacement vers ${voiceChannel.name}`);
                     return true;
                 }
@@ -855,6 +1303,13 @@ class QueueManager extends EventEmitter {
             }
         }
 
+        if (!applied && state?.status === AudioPlayerStatus.Playing && queue.currentTrack) {
+            const offset = this.getCurrentTime(guildId);
+            void this.resumeCurrentTrack(queue, offset).catch((error) => {
+                log.warn('Impossible de recreer la ressource audio pour appliquer le volume', error);
+            });
+        }
+
         log.debug(`Volume ${applied ? 'applique' : 'memorise'}: ${clamped}%`);
         return true;
     }
@@ -865,6 +1320,11 @@ class QueueManager extends EventEmitter {
     private handleTrackEnd(queue: GuildQueue): void {
         const currentTrackId = queue.currentTrack?.id ?? null;
         const now = Date.now();
+        if (!queue.currentTrack) {
+            log.trace('Fin de piste ignoree (aucune piste active)');
+            return;
+        }
+
         const lastEvent = this.lastTrackEndEvent.get(queue.guildId);
         if (
             lastEvent &&
@@ -872,43 +1332,6 @@ class QueueManager extends EventEmitter {
             now - lastEvent.at < 1_500
         ) {
             log.trace('Fin de piste dupliquee ignoree');
-            return;
-        }
-
-        if (queue.crossfadeInProgress) {
-            const activeTrackId = this.getActiveResourceTrackId(queue.guildId);
-            if (activeTrackId !== queue.crossfadeTargetTrackId) {
-                log.debug('Fin de piste ignorée (crossfade en cours, piste source)');
-                return;
-            }
-
-            const interruptedTrack = queue.currentTrack;
-            log.warn('Crossfade interrompu avant stabilisation, reprise standard', {
-                currentTrack: interruptedTrack?.title ?? null,
-                playbackDuration: this.activeResources.get(queue.guildId)?.playbackDuration ?? null,
-            });
-
-            this.lastTrackEndEvent.set(queue.guildId, {
-                trackId: currentTrackId ? `${currentTrackId}:crossfade-failure` : null,
-                at: now,
-            });
-
-            this.teardownActiveResource(queue.guildId);
-            this.stopCrossfadeMonitor(queue.guildId);
-            queue.crossfadeInProgress = false;
-            queue.crossfadeTargetTrackId = null;
-            queue.isPlaying = false;
-            queue.isPaused = false;
-            queue.autoPausedByEmptyChannel = false;
-            queue.startedAt = null;
-            queue.pausedAt = null;
-            queue.totalPausedTime = 0;
-
-            if (interruptedTrack) {
-                queue.tracks.unshift(interruptedTrack);
-            }
-
-            void this.playNext(queue.guildId);
             return;
         }
 
@@ -926,11 +1349,10 @@ class QueueManager extends EventEmitter {
         }
 
         this.teardownActiveResource(queue.guildId);
-        this.stopCrossfadeMonitor(queue.guildId);
+        this.clearBufferingWatchdog(queue.guildId);
         queue.isPlaying = false;
         queue.isPaused = false;
         queue.autoPausedByEmptyChannel = false;
-        queue.crossfadeTargetTrackId = null;
         queue.startedAt = null;
         queue.pausedAt = null;
         queue.totalPausedTime = 0;
@@ -961,9 +1383,18 @@ class QueueManager extends EventEmitter {
             return false;
         }
 
-        queue.player.pause();
+        const currentTime = this.getCurrentTime(guildId);
+        const paused = queue.player.pause();
+        if (!paused) {
+            log.trace('Pause refusee par le player');
+            return false;
+        }
+
+        queue.startedAt = Date.now() - currentTime * 1000;
+        queue.totalPausedTime = 0;
+        queue.pausedAt = Date.now();
+        queue.isPaused = true;
         queue.autoPausedByEmptyChannel = false;
-        this.stopCrossfadeMonitor(guildId);
         log.info('Lecture mise en pause');
         return true;
     }
@@ -984,10 +1415,15 @@ class QueueManager extends EventEmitter {
             queue.pausedAt = null;
         }
 
+        if (!queue.startedAt) {
+            const currentTime = this.getCurrentTime(guildId);
+            queue.startedAt = Date.now() - currentTime * 1000;
+            queue.totalPausedTime = 0;
+        }
+
         queue.player.unpause();
         queue.isPaused = false;
         queue.autoPausedByEmptyChannel = false;
-        this.startCrossfadeMonitor(queue);
         log.info('Lecture reprise');
         return true;
     }
@@ -998,27 +1434,50 @@ class QueueManager extends EventEmitter {
     async seekTo(guildId: string, targetSeconds: number): Promise<boolean> {
         return this.runWithTransitionLock(guildId, async () => {
             const queue = this.queues.get(guildId);
-            if (!queue || !queue.player || !queue.currentTrack) {
+            if (
+                !queue ||
+                !queue.player ||
+                !queue.currentTrack ||
+                queue.isReconnecting ||
+                !queue.connection ||
+                queue.connection.state.status !== VoiceConnectionStatus.Ready
+            ) {
                 log.warn(`Seek impossible pour guild: ${guildId}`);
                 return false;
             }
 
-            const duration = queue.currentTrack.duration;
+            const expectedTrack = queue.currentTrack;
+            const recovery: PlaybackRecoveryContext = {
+                signal: this.getQueueSessionSignal(guildId),
+                transitionNonce: this.bumpTransitionNonce(guildId),
+                track: expectedTrack,
+            };
+
+            const duration = expectedTrack.duration;
             const clamped = duration > 0
                 ? Math.max(0, Math.min(Math.floor(targetSeconds), duration - 1))
                 : Math.max(0, Math.floor(targetSeconds));
 
-            log.info(`Seek vers ${clamped}s (piste: ${queue.currentTrack.title})`);
+            log.info(`Seek vers ${clamped}s (piste: ${expectedTrack.title})`);
 
             const settings = await guildSettingsManager.getSettings(guildId);
+            if (!this.isRecoveryCurrent(queue, recovery)) {
+                return false;
+            }
             const resource = await audioWrapper.createResource(
                 guildId,
-                queue.currentTrack,
+                expectedTrack,
                 clamped,
-                settings.sponsorBlockEnabled
+                settings.sponsorBlockEnabled,
+                queue.volume
             );
             if (!resource) {
                 log.error('Seek: impossible de créer la ressource audio');
+                return false;
+            }
+
+            if (!this.isRecoveryCurrent(queue, recovery)) {
+                audioWrapper.teardownResource(resource);
                 return false;
             }
 
@@ -1032,10 +1491,12 @@ class QueueManager extends EventEmitter {
             queue.isPaused = false;
             queue.isStopping = false;
 
-            this.bumpTransitionNonce(guildId);
             await this.replaceActiveResource(queue, resource);
-            this.startCrossfadeMonitor(queue);
-            return true;
+            const started = await this.waitForPlaybackStart(queue, resource, recovery.signal);
+            if (!started && this.activeResources.get(guildId) === resource) {
+                this.teardownActiveResource(guildId);
+            }
+            return started && this.isRecoveryCurrent(queue, recovery);
         });
     }
 
@@ -1058,16 +1519,16 @@ class QueueManager extends EventEmitter {
         queue.currentTrack = null;
         queue.isPlaying = false;
         queue.isPaused = false;
+        queue.isReconnecting = false;
+        queue.reconnectAttempts = 0;
         queue.autoPausedByEmptyChannel = false;
-        queue.crossfadeInProgress = false;
-        queue.crossfadeTargetTrackId = null;
         queue.startedAt = null;
         queue.pausedAt = null;
         queue.totalPausedTime = 0;
-        this.bumpTransitionNonce(guildId);
+        this.beginQueueSession(guildId);
         this.teardownActiveResource(guildId);
         this.clearGuildWarmup(guildId);
-        this.stopCrossfadeMonitor(guildId);
+        this.clearBufferingWatchdog(guildId);
         void audioWrapper.cleanupGuildTemp(guildId);
 
         if (queue.player) {
@@ -1097,14 +1558,31 @@ class QueueManager extends EventEmitter {
             return false;
         }
 
-        log.info(`Skip de: ${queue.currentTrack?.title}`);
-        queue.crossfadeInProgress = false;
-        queue.crossfadeTargetTrackId = null;
+        const pending = this.pendingPlaybackStarts.get(guildId);
+        const hadCurrentTrack = Boolean(queue.currentTrack);
+        const skippedTrack = queue.currentTrack ?? pending?.track ?? null;
+        log.info(`Skip de: ${skippedTrack?.title}`);
         queue.autoPausedByEmptyChannel = false;
-        this.bumpTransitionNonce(guildId);
+        queue.isReconnecting = false;
+        queue.reconnectAttempts = 0;
+        this.beginQueueSession(guildId);
+        if (pending) {
+            this.pendingPlaybackStarts.delete(guildId);
+            const pendingIndex = queue.tracks.findIndex(
+                (candidate) => candidate === pending.track || candidate.id === pending.track.id
+            );
+            if (pendingIndex >= 0) {
+                queue.tracks.splice(pendingIndex, 1);
+            }
+        }
         this.teardownActiveResource(guildId);
-        this.stopCrossfadeMonitor(guildId);
+        this.clearBufferingWatchdog(guildId);
         queue.player.stop(true);
+        if (!queue.currentTrack && pending) {
+            void this.playNext(guildId);
+        } else if (hadCurrentTrack) {
+            this.handleTrackEnd(queue);
+        }
         return true;
     }
 
@@ -1224,10 +1702,26 @@ class QueueManager extends EventEmitter {
      */
     getCurrentTime(guildId: string): number {
         const queue = this.queues.get(guildId);
-        if (!queue || !queue.startedAt) return 0;
+        if (!queue) return 0;
 
-        const now = queue.isPaused && queue.pausedAt ? queue.pausedAt : Date.now();
-        return Math.floor((now - queue.startedAt - queue.totalPausedTime) / 1000);
+        if (queue.startedAt) {
+            const now = queue.isPaused && queue.pausedAt ? queue.pausedAt : Date.now();
+            return Math.max(0, Math.floor((now - queue.startedAt - queue.totalPausedTime) / 1000));
+        }
+
+        const resource = this.activeResources.get(guildId);
+        if (!resource || !queue.currentTrack) {
+            return 0;
+        }
+
+        const metadata = resource.metadata as { startSeconds?: number } | undefined;
+        const baseSeconds = Number.isFinite(metadata?.startSeconds) ? metadata?.startSeconds ?? 0 : 0;
+        const fallbackSeconds = Math.max(0, Math.floor(baseSeconds + resource.playbackDuration / 1000));
+        if (Number.isFinite(queue.currentTrack.duration) && queue.currentTrack.duration > 0) {
+            return Math.min(fallbackSeconds, queue.currentTrack.duration);
+        }
+
+        return fallbackSeconds;
     }
 
     /**
@@ -1278,6 +1772,10 @@ class QueueManager extends EventEmitter {
         }
 
         this.rememberRetiredResource(guildId, resource);
+        const pending = this.pendingPlaybackStarts.get(guildId);
+        if (pending?.resource === resource) {
+            this.pendingPlaybackStarts.delete(guildId);
+        }
         audioWrapper.teardownResource(resource);
         this.activeResources.delete(guildId);
     }
@@ -1287,15 +1785,9 @@ class QueueManager extends EventEmitter {
             throw new Error('Player non disponible');
         }
 
-        this.resourceSwapInProgress.add(queue.guildId);
-        try {
-            this.teardownActiveResource(queue.guildId);
-            await this.waitForPipelineSettle();
-            this.activeResources.set(queue.guildId, resource);
-            queue.player.play(resource);
-        } finally {
-            this.resourceSwapInProgress.delete(queue.guildId);
-        }
+        this.teardownActiveResource(queue.guildId);
+        this.activeResources.set(queue.guildId, resource);
+        queue.player.play(resource);
     }
 
     private getActiveResourceTrackId(guildId: string): string | null {
@@ -1362,6 +1854,8 @@ class QueueManager extends EventEmitter {
     }
 
     private clearGuildWarmup(guildId: string): void {
+        void audioWrapper.preloadTracks(guildId, []);
+        void audioWrapper.cancelGuildWarmups(guildId);
         const warmedTrackId = this.warmedTrackByGuild.get(guildId);
         if (!warmedTrackId) {
             return;
@@ -1389,158 +1883,9 @@ class QueueManager extends EventEmitter {
         }
 
         this.warmedTrackByGuild.set(queue.guildId, nextTrack.id);
-        const cacheCandidates = queue.tracks.slice(1, config.audio.cacheAhead + 1);
+        const cacheCandidates = queue.tracks.slice(0, config.audio.cacheAhead);
         void audioWrapper.preloadTracks(queue.guildId, cacheCandidates);
         void audioWrapper.warmTrack(queue.guildId, nextTrack);
-    }
-
-    private startCrossfadeMonitor(queue: GuildQueue): void {
-        this.stopCrossfadeMonitor(queue.guildId);
-        if (!queue.currentTrack || queue.tracks.length === 0 || queue.isPaused || !queue.isPlaying) {
-            return;
-        }
-
-        const remainingMs = (
-            queue.currentTrack.duration -
-            this.getCurrentTime(queue.guildId) -
-            this.crossfadeSeconds -
-            this.crossfadePrepareLeadSeconds
-        ) * 1000;
-        const delayMs = Number.isFinite(remainingMs) ? Math.max(250, remainingMs) : 250;
-        const timer = setTimeout(() => {
-            void this.maybeTriggerCrossfade(queue.guildId);
-        }, delayMs);
-
-        this.crossfadeMonitors.set(queue.guildId, timer);
-    }
-
-    private stopCrossfadeMonitor(guildId: string): void {
-        const monitor = this.crossfadeMonitors.get(guildId);
-        if (!monitor) {
-            return;
-        }
-
-        clearTimeout(monitor);
-        this.crossfadeMonitors.delete(guildId);
-    }
-
-    private async maybeTriggerCrossfade(guildId: string): Promise<void> {
-        const queue = this.queues.get(guildId);
-        if (!queue || !queue.currentTrack || queue.tracks.length === 0 || queue.isPaused || !queue.isPlaying) {
-            return;
-        }
-        if (!queue.player || queue.player.state.status !== AudioPlayerStatus.Playing) {
-            return;
-        }
-        if (queue.crossfadeInProgress || this.crossfadeAttemptsInFlight.has(guildId)) {
-            return;
-        }
-        if (!Number.isFinite(queue.currentTrack.duration) || queue.currentTrack.duration <= 0) {
-            return;
-        }
-
-        const settings = await guildSettingsManager.getSettings(guildId);
-        if (!settings.crossfadeEnabled) {
-            return;
-        }
-
-        const currentTime = this.getCurrentTime(guildId);
-        const remaining = queue.currentTrack.duration - currentTime;
-        if (remaining > this.crossfadeSeconds + this.crossfadePrepareLeadSeconds + 0.25 || remaining <= 0) {
-            return;
-        }
-
-        this.crossfadeAttemptsInFlight.add(guildId);
-        try {
-            await this.runWithTransitionLock(guildId, async () => this.triggerCrossfadeInternal(guildId));
-        } finally {
-            this.crossfadeAttemptsInFlight.delete(guildId);
-        }
-    }
-
-    private async triggerCrossfadeInternal(guildId: string): Promise<boolean> {
-        const queue = this.queues.get(guildId);
-        if (!queue || !queue.player || !queue.currentTrack || queue.tracks.length === 0) {
-            return false;
-        }
-        if (queue.crossfadeInProgress) {
-            return false;
-        }
-
-        const currentTrack = queue.currentTrack;
-        const previousStartedAt = queue.startedAt;
-        const previousPausedAt = queue.pausedAt;
-        const previousTotalPausedTime = queue.totalPausedTime;
-        const nextTrack = queue.tracks.shift();
-        if (!nextTrack) {
-            return false;
-        }
-
-        queue.crossfadeInProgress = true;
-        queue.crossfadeTargetTrackId = nextTrack.id;
-
-        try {
-            const currentOffsetSeconds = this.getCurrentTime(guildId);
-            const resource = await audioWrapper.createCrossfadeResource(
-                guildId,
-                currentTrack,
-                nextTrack,
-                currentOffsetSeconds,
-                this.crossfadeSeconds
-            );
-
-            if (!resource) {
-                queue.tracks.unshift(nextTrack);
-                queue.crossfadeInProgress = false;
-                queue.crossfadeTargetTrackId = null;
-                return false;
-            }
-
-            if (resource.volume) {
-                resource.volume.setVolume(queue.volume / 100);
-            }
-
-            this.bumpTransitionNonce(guildId);
-            queue.currentTrack = nextTrack;
-            queue.startedAt = Date.now();
-            queue.pausedAt = null;
-            queue.totalPausedTime = 0;
-            queue.isPaused = false;
-            queue.isPlaying = true;
-            queue.autoPausedByEmptyChannel = false;
-
-            audioWrapper.clearFromCache(guildId, currentTrack.id);
-            this.clearLyrics(queue, currentTrack.id);
-            void this.pruneCache();
-            this.emit('trackEnd', queue, currentTrack);
-
-            await this.replaceActiveResource(queue, resource);
-            setTimeout(() => {
-                const latestQueue = this.queues.get(guildId);
-                if (!latestQueue) {
-                    return;
-                }
-                if (latestQueue.crossfadeTargetTrackId === nextTrack.id) {
-                    latestQueue.crossfadeInProgress = false;
-                    latestQueue.crossfadeTargetTrackId = null;
-                }
-            }, (this.crossfadeSeconds + this.crossfadePrepareLeadSeconds) * 1000 + 250);
-            this.refreshWarmup(queue);
-            log.info(`Crossfade lancé: ${currentTrack.title} -> ${nextTrack.title}`);
-            return true;
-        } catch (error) {
-            queue.currentTrack = currentTrack;
-            queue.startedAt = previousStartedAt;
-            queue.pausedAt = previousPausedAt;
-            queue.totalPausedTime = previousTotalPausedTime;
-            queue.isPlaying = true;
-            queue.isPaused = !!previousPausedAt;
-            queue.tracks.unshift(nextTrack);
-            queue.crossfadeInProgress = false;
-            queue.crossfadeTargetTrackId = null;
-            log.warn('Crossfade indisponible, fallback en transition standard', error);
-            return false;
-        }
     }
 
     private stopVoiceChannelMonitor(guildId: string): void {
@@ -1580,23 +1925,113 @@ class QueueManager extends EventEmitter {
         }
     }
 
-    private async waitForPipelineSettle(): Promise<void> {
-        await new Promise<void>((resolve) => {
-            setTimeout(resolve, this.pipelineTeardownWaitMs);
-        });
+    private beginQueueSession(guildId: string): AbortSignal {
+        const previous = this.sessionAbortControllers.get(guildId);
+        previous?.abort();
+        const controller = new AbortController();
+        this.sessionAbortControllers.set(guildId, controller);
+        this.bumpTransitionNonce(guildId);
+        return controller.signal;
+    }
+
+    private invalidateQueueSession(guildId: string): void {
+        this.sessionAbortControllers.get(guildId)?.abort();
+        this.sessionAbortControllers.delete(guildId);
+        this.bumpTransitionNonce(guildId);
+    }
+
+    private getQueueSessionSignal(guildId: string): AbortSignal {
+        const existing = this.sessionAbortControllers.get(guildId);
+        if (existing) {
+            return existing.signal;
+        }
+        return this.beginQueueSession(guildId);
+    }
+
+    private captureRecoveryContext(queue: GuildQueue): PlaybackRecoveryContext {
+        return {
+            signal: this.getQueueSessionSignal(queue.guildId),
+            transitionNonce: this.transitionNonces.get(queue.guildId) ?? 0,
+            track: queue.currentTrack,
+        };
+    }
+
+    private isRecoveryCurrent(queue: GuildQueue, recovery: PlaybackRecoveryContext): boolean {
+        return (
+            !recovery.signal.aborted &&
+            !queue.isManualDisconnect &&
+            this.queues.get(queue.guildId) === queue &&
+            this.isTransitionCurrent(queue.guildId, recovery.transitionNonce) &&
+            queue.currentTrack === recovery.track
+        );
+    }
+
+    private startBufferingWatchdog(queue: GuildQueue): void {
+        this.clearBufferingWatchdog(queue.guildId);
+        const resource = this.activeResources.get(queue.guildId);
+        const recovery = this.captureRecoveryContext(queue);
+        const expectedTrack = recovery.track;
+        if (!resource || !expectedTrack) {
+            return;
+        }
+
+        const timer = setTimeout(() => {
+            if (this.bufferingWatchdogs.get(queue.guildId) === timer) {
+                this.bufferingWatchdogs.delete(queue.guildId);
+            }
+            void this.runWithTransitionLock(queue.guildId, async () => {
+                const activeQueue = this.queues.get(queue.guildId);
+                if (
+                    activeQueue !== queue ||
+                    !queue.player ||
+                    queue.player.state.status !== AudioPlayerStatus.Buffering ||
+                    this.activeResources.get(queue.guildId) !== resource ||
+                    !this.isRecoveryCurrent(queue, recovery)
+                ) {
+                    return;
+                }
+
+                const resumeOffset = this.getCurrentTime(queue.guildId);
+                log.warn(`Buffering bloqué depuis ${this.bufferingTimeoutMs}ms, recréation de la ressource`, {
+                    guildId: queue.guildId,
+                    track: expectedTrack.title,
+                    resumeOffset,
+                });
+                const recovered = await this.resumeCurrentTrack(queue, resumeOffset, recovery);
+                if (!recovered && this.isRecoveryCurrent(queue, recovery)) {
+                    this.handleTrackEnd(queue);
+                }
+            });
+        }, this.bufferingTimeoutMs);
+        timer.unref();
+        this.bufferingWatchdogs.set(queue.guildId, timer);
+    }
+
+    private clearBufferingWatchdog(guildId: string): void {
+        const timer = this.bufferingWatchdogs.get(guildId);
+        if (!timer) {
+            return;
+        }
+        clearTimeout(timer);
+        this.bufferingWatchdogs.delete(guildId);
     }
 
     private markIntentionalConnectionDestroy(guildId: string, connection: VoiceConnection): void {
-        this.intentionalConnectionDestroy.set(guildId, connection);
+        const markedConnections = this.intentionalConnectionDestroy.get(guildId) ?? new Set<VoiceConnection>();
+        markedConnections.add(connection);
+        this.intentionalConnectionDestroy.set(guildId, markedConnections);
     }
 
     private consumeIntentionalConnectionDestroy(guildId: string, connection: VoiceConnection): boolean {
-        const markedConnection = this.intentionalConnectionDestroy.get(guildId);
-        if (!markedConnection || markedConnection !== connection) {
+        const markedConnections = this.intentionalConnectionDestroy.get(guildId);
+        if (!markedConnections?.has(connection)) {
             return false;
         }
 
-        this.intentionalConnectionDestroy.delete(guildId);
+        markedConnections.delete(connection);
+        if (markedConnections.size === 0) {
+            this.intentionalConnectionDestroy.delete(guildId);
+        }
         return true;
     }
 }

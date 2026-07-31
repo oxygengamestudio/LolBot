@@ -3,6 +3,7 @@ import type {
     ButtonInteraction,
     ChatInputCommandInteraction,
     GuildMember,
+    InteractionEditReplyOptions,
     InteractionReplyOptions,
     ModalSubmitInteraction,
     RepliableInteraction,
@@ -34,7 +35,13 @@ export async function replyEphemeral(
         allowedMentions: { parse: [] },
     };
 
-    if (interaction.deferred || interaction.replied) {
+    if (interaction.deferred && !interaction.replied) {
+        const editPayload: InteractionEditReplyOptions = {
+            content,
+            allowedMentions: { parse: [] },
+        };
+        await interaction.editReply(editPayload);
+    } else if (interaction.replied) {
         await interaction.followUp(payload);
     } else {
         await interaction.reply(payload);

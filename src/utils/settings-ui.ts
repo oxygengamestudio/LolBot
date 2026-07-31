@@ -22,7 +22,6 @@ export const SETTINGS_BUTTON_IDS = {
     stay: 'settings_stay',
     always: 'settings_always',
     pauseOnEmpty: 'settings_pause_on_empty',
-    crossfade: 'settings_crossfade',
     sponsor: 'settings_sponsor',
     preferred: 'settings_preferred',
     voice: 'settings_voice',
@@ -65,7 +64,7 @@ export function buildSettingsMessage(settings: GuildSettings): {
         `📌 ${t(locale, 'settings.stayConnected')}: ${booleanLabel(locale, settings.stayConnected)}`,
         `🔗 ${t(locale, 'settings.alwaysConnected')}: ${booleanLabel(locale, settings.stayConnectedAlways)}`,
         `⏸️ ${t(locale, 'settings.pauseOnEmpty')}: ${booleanLabel(locale, settings.pauseOnEmptyChannelWhenAlwaysConnected)}`,
-        `🎚️ ${t(locale, 'settings.crossfade')}: ${settings.crossfadeEnabled ? `${t(locale, 'settings.value.enabled')} (3s)` : t(locale, 'settings.value.disabled')}`,
+        `⏭️ Transition gapless: ${t(locale, 'settings.value.enabled')}`,
         `🎶 SponsorBlock: ${booleanLabel(locale, settings.sponsorBlockEnabled)}`,
         `🎙️ ${t(locale, 'settings.preferredChannel')}: ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : t(locale, 'settings.channel.none')}`,
         `🚪 ${t(locale, 'settings.voiceChannels')}: ${formatModeLabel(locale, settings.voiceChannelMode, settings.allowedVoiceChannels.length, settings.blockedVoiceChannels.length)}`,
@@ -116,10 +115,6 @@ export function buildSettingsMessage(settings: GuildSettings): {
             .setCustomId(SETTINGS_BUTTON_IDS.pauseOnEmpty)
             .setEmoji('⏸️')
             .setStyle(settings.pauseOnEmptyChannelWhenAlwaysConnected ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId(SETTINGS_BUTTON_IDS.crossfade)
-            .setEmoji('🎚️')
-            .setStyle(settings.crossfadeEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.sponsor)
             .setEmoji('🎶')

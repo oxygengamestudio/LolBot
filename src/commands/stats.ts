@@ -1,11 +1,11 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, EmbedBuilder, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { audioWrapper } from '../audio/AudioWrapper.js';
-import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
 import { ensureCanUseBot, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
 import { safeContent } from '../utils/text.js';
+import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
 
 const log = logger.createModuleLogger('StatsCmd');
 
@@ -44,15 +44,15 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const currentTrack = queue?.currentTrack;
     const volume = queue?.volume ?? 100;
     const telemetry = queue?.lastStartMetrics;
-    const settings = await guildSettingsManager.getSettings(guildId);
 
     await interaction.deferReply({ flags: 64 });
 
     const sourceBitrate = currentTrack
-        ? await audioWrapper.getBestAudioBitrateKbps(currentTrack.url)
+        ? audioWrapper.getEstimatedAudioBitrateKbps(guildId, currentTrack)
         : null;
     const outputBitrate = audioWrapper.getDiscordOutputBitrateKbps();
     const sourceMode = queue ? audioWrapper.getLastSourceMode(guildId) : 'unknown';
+    const runtime = runtimeTelemetry.getSnapshot();
 
     const audioQuality = [
         `${t(locale, 'stats.source')}: ${sourceBitrate ? `${sourceBitrate} kbps` : 'n/a'}`,
@@ -65,9 +65,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
             warmup: telemetry.warmHit ? `hit (${telemetry.warmupMs ?? 0}ms)` : `${telemetry.warmupMs ?? 'n/a'}ms`,
             resourceMs: telemetry.resourceMs ?? 'n/a',
             sourceMode,
-            crossfade: settings.crossfadeEnabled
-                ? (queue?.crossfadeInProgress ? 'on (active)' : 'on')
-                : 'off',
+            crossfade: 'off (gapless)',
         })
         : 'n/a';
 
@@ -81,6 +79,16 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
             { name: t(locale, 'stats.player'), value: `Etat: ${playerStatus}\nVolume: ${volume}%`, inline: true },
             { name: t(locale, 'stats.audioQuality'), value: audioQuality, inline: false },
             { name: t(locale, 'stats.telemetry'), value: telemetryValue, inline: false },
+            {
+                name: 'Runtime',
+                value: [
+                    `CPU: ${runtime.cpuPercent}% • RSS: ${runtime.rssMb} MB • event-loop p95: ${runtime.eventLoopP95Ms} ms`,
+                    `Média observé: ${runtime.mediaKbps} kb/s • cache: ${runtime.cacheHits} hit / ${runtime.cacheMisses} miss`,
+                    `Démarrage p95: ${runtime.startLatencyP95Ms} ms • join: ${runtime.joinLatencyP95Ms} ms • résolution: ${runtime.resolutionLatencyP95Ms} ms`,
+                    `Retries: ${runtime.playbackRetries} • reconnexions: ${runtime.reconnectAttempts}`,
+                ].join('\n'),
+                inline: false,
+            },
             {
                 name: t(locale, 'stats.nowPlaying'),
                 value: currentTrack

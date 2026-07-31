@@ -2,17 +2,17 @@
 import { EventEmitter } from 'events';
 import { Readable, Transform } from 'stream';
 import type { ChildProcess } from 'child_process';
-import { existsSync, mkdirSync } from 'fs';
-import { mkdir, chmod, rename, unlink, readdir, rm, stat } from 'fs/promises';
+import { createReadStream, existsSync, mkdirSync } from 'fs';
+import { mkdir, unlink, readdir, rm, stat } from 'fs/promises';
 import { join } from 'path';
 import { createAudioResource, StreamType, AudioResource } from '@discordjs/voice';
 import type { Track } from '../types/index.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
-import { downloadFile } from '../utils/httpClient.js';
 import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
 import { mediaCacheManager } from './MediaCacheManager.js';
 import { sponsorBlockService } from './SponsorBlockService.js';
+import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
 
@@ -63,18 +63,28 @@ interface CacheEntry {
     trackId: string;
     resource: AudioResource | null;
     streamUrl: string | null;
+    streamError?: string;
+    streamErrorAt?: number;
     timestamp: number;
 }
 
 interface ResourceMetadata {
     trackId: string;
     teardown: () => void;
+    fullyClosed?: Promise<void>;
     createdAt: number;
+    startSeconds: number;
 }
 
 interface WarmResourceEntry {
     warmedAt: number;
     expiresAt: number;
+}
+
+interface WarmupSlotWaiter {
+    resolve: (acquired: boolean) => void;
+    signal: AbortSignal;
+    onAbort: () => void;
 }
 
 interface SponsorSegment {
@@ -84,6 +94,7 @@ interface SponsorSegment {
 
 export class AudioWrapper extends EventEmitter {
     private cache: Map<string, CacheEntry> = new Map();
+    private bitrateCache: Map<string, { bitrate: number | null; timestamp: number }> = new Map();
     private preloadingGuilds: Set<string> = new Set();
     private ffmpegPath: string = 'ffmpeg';
     private ytdlpPath: string = 'yt-dlp';
@@ -92,12 +103,20 @@ export class AudioWrapper extends EventEmitter {
     private dependenciesReady: Promise<boolean> | null = null;
     private warmTracks: Map<string, WarmResourceEntry> = new Map();
     private warmupInFlight: Map<string, Promise<void>> = new Map();
+    private warmupAbortControllers: Map<string, AbortController> = new Map();
+    private warmupGenerationByGuild: Map<string, number> = new Map();
+    private warmupSlotWaiters: WarmupSlotWaiter[] = [];
+    private activeWarmupSlots = 0;
+    private readonly maxConcurrentWarmups = Math.max(1, Math.min(2, config.audio.cacheDownloadConcurrency));
     private lastSourceModeByGuild: Map<string, 'direct' | 'ytdlp' | 'unknown'> = new Map();
     private readonly discordOpusBitrateKbps = 96;
     private readonly streamReadyWaitMs = 1_000;
     private readonly directStreamReadyWaitMs = 1_000;
-    private readonly crossfadeReadyWaitMs = 4_000;
+    private readonly maxProcessOutputBytes = 64 * 1024;
+    private readonly maxMetadataOutputBytes = 2 * 1024 * 1024;
+    private readonly processKillGraceMs = 2_000;
     private readonly warmResourceTtlMs = 90_000;
+    private readonly bitrateCacheTtlMs = 60 * 60 * 1000;
     private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
@@ -106,7 +125,7 @@ export class AudioWrapper extends EventEmitter {
         mkdirSync(config.paths.cache, { recursive: true });
         this.dependenciesReady = this.checkDependencies();
         this.startCacheCleanup();
-        void this.cleanupAllStaleTemp();
+        void this.cleanupAllStaleTemp(0);
     }
 
     /**
@@ -130,24 +149,12 @@ export class AudioWrapper extends EventEmitter {
         this.ffmpegAvailable = await this.checkBinary('FFmpeg', this.ffmpegPath, ['-version']);
         this.ytdlpAvailable = await this.checkBinary('yt-dlp', this.ytdlpPath, ['--version']);
 
-        if (!this.ytdlpAvailable && !envYtdlp && config.audio.ytdlpAutoDownload) {
-            const downloaded = await this.downloadYtdlp(localYtdlpPath);
-            if (downloaded) {
-                this.ytdlpPath = localYtdlpPath;
-                this.ytdlpAvailable = await this.checkBinary('yt-dlp', this.ytdlpPath, ['--version']);
-            }
-        }
-
         if (!this.ffmpegAvailable) {
             log.error('FFmpeg not found. Install it or set FFMPEG_PATH.');
         }
 
         if (!this.ytdlpAvailable) {
-            if (config.audio.ytdlpAutoDownload) {
-                log.error('yt-dlp not found. Install it or set YTDLP_PATH.');
-            } else {
-                log.error('yt-dlp not found. Install it, set YTDLP_PATH, or enable YTDLP_AUTO_DOWNLOAD=true.');
-            }
+            log.error('yt-dlp not found. Install a pinned version or set YTDLP_PATH.');
         }
 
         return this.ffmpegAvailable && this.ytdlpAvailable;
@@ -162,10 +169,12 @@ export class AudioWrapper extends EventEmitter {
         return new Promise((resolve) => {
             let output = '';
             let settled = false;
+            let timer: NodeJS.Timeout | undefined;
 
             const finish = (ok: boolean) => {
                 if (!settled) {
                     settled = true;
+                    if (timer) clearTimeout(timer);
                     resolve(ok);
                 }
             };
@@ -176,11 +185,11 @@ export class AudioWrapper extends EventEmitter {
             });
 
             child.stdout?.on('data', (data) => {
-                output += data.toString();
+                output = this.appendBoundedOutput(output, data);
             });
 
             child.stderr?.on('data', (data) => {
-                output += data.toString();
+                output = this.appendBoundedOutput(output, data);
             });
 
             child.on('error', (error) => {
@@ -208,6 +217,11 @@ export class AudioWrapper extends EventEmitter {
                 }
                 finish(success);
             });
+            timer = setTimeout(() => {
+                this.terminateProcess(child);
+                finish(false);
+            }, config.audio.ffmpegTimeoutMs);
+            timer.unref?.();
         });
     }
 
@@ -260,6 +274,36 @@ export class AudioWrapper extends EventEmitter {
         return safeEnv;
     }
 
+    private terminateProcess(child: ChildProcess): void {
+        if (child.exitCode !== null || child.signalCode !== null) {
+            return;
+        }
+        try {
+            child.kill('SIGTERM');
+        } catch {
+            return;
+        }
+        const forceKill = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+                try {
+                    child.kill('SIGKILL');
+                } catch {
+                    // Le processus est déjà fermé.
+                }
+            }
+        }, this.processKillGraceMs);
+        forceKill.unref?.();
+        child.once('close', () => clearTimeout(forceKill));
+    }
+
+    private appendBoundedOutput(current: string, chunk: Buffer | string): string {
+        const next = current + chunk.toString();
+        if (Buffer.byteLength(next) <= this.maxProcessOutputBytes) {
+            return next;
+        }
+        return Buffer.from(next).subarray(-this.maxProcessOutputBytes).toString();
+    }
+
     private async cleanupRunDirectory(runDir: string): Promise<void> {
         try {
             await rm(runDir, { recursive: true, force: true });
@@ -269,6 +313,7 @@ export class AudioWrapper extends EventEmitter {
     }
 
     async cleanupGuildTemp(guildId: string): Promise<void> {
+        await this.cancelGuildWarmups(guildId);
         const prefix = `${guildId}:`;
         for (const key of this.cache.keys()) {
             if (key.startsWith(prefix)) {
@@ -280,12 +325,6 @@ export class AudioWrapper extends EventEmitter {
                 this.warmTracks.delete(key);
             }
         }
-        for (const key of this.warmupInFlight.keys()) {
-            if (key.startsWith(prefix)) {
-                this.warmupInFlight.delete(key);
-            }
-        }
-
         this.lastSourceModeByGuild.delete(guildId);
         const guildCacheDir = this.getGuildCacheDir(guildId);
         await rm(guildCacheDir, { recursive: true, force: true }).catch(() => undefined);
@@ -413,6 +452,24 @@ export class AudioWrapper extends EventEmitter {
         return lower.includes('could not copy') && lower.includes('cookie');
     }
 
+    private isAuthenticationRequiredError(stderr: string): boolean {
+        const lower = stderr.toLowerCase();
+        return lower.includes('sign in')
+            || lower.includes('confirm your age')
+            || lower.includes('confirm you are not a bot')
+            || lower.includes('inappropriate for some users');
+    }
+
+    private shouldSkipYtdlpFallback(cacheKey: string): boolean {
+        const cached = this.cache.get(cacheKey);
+        if (!cached?.streamError || this.hasCookieEnv() || !this.isAuthenticationRequiredError(cached.streamError)) {
+            return false;
+        }
+
+        log.warn(this.getYtdlpHint(cached.streamError) ?? 'YouTube demande une authentification pour cette vidéo.');
+        return true;
+    }
+
     private getYtdlpHint(stderr: string): string | null {
         const lower = stderr.toLowerCase();
         if (this.isCookieCopyError(stderr)) {
@@ -421,7 +478,7 @@ export class AudioWrapper extends EventEmitter {
         if (lower.includes('http error 403') || lower.includes('forbidden')) {
             return 'yt-dlp recoit un 403. Essayez YTDLP_COOKIES_FROM_BROWSER=chrome (ou edge) ou YTDLP_COOKIES=chemin\\cookies.txt.';
         }
-        if (lower.includes('sign in') || lower.includes('confirm you are not a bot')) {
+        if (this.isAuthenticationRequiredError(stderr)) {
             return 'YouTube demande une verification. Utilise des cookies via YTDLP_COOKIES_FROM_BROWSER ou YTDLP_COOKIES.';
         }
         return null;
@@ -485,42 +542,6 @@ export class AudioWrapper extends EventEmitter {
         });
     }
 
-    private async downloadYtdlp(targetPath: string): Promise<boolean> {
-        try {
-            const url = this.getYtdlpDownloadUrl();
-            const binDir = join(config.paths.data, 'bin');
-            await mkdir(binDir, { recursive: true });
-
-            const tempPath = `${targetPath}.tmp`;
-
-            log.info(`Downloading yt-dlp from ${url}`);
-            await downloadFile(url, tempPath, ['github.com', 'objects.githubusercontent.com']);
-
-            if (existsSync(targetPath)) {
-                await unlink(targetPath);
-            }
-
-            await rename(tempPath, targetPath);
-
-            if (process.platform !== 'win32') {
-                await chmod(targetPath, 0o755);
-            }
-
-            log.info(`yt-dlp downloaded to: ${targetPath}`);
-            return true;
-        } catch (error) {
-            log.error('yt-dlp download failed', error);
-            return false;
-        }
-    }
-
-    private getYtdlpDownloadUrl(): string {
-        if (process.platform === 'win32') {
-            return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
-        }
-        return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
-    }
-
     /**
      * Crée une ressource audio à partir d'une piste
      * Utilise yt-dlp pour obtenir le stream audio
@@ -529,7 +550,8 @@ export class AudioWrapper extends EventEmitter {
         guildId: string,
         track: Track,
         startSeconds: number = 0,
-        sponsorBlockEnabled = false
+        sponsorBlockEnabled = false,
+        targetVolume = 100
     ): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
         log.trace('Track ID:', track.id);
@@ -541,19 +563,38 @@ export class AudioWrapper extends EventEmitter {
         }
 
         try {
-            const sponsorSegments = await this.getSponsorSegmentsFast(track.id, sponsorBlockEnabled);
+            const sponsorSegments = await this.getSponsorSegmentsFast(
+                track.id,
+                this.shouldUseSponsorBlock(track, sponsorBlockEnabled)
+            );
             this.applySponsorAdjustedDuration(track, sponsorSegments);
             const effectiveStartSeconds = this.getSponsorAdjustedStart(startSeconds, sponsorSegments);
             if (effectiveStartSeconds > startSeconds + 0.25) {
                 log.info(`SponsorBlock: saut du debut non musical jusqu'a ${effectiveStartSeconds.toFixed(1)}s`);
             }
 
-            const cachedFile = await mediaCacheManager.getTrackPath(track.id);
-            if (cachedFile) {
-                const resource = await this.createResourceWithDirectUrl(guildId, track, cachedFile, effectiveStartSeconds, sponsorSegments);
-                if (resource) {
-                    this.lastSourceModeByGuild.set(guildId, 'direct');
-                    return resource;
+            const cachedLease = await mediaCacheManager.acquireTrackPath(track);
+            if (cachedLease) {
+                let leaseTransferred = false;
+                try {
+                    const resource = await this.createResourceWithDirectUrl(
+                        guildId,
+                        track,
+                        cachedLease.path,
+                        effectiveStartSeconds,
+                        sponsorSegments,
+                        targetVolume
+                    );
+                    if (resource) {
+                        leaseTransferred = true;
+                        this.releaseCacheLeaseWhenClosed(resource, cachedLease.release);
+                        this.lastSourceModeByGuild.set(guildId, 'direct');
+                        return resource;
+                    }
+                } finally {
+                    if (!leaseTransferred) {
+                        cachedLease.release();
+                    }
                 }
             }
 
@@ -566,7 +607,8 @@ export class AudioWrapper extends EventEmitter {
                     track,
                     cached.streamUrl,
                     effectiveStartSeconds,
-                    sponsorSegments
+                    sponsorSegments,
+                    targetVolume
                 );
                 if (directResource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
@@ -583,11 +625,34 @@ export class AudioWrapper extends EventEmitter {
                     track,
                     warmDirectUrl,
                     effectiveStartSeconds,
-                    sponsorSegments
+                    sponsorSegments,
+                    targetVolume
                 );
                 if (directResource) {
                     this.lastSourceModeByGuild.set(guildId, 'direct');
                     return directResource;
+                }
+            }
+            if (shouldPreferDirectUrl && this.warmupInFlight.has(cacheKey)) {
+                log.debug('Résolution directe encore en cours, attente avant fallback yt-dlp');
+                await this.warmupInFlight.get(cacheKey)?.catch(() => undefined);
+                const warmed = this.cache.get(cacheKey);
+                if (warmed?.streamUrl && this.isLikelyDirectStreamUrl(warmed.streamUrl)) {
+                    const directResource = await this.createResourceWithDirectUrl(
+                        guildId,
+                        track,
+                        warmed.streamUrl,
+                        effectiveStartSeconds,
+                        sponsorSegments,
+                        targetVolume
+                    );
+                    if (directResource) {
+                        this.lastSourceModeByGuild.set(guildId, 'direct');
+                        return directResource;
+                    }
+                }
+                if (this.shouldSkipYtdlpFallback(cacheKey)) {
+                    return null;
                 }
             }
 
@@ -599,19 +664,24 @@ export class AudioWrapper extends EventEmitter {
                         track,
                         seekableUrl,
                         effectiveStartSeconds,
-                        sponsorSegments
+                        sponsorSegments,
+                        targetVolume
                     );
                     if (directResource) {
                         this.lastSourceModeByGuild.set(guildId, 'direct');
                         return directResource;
                     }
                 }
+                if (this.shouldSkipYtdlpFallback(cacheKey)) {
+                    return null;
+                }
             }
 
             if (track.sourceType === 'url') {
-                log.warn(`URL YouTube non lisible ou indisponible: ${track.id}`);
-                this.lastSourceModeByGuild.set(guildId, 'unknown');
-                return null;
+                log.warn(`URL directe indisponible pour ${track.id}, fallback streaming yt-dlp`);
+                const fallback = await this.createResourceWithYtdlp(guildId, track, effectiveStartSeconds, sponsorSegments);
+                this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
+                return fallback;
             }
 
             log.debug('Aucun media pre-resolu disponible, demarrage streaming yt-dlp immediat');
@@ -622,6 +692,20 @@ export class AudioWrapper extends EventEmitter {
             log.error(`Erreur lors de la création de la ressource:`, error);
             return null;
         }
+    }
+
+    private releaseCacheLeaseWhenClosed(resource: AudioResource, release: () => void): void {
+        const fullyClosed = (resource.metadata as Partial<ResourceMetadata> | undefined)?.fullyClosed;
+        if (fullyClosed) {
+            void fullyClosed.then(release, release);
+            return;
+        }
+        const stream = resource.playStream as Readable;
+        if (stream.closed) {
+            release();
+            return;
+        }
+        stream.once('close', release);
     }
 
     private async getSponsorSegmentsFast(videoId: string, enabled: boolean): Promise<SponsorSegment[]> {
@@ -705,140 +789,6 @@ export class AudioWrapper extends EventEmitter {
         return clipped.reduce((total, segment) => total + (segment.end - segment.start), 0);
     }
 
-    async createCrossfadeResource(
-        guildId: string,
-        currentTrack: Track,
-        nextTrack: Track,
-        currentOffsetSeconds: number,
-        fadeSeconds: number
-    ): Promise<AudioResource | null> {
-        const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
-        if (!dependenciesOk) {
-            return null;
-        }
-
-        const currentUrl = await this.resolveDirectStreamUrl(guildId, currentTrack);
-        const nextUrl = await this.resolveDirectStreamUrl(guildId, nextTrack);
-        if (!currentUrl || !nextUrl) {
-            log.warn('Crossfade impossible: URL directe manquante');
-            return null;
-        }
-
-        const runDir = await this.createRunDirectory(guildId);
-        const safeFade = Math.max(1, Math.min(Math.floor(fadeSeconds), 10));
-        const safeOffset = Math.max(0, Math.floor(currentOffsetSeconds));
-
-        const ffmpegArgs = [
-            '-loglevel', 'warning',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '2',
-            ...(safeOffset > 0 ? ['-ss', safeOffset.toString()] : []),
-            '-i', currentUrl,
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '2',
-            '-i', nextUrl,
-            '-filter_complex',
-            `[0:a]aresample=48000,asetpts=PTS-STARTPTS[a0];` +
-            `[1:a]aresample=48000,asetpts=PTS-STARTPTS[a1];` +
-            `[a0][a1]acrossfade=d=${safeFade}:c1=tri:c2=tri[a]`,
-            '-map', '[a]',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2',
-            'pipe:1',
-        ];
-
-        const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true,
-            env: this.getSpawnEnv(runDir),
-            cwd: runDir,
-        });
-
-        let tornDown = false;
-        const teardown = (reason: string) => {
-            if (tornDown) return;
-            tornDown = true;
-            log.trace(`Teardown crossfade pipeline: ${reason}`);
-
-            try {
-                ffmpeg.stdout?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            try {
-                ffmpeg.stderr?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            if (!ffmpeg.killed) {
-                try {
-                    ffmpeg.kill();
-                } catch {
-                    // Ignore
-                }
-            }
-
-            void this.cleanupRunDirectory(runDir);
-        };
-
-        let ffmpegErrors = '';
-        ffmpeg.stderr?.on('data', (data) => {
-            ffmpegErrors += data.toString();
-        });
-
-        ffmpeg.on('error', () => teardown('crossfade ffmpeg error'));
-        ffmpeg.on('close', (code) => {
-            if (code !== 0 && code !== null) {
-                log.trace(`FFmpeg crossfade fermé avec code ${code}`);
-            }
-            teardown(`crossfade ffmpeg closed (${code ?? 'null'})`);
-        });
-
-        if (!ffmpeg.stdout) {
-            teardown('crossfade stdout unavailable');
-            return null;
-        }
-
-        const stdout = ffmpeg.stdout as Readable;
-        stdout.once('close', () => teardown('crossfade audio stream closed'));
-        stdout.once('end', () => teardown('crossfade audio stream ended'));
-        stdout.once('error', () => teardown('crossfade audio stream error'));
-
-        const resource = createAudioResource<ResourceMetadata>(stdout, {
-            inputType: StreamType.Raw,
-            inlineVolume: true,
-            metadata: {
-                trackId: nextTrack.id,
-                teardown: () => teardown('crossfade resource teardown requested'),
-                createdAt: Date.now(),
-            },
-        });
-
-        if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
-            resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
-        }
-
-        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, this.crossfadeReadyWaitMs);
-        if (ready === 'close') {
-            if (ffmpegErrors) {
-                log.trace('FFmpeg crossfade errors:', ffmpegErrors.slice(-500));
-            }
-            return null;
-        }
-        if (ready === 'timeout') {
-            log.trace('FFmpeg crossfade readiness timeout, fallback possible');
-            teardown('crossfade readiness timeout');
-            return null;
-        }
-
-        return resource;
-    }
-
     getDiscordOutputBitrateKbps(): number {
         return this.discordOpusBitrateKbps;
     }
@@ -847,7 +797,27 @@ export class AudioWrapper extends EventEmitter {
         return this.lastSourceModeByGuild.get(guildId) ?? 'unknown';
     }
 
+    getEstimatedAudioBitrateKbps(guildId: string, track: Track): number | null {
+        const cached = this.cache.get(this.getScopedTrackKey(guildId, track.id));
+        const directEstimate = cached?.streamUrl ? this.estimateBitrateFromDirectUrl(cached.streamUrl) : null;
+        if (directEstimate) {
+            return directEstimate;
+        }
+
+        const infoEstimate = this.bitrateCache.get(track.url);
+        if (infoEstimate && Date.now() - infoEstimate.timestamp < this.bitrateCacheTtlMs) {
+            return infoEstimate.bitrate;
+        }
+
+        return null;
+    }
+
     async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
+        const cached = this.bitrateCache.get(url);
+        if (cached && Date.now() - cached.timestamp < this.bitrateCacheTtlMs) {
+            return cached.bitrate;
+        }
+
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
         if (!dependenciesOk) {
             return null;
@@ -856,17 +826,51 @@ export class AudioWrapper extends EventEmitter {
         const includeCookies = this.hasCookieEnv();
         const primary = await this.fetchYtdlpInfo(guildId, url, includeCookies);
         if (primary.info) {
-            return this.extractAudioBitrateKbps(primary.info);
+            const bitrate = this.extractAudioBitrateKbps(primary.info);
+            this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+            return bitrate;
         }
 
         if (includeCookies && this.isCookieCopyError(primary.ytdlpErrors)) {
             const fallback = await this.fetchYtdlpInfo(guildId, url, false);
             if (fallback.info) {
-                return this.extractAudioBitrateKbps(fallback.info);
+                const bitrate = this.extractAudioBitrateKbps(fallback.info);
+                this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+                return bitrate;
             }
         }
 
+        this.bitrateCache.set(url, { bitrate: null, timestamp: Date.now() });
         return null;
+    }
+
+    private estimateBitrateFromDirectUrl(url: string): number | null {
+        try {
+            const parsed = new URL(url);
+            const itag = parsed.searchParams.get('itag');
+            switch (itag) {
+                case '251':
+                    return 160;
+                case '250':
+                    return 70;
+                case '249':
+                    return 50;
+                case '140':
+                    return 128;
+                case '141':
+                    return 256;
+                case '139':
+                    return 48;
+                case '171':
+                    return 128;
+                case '172':
+                    return 256;
+                default:
+                    return null;
+            }
+        } catch {
+            return null;
+        }
     }
 
     private async resolveDirectStreamUrl(guildId: string, track: Track): Promise<string | null> {
@@ -903,6 +907,8 @@ export class AudioWrapper extends EventEmitter {
             trackId: track.id,
             resource: null,
             streamUrl: directUrl,
+            streamError: undefined,
+            streamErrorAt: undefined,
             timestamp: Date.now(),
         });
         return directUrl;
@@ -944,10 +950,22 @@ export class AudioWrapper extends EventEmitter {
                     trackId: track.id,
                     resource: null,
                     streamUrl: result.url,
+                    streamError: undefined,
+                    streamErrorAt: undefined,
                     timestamp: Date.now(),
                 });
                 return result.url;
             }
+
+            this.cache.set(cacheKey, {
+                guildId,
+                trackId: track.id,
+                resource: null,
+                streamUrl: cached?.streamUrl ?? null,
+                streamError: result.ytdlpErrors,
+                streamErrorAt: Date.now(),
+                timestamp: Date.now(),
+            });
 
             if (!attemptCookies || !this.isCookieCopyError(result.ytdlpErrors)) {
                 break;
@@ -968,11 +986,18 @@ export class AudioWrapper extends EventEmitter {
             if (host.includes('googlevideo.com')) {
                 return true;
             }
+            if (host === 'sndcdn.com' || host.endsWith('.sndcdn.com')) {
+                return true;
+            }
 
             return parsed.pathname.includes('.m4a') || parsed.pathname.includes('.webm');
         } catch {
             return false;
         }
+    }
+
+    private shouldUseSponsorBlock(track: Track, enabled: boolean): boolean {
+        return enabled && (!track.provider || track.provider === 'youtube');
     }
 
     private async waitForProcessStreamReady(
@@ -1030,23 +1055,39 @@ export class AudioWrapper extends EventEmitter {
         track: Track,
         directUrl: string,
         startSeconds: number,
-        sponsorSegments: SponsorSegment[] = []
+        sponsorSegments: SponsorSegment[] = [],
+        targetVolume = 100
     ): Promise<AudioResource | null> {
-        const runDir = await this.createRunDirectory(guildId);
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
+        const nativeOpusType = this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
+        if (nativeOpusType) {
+            const nativeResource = await this.createNativeOpusResource(track, directUrl, nativeOpusType, startSeconds);
+            if (nativeResource) {
+                return nativeResource;
+            }
+            log.debug('Fallback FFmpeg: lecture native Opus impossible');
+        }
+
+        const runDir = await this.createRunDirectory(guildId);
+        const useOpusCopy = this.canCopyDirectOpus(directUrl, filters, startSeconds, targetVolume);
         const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
             ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
             : [];
+        const outputArgs = useOpusCopy
+            ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg']
+            : [
+                ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+                '-f', 's16le',
+                '-ar', '48000',
+                '-ac', '2',
+            ];
         const ffmpegArgs = [
             '-loglevel', 'warning',
             ...inputReconnectArgs,
             ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
             '-i', directUrl,
             '-vn',
-            '-f', 's16le',
-            '-ar', '48000',
-            '-ac', '2',
-            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+            ...outputArgs,
             'pipe:1',
         ];
 
@@ -1056,6 +1097,9 @@ export class AudioWrapper extends EventEmitter {
             env: this.getSpawnEnv(runDir),
             cwd: runDir,
         });
+
+        let markFullyClosed!: () => void;
+        const fullyClosed = new Promise<void>((resolve) => { markFullyClosed = resolve; });
 
         let tornDown = false;
         const teardown = (reason: string) => {
@@ -1077,26 +1121,22 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            if (!ffmpeg.killed) {
-                try {
-                    ffmpeg.kill();
-                } catch {
-                    // Ignore
-                }
-            }
+            this.terminateProcess(ffmpeg);
             void this.cleanupRunDirectory(runDir);
         };
 
         let ffmpegErrors = '';
         ffmpeg.stderr?.on('data', (data) => {
-            ffmpegErrors += data.toString();
+            ffmpegErrors = this.appendBoundedOutput(ffmpegErrors, data);
         });
 
         ffmpeg.on('error', () => {
+            markFullyClosed();
             teardown('ffmpeg process error (direct)');
         });
 
         ffmpeg.on('close', (code) => {
+            markFullyClosed();
             if (code !== 0 && code !== null) {
                 log.trace(`FFmpeg direct fermé avec code ${code}`);
             }
@@ -1114,12 +1154,14 @@ export class AudioWrapper extends EventEmitter {
         stdout.once('error', () => teardown('direct audio stream error'));
 
         const resource = createAudioResource<ResourceMetadata>(stdout, {
-            inputType: StreamType.Raw,
-            inlineVolume: true,
+            inputType: useOpusCopy ? StreamType.OggOpus : StreamType.Raw,
+            inlineVolume: !useOpusCopy,
             metadata: {
                 trackId: track.id,
                 teardown: () => teardown('direct resource teardown requested'),
+                fullyClosed,
                 createdAt: Date.now(),
+                startSeconds,
             },
         });
 
@@ -1129,6 +1171,7 @@ export class AudioWrapper extends EventEmitter {
 
         const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, this.directStreamReadyWaitMs);
         if (ready === 'close') {
+            await fullyClosed;
             if (ffmpegErrors) {
                 log.trace('FFmpeg direct errors:', ffmpegErrors.slice(-500));
             }
@@ -1139,6 +1182,175 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return resource;
+    }
+
+    private async createNativeOpusResource(
+        track: Track,
+        directUrl: string,
+        inputType: StreamType.WebmOpus | StreamType.OggOpus,
+        startSeconds: number
+    ): Promise<AudioResource | null> {
+        const controller = new AbortController();
+        let stream: Readable | null = null;
+        let tornDown = false;
+        const teardown = (reason: string) => {
+            if (tornDown) {
+                return;
+            }
+            tornDown = true;
+            log.trace(`Teardown native opus stream: ${reason}`);
+            controller.abort();
+            stream?.destroy();
+        };
+
+        try {
+            if (/^https?:\/\//i.test(directUrl)) {
+                const connectionTimeout = setTimeout(() => controller.abort(), 15_000);
+                connectionTimeout.unref?.();
+                const response = await fetch(directUrl, {
+                    signal: controller.signal,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0',
+                        Accept: '*/*',
+                    },
+                }).finally(() => clearTimeout(connectionTimeout));
+                if (!response.ok || !response.body) {
+                    teardown(`native opus http ${response.status}`);
+                    return null;
+                }
+                const responseStream = Readable.fromWeb(response.body as any, {
+                    highWaterMark: 4 * 1024 * 1024,
+                });
+                const byteCounter = new Transform({
+                    transform(chunk: Buffer, _encoding, callback) {
+                        runtimeTelemetry.recordMediaBytes(chunk.length);
+                        callback(null, chunk);
+                    },
+                });
+                stream = responseStream.pipe(byteCounter);
+            } else {
+                stream = createReadStream(directUrl);
+            }
+
+            stream.once('close', () => teardown('native opus stream closed'));
+            stream.once('end', () => teardown('native opus stream ended'));
+            stream.once('error', () => teardown('native opus stream error'));
+
+            const resource = createAudioResource<ResourceMetadata>(stream, {
+                inputType,
+                inlineVolume: false,
+                metadata: {
+                    trackId: track.id,
+                    teardown: () => teardown('native opus resource teardown requested'),
+                    createdAt: Date.now(),
+                    startSeconds,
+                },
+            });
+
+            const ready = await this.waitForReadableStreamReady(stream, this.directStreamReadyWaitMs);
+            if (ready === 'close') {
+                return null;
+            }
+            if (ready === 'timeout') {
+                log.trace('Native opus readiness timeout, continuing');
+            }
+
+            return resource;
+        } catch (error) {
+            teardown('native opus setup failed');
+            log.trace('Lecture native Opus indisponible', error);
+            return null;
+        }
+    }
+
+    private async waitForReadableStreamReady(stream: Readable, timeoutMs: number): Promise<'ready' | 'timeout' | 'close'> {
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer: NodeJS.Timeout;
+
+            const finish = (result: 'ready' | 'timeout' | 'close') => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            };
+
+            const cleanup = () => {
+                stream.removeListener('readable', onReady);
+                stream.removeListener('close', onClose);
+                stream.removeListener('end', onClose);
+                stream.removeListener('error', onClose);
+            };
+
+            const onReady = () => {
+                clearTimeout(timer);
+                cleanup();
+                finish('ready');
+            };
+            const onClose = () => {
+                clearTimeout(timer);
+                cleanup();
+                finish('close');
+            };
+
+            timer = setTimeout(() => {
+                cleanup();
+                finish('timeout');
+            }, timeoutMs);
+            timer.unref?.();
+
+            if (stream.readableLength > 0) {
+                queueMicrotask(onReady);
+                return;
+            }
+
+            stream.once('readable', onReady);
+            stream.once('close', onClose);
+            stream.once('end', onClose);
+            stream.once('error', onClose);
+        });
+    }
+
+    private getNativeOpusStreamType(
+        directUrl: string,
+        filters: string[],
+        startSeconds: number,
+        targetVolume: number
+    ): StreamType.WebmOpus | StreamType.OggOpus | null {
+        if (filters.length > 0 || startSeconds > 0 || Math.abs(targetVolume - 100) > 0.01) {
+            return null;
+        }
+
+        const decoded = this.safeDecodeUrl(directUrl);
+        if (/mime=audio\/webm/i.test(decoded) || /\.webm(?:$|[?#])/i.test(decoded)) {
+            return StreamType.WebmOpus;
+        }
+        if (/mime=audio\/ogg/i.test(decoded) || /\.ogg(?:$|[?#])/i.test(decoded)) {
+            return StreamType.OggOpus;
+        }
+
+        return null;
+    }
+
+    private canCopyDirectOpus(
+        directUrl: string,
+        filters: string[],
+        startSeconds: number,
+        targetVolume: number
+    ): boolean {
+        if (filters.length > 0 || startSeconds > 0 || Math.abs(targetVolume - 100) > 0.01) {
+            return false;
+        }
+
+        const decoded = this.safeDecodeUrl(directUrl);
+        return /mime=audio\/(?:webm|ogg)/i.test(decoded);
+    }
+
+    private safeDecodeUrl(value: string): string {
+        try {
+            return decodeURIComponent(value);
+        } catch {
+            return value;
+        }
     }
 
     private buildAudioFilters(startSeconds: number, sponsorSegments: SponsorSegment[]): string[] {
@@ -1253,7 +1465,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-warnings',
             '--no-playlist',
             '--paths', `temp:${runDir}`,
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '-o', '-', // Output vers stdout
             '--quiet',
             track.url,
@@ -1323,21 +1535,8 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            if (!ffmpeg.killed) {
-                try {
-                    ffmpeg.kill();
-                } catch {
-                    // Ignore
-                }
-            }
-
-            if (!ytdlp.killed) {
-                try {
-                    ytdlp.kill();
-                } catch {
-                    // Ignore
-                }
-            }
+            this.terminateProcess(ffmpeg);
+            this.terminateProcess(ytdlp);
             void this.cleanupRunDirectory(runDir);
         };
 
@@ -1352,6 +1551,7 @@ export class AudioWrapper extends EventEmitter {
         };
 
         ytdlp.stdout?.on('error', (error) => handlePipeError('yt-dlp stdout', error as NodeJS.ErrnoException));
+        ytdlp.stdout?.on('data', (data: Buffer) => runtimeTelemetry.recordMediaBytes(data.length));
         ffmpeg.stdin?.on('error', (error) => handlePipeError('FFmpeg stdin', error as NodeJS.ErrnoException));
         ffmpeg.stdout?.on('error', (error) => handlePipeError('FFmpeg stdout', error as NodeJS.ErrnoException));
 
@@ -1361,7 +1561,7 @@ export class AudioWrapper extends EventEmitter {
         // Gérer les erreurs yt-dlp
         let ytdlpErrors = '';
         ytdlp.stderr?.on('data', (data) => {
-            ytdlpErrors += data.toString();
+            ytdlpErrors = this.appendBoundedOutput(ytdlpErrors, data);
         });
 
         ytdlp.on('error', (error) => {
@@ -1393,7 +1593,7 @@ export class AudioWrapper extends EventEmitter {
         let ffmpegErrors = '';
         ffmpeg.stderr?.on('data', (data) => {
             const message = data.toString();
-            ffmpegErrors += message;
+            ffmpegErrors = this.appendBoundedOutput(ffmpegErrors, message);
 
             const lower = message.toLowerCase();
             const suppressed =
@@ -1467,6 +1667,7 @@ export class AudioWrapper extends EventEmitter {
                 trackId: track.id,
                 teardown: () => teardown('resource teardown requested'),
                 createdAt: Date.now(),
+                startSeconds,
             },
         });
 
@@ -1534,39 +1735,94 @@ export class AudioWrapper extends EventEmitter {
             return;
         }
 
-        const warmup = (async () => {
-            const startedAt = Date.now();
-            const includeCookies = this.hasCookieEnv();
-            let streamResult = await this.fetchDirectStreamUrl(guildId, track.url, includeCookies, 8_000)
-                .catch(() => ({ url: null, ytdlpErrors: '' }));
-            if (!streamResult.url && includeCookies && this.isCookieCopyError(streamResult.ytdlpErrors)) {
-                streamResult = await this.fetchDirectStreamUrl(guildId, track.url, false, 8_000)
-                    .catch(() => ({ url: null, ytdlpErrors: '' }));
+        const generation = (this.warmupGenerationByGuild.get(guildId) ?? 0) + 1;
+        this.warmupGenerationByGuild.set(guildId, generation);
+
+        const guildPrefix = `${guildId}:`;
+        const superseded: Promise<void>[] = [];
+        for (const [key, controller] of this.warmupAbortControllers) {
+            if (key.startsWith(guildPrefix) && key !== cacheKey) {
+                controller.abort();
+                const obsolete = this.warmupInFlight.get(key);
+                if (obsolete) superseded.push(obsolete);
             }
+        }
+        if (superseded.length > 0) {
+            await Promise.allSettled(superseded);
+        }
+        if (this.warmupGenerationByGuild.get(guildId) !== generation) {
+            return;
+        }
 
-            const directUrl = streamResult.url;
-            const existingCache = this.cache.get(cacheKey);
-            this.cache.set(cacheKey, {
-                guildId,
-                trackId: track.id,
-                resource: null,
-                streamUrl: directUrl ?? existingCache?.streamUrl ?? track.url,
-                timestamp: Date.now(),
-            });
+        const controller = new AbortController();
+        this.warmupAbortControllers.set(cacheKey, controller);
+        const isCurrent = (): boolean =>
+            !controller.signal.aborted &&
+            this.warmupGenerationByGuild.get(guildId) === generation &&
+            this.warmupAbortControllers.get(cacheKey) === controller;
 
-            this.warmTracks.set(cacheKey, {
-                warmedAt: Date.now(),
-                expiresAt: Date.now() + this.warmResourceTtlMs,
+        let warmup!: Promise<void>;
+        warmup = (async () => {
+            const startedAt = Date.now();
+            await this.withWarmupSlot(controller.signal, async () => {
+                if (!isCurrent()) return;
+                const includeCookies = this.hasCookieEnv();
+                let streamResult = await this.fetchDirectStreamUrl(
+                    guildId,
+                    track.url,
+                    includeCookies,
+                    15_000,
+                    controller.signal
+                )
+                    .catch(() => ({ url: null, ytdlpErrors: '' }));
+                if (
+                    isCurrent() &&
+                    !streamResult.url &&
+                    includeCookies &&
+                    this.isCookieCopyError(streamResult.ytdlpErrors)
+                ) {
+                    streamResult = await this.fetchDirectStreamUrl(
+                        guildId,
+                        track.url,
+                        false,
+                        15_000,
+                        controller.signal
+                    ).catch(() => ({ url: null, ytdlpErrors: '' }));
+                }
+                if (!isCurrent()) return;
+
+                const directUrl = streamResult.url;
+                const existingCache = this.cache.get(cacheKey);
+                this.cache.set(cacheKey, {
+                    guildId,
+                    trackId: track.id,
+                    resource: null,
+                    streamUrl: directUrl ?? existingCache?.streamUrl ?? track.url,
+                    streamError: directUrl ? undefined : streamResult.ytdlpErrors || existingCache?.streamError,
+                    streamErrorAt: directUrl ? undefined : streamResult.ytdlpErrors ? Date.now() : existingCache?.streamErrorAt,
+                    timestamp: Date.now(),
+                });
+
+                const now = Date.now();
+                this.warmTracks.set(cacheKey, {
+                    warmedAt: now,
+                    expiresAt: now + this.warmResourceTtlMs,
+                });
+                log.debug(
+                    `Warmup metadata prêt pour ${track.title} (${Date.now() - startedAt}ms, directUrl=${directUrl ? 'yes' : 'no'})`
+                );
             });
-            log.debug(
-                `Warmup metadata prêt pour ${track.title} (${Date.now() - startedAt}ms, directUrl=${directUrl ? 'yes' : 'no'})`
-            );
         })()
             .catch((error) => {
                 log.trace(`Warmup échoué pour ${track.title}`, error);
             })
             .finally(() => {
-                this.warmupInFlight.delete(cacheKey);
+                if (this.warmupInFlight.get(cacheKey) === warmup) {
+                    this.warmupInFlight.delete(cacheKey);
+                }
+                if (this.warmupAbortControllers.get(cacheKey) === controller) {
+                    this.warmupAbortControllers.delete(cacheKey);
+                }
             });
 
         this.warmupInFlight.set(cacheKey, warmup);
@@ -1577,16 +1833,24 @@ export class AudioWrapper extends EventEmitter {
         guildId: string,
         url: string,
         includeCookies: boolean,
-        timeoutMs: number
+        timeoutMs: number,
+        signal?: AbortSignal
     ): Promise<{ url: string | null; ytdlpErrors: string }> {
+        if (signal?.aborted) {
+            return { url: null, ytdlpErrors: 'Warmup annulé' };
+        }
         const runDir = await this.createRunDirectory(guildId);
+        if (signal?.aborted) {
+            await this.cleanupRunDirectory(runDir);
+            return { url: null, ytdlpErrors: 'Warmup annulé' };
+        }
         const extraArgs = this.getYtdlpExtraArgs(includeCookies);
         const ytdlpArgs = [
             ...extraArgs,
             '--no-warnings',
             '--no-playlist',
             '--paths', `temp:${runDir}`,
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '--get-url',
             url,
         ];
@@ -1595,6 +1859,8 @@ export class AudioWrapper extends EventEmitter {
             let stdout = '';
             let stderr = '';
             let settled = false;
+            let requestedResult: { url: string | null; errors: string } | null = null;
+            let timer: NodeJS.Timeout | undefined;
 
             const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
                 stdio: ['ignore', 'pipe', 'pipe'],
@@ -1608,32 +1874,40 @@ export class AudioWrapper extends EventEmitter {
                     return;
                 }
                 settled = true;
-                clearTimeout(timer);
+                if (timer) clearTimeout(timer);
+                signal?.removeEventListener('abort', onAbort);
                 void this.cleanupRunDirectory(runDir);
                 resolve({ url: resultUrl, ytdlpErrors: errors });
             };
 
-            const timer = setTimeout(() => {
-                if (!ytdlp.killed) {
-                    ytdlp.kill();
-                }
-                finish(null, stderr || `yt-dlp get-url timeout after ${timeoutMs}ms`);
+            const terminateWith = (resultUrl: string | null, errors: string): void => {
+                if (requestedResult || settled) return;
+                requestedResult = { url: resultUrl, errors };
+                this.terminateProcess(ytdlp);
+                ytdlp.stdout?.resume();
+                ytdlp.stderr?.resume();
+            };
+
+            timer = setTimeout(() => {
+                terminateWith(null, stderr || `yt-dlp get-url timeout after ${timeoutMs}ms`);
             }, timeoutMs);
             timer.unref?.();
 
+            const onAbort = (): void => {
+                terminateWith(null, 'Warmup annulé');
+            };
+            signal?.addEventListener('abort', onAbort, { once: true });
+
             ytdlp.stdout?.on('data', (data) => {
-                stdout += data.toString();
+                stdout = this.appendBoundedOutput(stdout, data);
                 const directUrl = this.findDirectStreamUrl(stdout);
                 if (directUrl) {
-                    if (!ytdlp.killed) {
-                        ytdlp.kill();
-                    }
-                    finish(directUrl);
+                    terminateWith(directUrl, stderr);
                 }
             });
 
             ytdlp.stderr?.on('data', (data) => {
-                stderr += data.toString();
+                stderr = this.appendBoundedOutput(stderr, data);
             });
 
             ytdlp.on('error', (error) => {
@@ -1641,6 +1915,10 @@ export class AudioWrapper extends EventEmitter {
             });
 
             ytdlp.on('close', (code) => {
+                if (requestedResult) {
+                    finish(requestedResult.url, requestedResult.errors);
+                    return;
+                }
                 if (code !== 0) {
                     finish(null, stderr);
                     return;
@@ -1676,10 +1954,73 @@ export class AudioWrapper extends EventEmitter {
 
     clearWarmResource(guildId: string, trackId: string): void {
         const cacheKey = this.getScopedTrackKey(guildId, trackId);
-        if (!this.warmTracks.has(cacheKey)) {
-            return;
-        }
+        this.warmupAbortControllers.get(cacheKey)?.abort();
         this.warmTracks.delete(cacheKey);
+    }
+
+    async cancelGuildWarmups(guildId: string): Promise<void> {
+        this.warmupGenerationByGuild.set(guildId, (this.warmupGenerationByGuild.get(guildId) ?? 0) + 1);
+        const prefix = `${guildId}:`;
+        const pending: Promise<void>[] = [];
+        for (const [key, controller] of this.warmupAbortControllers) {
+            if (!key.startsWith(prefix)) continue;
+            controller.abort();
+            const operation = this.warmupInFlight.get(key);
+            if (operation) pending.push(operation);
+        }
+        await Promise.allSettled(pending);
+        for (const key of Array.from(this.warmTracks.keys())) {
+            if (key.startsWith(prefix)) this.warmTracks.delete(key);
+        }
+        const stillActive = Array.from(this.warmupAbortControllers.keys()).some((key) => key.startsWith(prefix)) ||
+            Array.from(this.warmupInFlight.keys()).some((key) => key.startsWith(prefix));
+        if (!stillActive) this.warmupGenerationByGuild.delete(guildId);
+    }
+
+    private async withWarmupSlot(signal: AbortSignal, operation: () => Promise<void>): Promise<void> {
+        const acquired = await this.acquireWarmupSlot(signal);
+        if (!acquired) return;
+        try {
+            await operation();
+        } finally {
+            this.releaseWarmupSlot();
+        }
+    }
+
+    private acquireWarmupSlot(signal: AbortSignal): Promise<boolean> {
+        if (signal.aborted) return Promise.resolve(false);
+        if (this.activeWarmupSlots < this.maxConcurrentWarmups) {
+            this.activeWarmupSlots += 1;
+            return Promise.resolve(true);
+        }
+        return new Promise<boolean>((resolve) => {
+            const waiter: WarmupSlotWaiter = {
+                resolve,
+                signal,
+                onAbort: () => {
+                    const index = this.warmupSlotWaiters.indexOf(waiter);
+                    if (index >= 0) this.warmupSlotWaiters.splice(index, 1);
+                    resolve(false);
+                },
+            };
+            signal.addEventListener('abort', waiter.onAbort, { once: true });
+            this.warmupSlotWaiters.push(waiter);
+        });
+    }
+
+    private releaseWarmupSlot(): void {
+        this.activeWarmupSlots = Math.max(0, this.activeWarmupSlots - 1);
+        while (this.warmupSlotWaiters.length > 0) {
+            const waiter = this.warmupSlotWaiters.shift()!;
+            waiter.signal.removeEventListener('abort', waiter.onAbort);
+            if (waiter.signal.aborted) {
+                waiter.resolve(false);
+                continue;
+            }
+            this.activeWarmupSlots += 1;
+            waiter.resolve(true);
+            break;
+        }
     }
 
     teardownResource(resource: AudioResource | null | undefined): void {
@@ -1714,7 +2055,7 @@ export class AudioWrapper extends EventEmitter {
             '--no-playlist',
             '--paths', `temp:${runDir}`,
             '--skip-download',
-            '-f', 'bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+            '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
             '--dump-single-json',
             url,
         ];
@@ -1722,6 +2063,7 @@ export class AudioWrapper extends EventEmitter {
         return new Promise((resolve) => {
             let stdout = '';
             let stderr = '';
+            let settled = false;
 
             const ytdlp = spawn(this.ytdlpPath, ytdlpArgs, {
                 stdio: ['ignore', 'pipe', 'pipe'],
@@ -1730,42 +2072,59 @@ export class AudioWrapper extends EventEmitter {
                 cwd: runDir,
             });
 
+            const finish = (info: any | null, errors = stderr) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                void this.cleanupRunDirectory(runDir);
+                resolve({ info, ytdlpErrors: errors });
+            };
+
+            const timer = setTimeout(() => {
+                this.terminateProcess(ytdlp);
+                finish(null, stderr || `yt-dlp info timeout after ${config.audio.ytDlpTimeoutMs}ms`);
+            }, config.audio.ytDlpTimeoutMs);
+            timer.unref?.();
+
             ytdlp.stdout?.on('data', (data) => {
+                if (Buffer.byteLength(stdout) + data.length > this.maxMetadataOutputBytes) {
+                    this.terminateProcess(ytdlp);
+                    finish(null, 'yt-dlp metadata output exceeded limit');
+                    return;
+                }
                 stdout += data.toString();
             });
 
             ytdlp.stderr?.on('data', (data) => {
-                stderr += data.toString();
+                stderr = this.appendBoundedOutput(stderr, data);
             });
 
             ytdlp.on('error', (error) => {
                 log.error('yt-dlp info error:', error);
-                void this.cleanupRunDirectory(runDir);
-                resolve({ info: null, ytdlpErrors: stderr });
+                finish(null, `${stderr}\n${error.message}`.trim());
             });
 
             ytdlp.on('close', (code) => {
-                void this.cleanupRunDirectory(runDir);
                 if (code !== 0) {
                     if (stderr) {
                         log.trace('yt-dlp info errors:', stderr.trim());
                     }
-                    resolve({ info: null, ytdlpErrors: stderr });
+                    finish(null);
                     return;
                 }
 
                 const payload = stdout.trim();
                 if (!payload) {
-                    resolve({ info: null, ytdlpErrors: stderr });
+                    finish(null);
                     return;
                 }
 
                 try {
                     const info = JSON.parse(payload);
-                    resolve({ info, ytdlpErrors: stderr });
+                    finish(info);
                 } catch (error) {
                     log.warn('Impossible de parser les infos yt-dlp');
-                    resolve({ info: null, ytdlpErrors: stderr });
+                    finish(null);
                 }
             });
         });
@@ -1855,7 +2214,7 @@ export class AudioWrapper extends EventEmitter {
         try {
             const toPreload = tracks.slice(0, config.audio.cacheAhead);
             log.debug(`Pré-vérification de ${toPreload.length} piste(s)...`);
-            mediaCacheManager.preloadTracks(toPreload);
+            mediaCacheManager.preloadTracks(toPreload, guildId);
 
             for (const track of toPreload) {
                 const cacheKey = this.getScopedTrackKey(guildId, track.id);
@@ -1941,7 +2300,10 @@ export class AudioWrapper extends EventEmitter {
         const inFlightSize = this.warmupInFlight.size;
         this.cache.clear();
         this.warmTracks.clear();
+        for (const controller of this.warmupAbortControllers.values()) controller.abort();
         this.warmupInFlight.clear();
+        this.warmupAbortControllers.clear();
+        this.warmupGenerationByGuild.clear();
         this.preloadingGuilds.clear();
         this.lastSourceModeByGuild.clear();
         mediaCacheManager.clearAll();

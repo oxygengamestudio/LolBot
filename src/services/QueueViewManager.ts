@@ -5,6 +5,7 @@ import {
     ButtonStyle,
     ChatInputCommandInteraction,
     EmbedBuilder,
+    GuildMember,
     Message,
     MessageFlags,
     ModalBuilder,
@@ -20,6 +21,7 @@ import { config } from '../config.js';
 import { resolveLocale, t } from '../utils/i18n.js';
 import type { GuildQueue } from '../types/index.js';
 import { safeContent } from '../utils/text.js';
+import { ensureCanUseBot } from '../utils/commandHelpers.js';
 
 interface QueueViewState {
     messageId: string;
@@ -101,6 +103,15 @@ class QueueViewManager {
     async handleComponentInteraction(
         interaction: ButtonInteraction | StringSelectMenuInteraction
     ): Promise<void> {
+        if (!interaction.inCachedGuild()) {
+            return;
+        }
+
+        const member = interaction.member as GuildMember;
+        if (!(await ensureCanUseBot(interaction, member))) {
+            return;
+        }
+
         const messageId = interaction.message.id;
         const state = await this.getState(messageId, interaction);
         if (!state) {
@@ -172,6 +183,15 @@ class QueueViewManager {
 
     async handleModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
         if (!interaction.customId.startsWith('queue_move:')) {
+            return;
+        }
+
+        if (!interaction.inCachedGuild()) {
+            return;
+        }
+
+        const member = interaction.member as GuildMember;
+        if (!(await ensureCanUseBot(interaction, member))) {
             return;
         }
 
@@ -318,7 +338,7 @@ class QueueViewManager {
             const statusIcon = queue.isPaused ? '⏸️' : '▶️';
             embed.addFields({
                 name: statusIcon,
-                value: `**${safeContent(queue.currentTrack.title)}**\n⏱️ \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
+                value: `**${safeContent(this.truncateString(queue.currentTrack.title, 80))}** • \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,
                 inline: false,
             });
         }
@@ -327,9 +347,9 @@ class QueueViewManager {
             const list = pageTracks
                 .map((track, index) => {
                     const position = startIndex + index + 1;
-                    return `**${position}.** ${this.truncateString(track.title, 60)}\n⏱️ \`${this.formatTime(track.duration)}\` • 👤 <@${track.requestedById}>`;
+                    return `**${position}.** ${this.truncateString(track.title, 68)} • \`${this.formatTime(track.duration)}\` • 👤 <@${track.requestedById}>`;
                 })
-                .join('\n\n');
+                .join('\n');
             embed.setDescription(this.fitEmbedDescription(`**${t(state.locale, 'queue.listTitle')}**\n${list}`));
         } else {
             embed.setDescription(t(state.locale, 'queue.empty'));

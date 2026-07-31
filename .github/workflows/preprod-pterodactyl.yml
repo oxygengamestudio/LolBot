@@ -11,55 +11,33 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: lolbot-preprod-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Typecheck, test, and build
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'pre-prod'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: |
-          if compgen -G "test/*.test.ts" > /dev/null; then
-            npm test
-          else
-            echo "No test/*.test.ts files found. Skipping tests."
-          fi
-
-      - name: Build
-        run: npm run build
+  quality:
+    name: Shared quality gate
+    uses: ./.github/workflows/quality.yml
+    permissions:
+      contents: read
+      security-events: write
 
   docker:
     name: Build and push GHCR image
     runs-on: ubuntu-latest
-    needs: test
+    needs: quality
+    if: github.ref == 'refs/heads/pre-prod'
+    permissions:
+      contents: read
+      packages: write
     outputs:
       image: ${{ steps.image.outputs.image }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Resolve image name
         id: image
@@ -68,25 +46,56 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          push: true
+          load: true
+          push: false
+          provenance: false
           build-args: |
             BOT_BUILD_SHA=${{ github.sha }}
           tags: |
             ${{ steps.image.outputs.image }}:preprod
             ${{ steps.image.outputs.image }}:${{ github.sha }}
+
+      - name: Run image doctor
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.image }}:${{ github.sha }}
+        run: docker run --rm --entrypoint node "$IMAGE_REF" dist/doctor.js
+
+      - name: Setup Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.72.0
+          cache: true
+          token: ${{ github.token }}
+
+      - name: Scan and block all high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.image }}:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
+          exit-code: '1'
+          timeout: 10m
+          skip-setup-trivy: true
+
+      - name: Push validated image
+        run: |
+          docker push "${{ steps.image.outputs.image }}:preprod"
+          docker push "${{ steps.image.outputs.image }}:${{ github.sha }}"
 
   restart:
     name: Restart Pterodactyl preprod
@@ -94,21 +103,23 @@ jobs:
     needs: docker
 
     steps:
+      - name: Setup Node for readiness probe
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
       - name: Restart server through Pterodactyl API
         env:
           PTERO_URL: ${{ secrets.PTERO_URL }}
           PTERO_CLIENT_API_KEY: ${{ secrets.PTERO_CLIENT_API_KEY }}
           PTERO_TARGET_SERVER_ID: ${{ secrets.PTERO_PREPROD_SERVER_ID }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          if [ -z "$PTERO_TARGET_SERVER_ID" ]; then
-            echo "PTERO_PREPROD_SERVER_ID is not set. Skipping Pterodactyl restart."
-            exit 0
-          fi
-
           test -n "$PTERO_URL"
           test -n "$PTERO_CLIENT_API_KEY"
+          test -n "$PTERO_TARGET_SERVER_ID"
 
           api_base="${PTERO_URL%/}/api/client"
           server_identifier="$PTERO_TARGET_SERVER_ID"
@@ -154,6 +165,21 @@ jobs:
             cat "$clear_body"
           fi
 
+          before_resources="$(mktemp)"
+          curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
+            "${api_base}/servers/${server_identifier}/resources" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --output "$before_resources"
+          before_state="$(jq -r '.attributes.current_state // "unknown"' "$before_resources")"
+          before_uptime="$(jq -r '.attributes.resources.uptime // 0' "$before_resources")"
+          test "$before_state" != "unknown"
+          [[ "$before_uptime" =~ ^[0-9]+$ ]]
           response_body="$(mktemp)"
           status_code="$(curl --silent --show-error \
             --request POST \
@@ -167,9 +193,318 @@ jobs:
 
           if [ "$status_code" = "204" ]; then
             echo "Pterodactyl restart signal sent."
-            exit 0
+          else
+            echo "Pterodactyl restart failed with HTTP ${status_code}."
+            cat "$response_body"
+            exit 1
           fi
 
-          echo "Pterodactyl restart failed with HTTP ${status_code}."
-          cat "$response_body"
-          exit 1
+          restart_observed=false
+          if [ "$before_state" = "offline" ]; then
+            restart_observed=true
+          fi
+          state=unknown
+          uptime="$before_uptime"
+          for attempt in $(seq 1 30); do
+            resources_json="$(mktemp)"
+            if ! curl --silent --show-error --fail-with-body \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "${api_base}/servers/${server_identifier}/resources" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --output "$resources_json"; then
+              echo "Pterodactyl resources temporarily unavailable (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
+            state="$(jq -r '.attributes.current_state' "$resources_json")"
+            uptime="$(jq -r '.attributes.resources.uptime // 0' "$resources_json")"
+            [[ "$uptime" =~ ^[0-9]+$ ]]
+            if [ "$state" != "running" ] || [ "$uptime" -lt "$before_uptime" ]; then
+              restart_observed=true
+            fi
+            if [ "$state" = "running" ] && [ "$restart_observed" = "true" ]; then
+              break
+            fi
+            sleep 4
+          done
+          test "$state" = "running"
+          test "$restart_observed" = "true"
+
+          websocket_json="$(mktemp)"
+          websocket_available=true
+          if ! curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
+            "${api_base}/servers/${server_identifier}/websocket" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --output "$websocket_json"; then
+            websocket_available=false
+            echo "Pterodactyl websocket credentials temporarily unavailable; using the file API fallback."
+          fi
+
+          if [ "$websocket_available" = "true" ]; then
+            export PTERO_WS_URL="$(jq -r '.data.socket' "$websocket_json")"
+            export PTERO_WS_TOKEN="$(jq -r '.data.token' "$websocket_json")"
+            if node --input-type=module <<'NODE'
+          import { randomBytes } from 'node:crypto';
+
+          const url = process.env.PTERO_WS_URL;
+          const token = process.env.PTERO_WS_TOKEN;
+          const expectedBuildSha = process.env.EXPECTED_BUILD_SHA;
+          if (!url || !token || url === 'null' || token === 'null') {
+            throw new Error('Pterodactyl websocket credentials unavailable');
+          }
+          if (!expectedBuildSha || !/^[0-9a-f]{40}$/i.test(expectedBuildSha)) {
+            throw new Error('Expected GitHub build SHA unavailable');
+          }
+
+          const challenge = randomBytes(32).toString('hex');
+          const normalizedBuildSha = expectedBuildSha.toLowerCase();
+          const expectedReadinessLine =
+            ` INFO  [Readiness] challenge=${challenge} `
+            + `build=${normalizedBuildSha} discordReady=true`;
+          const isExpectedReadiness = (line) => {
+            if (line.length !== 23 + expectedReadinessLine.length) return false;
+            const timestamp = line.slice(0, 23);
+            if (!Number.isFinite(Date.parse(`${timestamp.replace(' ', 'T')}Z`))) return false;
+            return line.slice(23) === expectedReadinessLine;
+          };
+
+          await new Promise((resolve, reject) => {
+            const maxConnectionAttempts = 2;
+            let connectionAttempt = 0;
+            let currentSocket;
+            let currentChallengeTimer;
+            let reconnectTimer;
+            let settled = false;
+
+            const closeCurrentSocket = () => {
+              try { currentSocket?.close(); } catch { /* best effort */ }
+              currentSocket = undefined;
+            };
+            const cleanup = () => {
+              clearTimeout(timeout);
+              clearTimeout(reconnectTimer);
+              clearInterval(currentChallengeTimer);
+              currentChallengeTimer = undefined;
+              closeCurrentSocket();
+            };
+            const fail = (error) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            };
+            const succeed = () => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve();
+            };
+            const timeout = setTimeout(() => {
+              fail(new Error(
+                `Build ${expectedBuildSha} and Discord Ready markers not observed in order within 120 seconds`
+              ));
+            }, 120_000);
+
+            const connect = () => {
+              if (settled) return;
+              connectionAttempt += 1;
+              const socket = new WebSocket(url);
+              currentSocket = socket;
+              let terminal = false;
+              const attemptTimeout = setTimeout(() => retry(), 10_000);
+
+              const retry = () => {
+                if (terminal || settled) return;
+                terminal = true;
+                clearTimeout(attemptTimeout);
+                clearInterval(currentChallengeTimer);
+                currentChallengeTimer = undefined;
+                try { socket.close(); } catch { /* best effort */ }
+                if (connectionAttempt >= maxConnectionAttempts) {
+                  fail(new Error(
+                    `Pterodactyl websocket readiness probe failed after ${maxConnectionAttempts} attempts`
+                  ));
+                  return;
+                }
+                const delayMs = Math.min(1_000 * (2 ** (connectionAttempt - 1)), 8_000);
+                console.warn(
+                  `Pterodactyl websocket temporarily unavailable `
+                  + `(attempt ${connectionAttempt}/${maxConnectionAttempts}); retrying in ${delayMs}ms.`
+                );
+                reconnectTimer = setTimeout(connect, delayMs);
+              };
+
+              socket.addEventListener('open', () => {
+                if (terminal || settled) return;
+                try {
+                  socket.send(JSON.stringify({ event: 'auth', args: [token] }));
+                } catch {
+                  retry();
+                }
+              });
+              socket.addEventListener('message', (message) => {
+                if (terminal || settled) return;
+                let payload;
+                try { payload = JSON.parse(String(message.data)); } catch { return; }
+                if (payload.event === 'auth success') {
+                  clearTimeout(attemptTimeout);
+                  const sendChallenge = () => {
+                    if (terminal || settled) return;
+                    try {
+                      socket.send(JSON.stringify({
+                        event: 'send command',
+                        args: [`lolbot:ready ${challenge}`],
+                      }));
+                    } catch {
+                      retry();
+                    }
+                  };
+                  sendChallenge();
+                  if (terminal || settled) return;
+                  currentChallengeTimer = setInterval(sendChallenge, 5_000);
+                  return;
+                }
+                if (payload.event !== 'console output') return;
+                const output = Array.isArray(payload.args) ? payload.args.join('\n') : String(payload.args ?? '');
+                for (const line of output.split(/\r?\n/)) {
+                  const plainLine = line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+                  if (isExpectedReadiness(plainLine)) {
+                    clearInterval(currentChallengeTimer);
+                    currentChallengeTimer = undefined;
+                    succeed();
+                    return;
+                  }
+                }
+              });
+              socket.addEventListener('error', retry);
+              socket.addEventListener('close', retry);
+            };
+
+            connect();
+          });
+          console.log(`Pterodactyl running and Discord Ready confirmed for build ${expectedBuildSha}.`);
+          NODE
+            then
+              exit 0
+            fi
+          fi
+
+          echo "Direct Wings websocket unavailable; using the Pterodactyl file API readiness fallback."
+          startup_body="$(mktemp)"
+          curl --silent --show-error --fail-with-body \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 5 \
+            --max-time 20 \
+            "${api_base}/servers/${server_identifier}/startup" \
+            --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+            --header "Accept: Application/vnd.pterodactyl.v1+json" \
+            --output "$startup_body"
+          export PTERO_DATA_DIR="$(jq -er '
+            .data[]
+            | select(.attributes.env_variable == "DATA_DIR")
+            | ((.attributes.server_value | select(type == "string" and length > 0))
+              // .attributes.default_value)
+            | select(type == "string" and length > 0)
+          ' "$startup_body" | head -n 1)"
+          readiness_file="$(node --input-type=module -e '
+            import { posix } from "node:path";
+            const root = "/home/container";
+            const resolved = posix.resolve(root, process.env.PTERO_DATA_DIR);
+            if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+              throw new Error("DATA_DIR must stay under /home/container for Pterodactyl readiness");
+            }
+            const relative = posix.relative(root, resolved);
+            process.stdout.write(`/${relative ? `${relative}/` : ""}runtime-readiness.json`);
+          ')"
+          readiness_challenge="$(openssl rand -hex 32)"
+          [[ "$readiness_challenge" =~ ^[0-9a-f]{64}$ ]]
+          normalized_build_sha="${EXPECTED_BUILD_SHA,,}"
+          [[ "$normalized_build_sha" =~ ^[0-9a-f]{40}$ ]]
+          readiness_command="$(jq -cn --arg command "lolbot:ready ${readiness_challenge}" '{command: $command}')"
+          readiness_confirmed=false
+          receipt_status="not-requested"
+          receipt_body=""
+
+          for attempt in $(seq 1 30); do
+            command_body="$(mktemp)"
+            if ! command_status="$(curl --silent --show-error \
+              --request POST \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "${api_base}/servers/${server_identifier}/command" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --header "Content-Type: application/json" \
+              --data "$readiness_command" \
+              --output "$command_body" \
+              --write-out "%{http_code}")"; then
+              echo "Readiness command network error (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
+
+            if [ "$command_status" != "204" ]; then
+              echo "Readiness command temporarily unavailable with HTTP ${command_status} (attempt ${attempt}/30)."
+              sleep 4
+              continue
+            fi
+
+            receipt_body="$(mktemp)"
+            if ! receipt_status="$(curl --silent --show-error \
+              --get \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "${api_base}/servers/${server_identifier}/files/contents" \
+              --header "Authorization: Bearer ${PTERO_CLIENT_API_KEY}" \
+              --header "Accept: Application/vnd.pterodactyl.v1+json" \
+              --data-urlencode "file=${readiness_file}" \
+              --output "$receipt_body" \
+              --write-out "%{http_code}")"; then
+              echo "Readiness receipt network error (attempt ${attempt}/30); retrying."
+              sleep 4
+              continue
+            fi
+
+            now_ms="$(($(date +%s) * 1000))"
+
+            if [ "$receipt_status" = "200" ] && jq -e \
+              --arg challenge "$readiness_challenge" \
+              --arg build "$normalized_build_sha" \
+              --argjson nowMs "$now_ms" \
+              '(.schemaVersion == 1)
+                and (.challenge == $challenge)
+                and (.buildSha == $build)
+                and (.discordReady == true)
+                and (.generatedAt | type == "string")
+                and (.expiresAtMs | type == "number" and . >= $nowMs)' \
+              "$receipt_body" >/dev/null; then
+              readiness_confirmed=true
+              break
+            fi
+
+            echo "Exact readiness receipt not available yet (attempt ${attempt}/30); retrying."
+            sleep 4
+          done
+
+          if [ "$readiness_confirmed" != "true" ]; then
+            if [ "$receipt_status" = "200" ] && [ -n "$receipt_body" ] && jq -e 'type == "object"' "$receipt_body" >/dev/null 2>&1; then
+              observed_build="$(jq -r 'if ((.buildSha | type) == "string" and (.buildSha | test("^[0-9a-fA-F]{40}$"))) then (.buildSha | ascii_downcase) else "invalid-or-missing" end' "$receipt_body")"
+              observed_discord_ready="$(jq -r 'if (.discordReady | type) == "boolean" then (.discordReady | tostring) else "invalid-or-missing" end' "$receipt_body")"
+              observed_generated_at="$(jq -r 'if ((.generatedAt | type) == "string" and (.generatedAt | test("^[0-9TZ:.-]{20,32}$"))) then .generatedAt else "invalid-or-missing" end' "$receipt_body")"
+              echo "Readiness mismatch: expected build ${EXPECTED_BUILD_SHA}; observed build ${observed_build}, discordReady=${observed_discord_ready}, generatedAt=${observed_generated_at}."
+            else
+              echo "Readiness receipt unavailable after retries (HTTP ${receipt_status})."
+            fi
+            exit 1
+          fi
+          echo "Pterodactyl running and Discord Ready confirmed for build ${EXPECTED_BUILD_SHA} through the file API fallback."

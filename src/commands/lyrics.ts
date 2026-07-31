@@ -1,9 +1,10 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { buildTrackLyricsQuery, sendLyrics } from '../utils/lyrics.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
 import { getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
 import { logger } from '../utils/Logger.js';
+import { canUseBot } from '../utils/permissions.js';
 
 const log = logger.createModuleLogger('LyricsCmd');
 
@@ -23,6 +24,12 @@ export const data = new SlashCommandBuilder()
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.inGuild()) {
         await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.guildOnly')}`, false);
+        return;
+    }
+
+    const member = interaction.member as GuildMember;
+    if (!(await canUseBot(member))) {
+        await replyEphemeral(interaction, `❌ ${t(interaction.locale, 'error.noPermission')}`, false);
         return;
     }
 

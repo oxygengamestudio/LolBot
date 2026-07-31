@@ -33,8 +33,8 @@
       "description": "Discord bot token.",
       "env_variable": "DISCORD_TOKEN",
       "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
+      "user_viewable": false,
+      "user_editable": false,
       "rules": "required|string|max:200",
       "field_type": "text"
     },
@@ -83,8 +83,8 @@
       "description": "Optional YouTube Data API key. If empty or quota-limited, the bot falls back to yt-dlp.",
       "env_variable": "GOOGLE_API_KEY",
       "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
+      "user_viewable": false,
+      "user_editable": false,
       "rules": "nullable|string|max:4096",
       "field_type": "text"
     },
@@ -103,8 +103,8 @@
       "description": "Optional Genius OAuth client secret.",
       "env_variable": "GENIUS_CLIENT_SECRET",
       "default_value": "",
-      "user_viewable": true,
-      "user_editable": true,
+      "user_viewable": false,
+      "user_editable": false,
       "rules": "nullable|string|max:255",
       "field_type": "text"
     },

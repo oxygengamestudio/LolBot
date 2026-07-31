@@ -11,6 +11,16 @@ import type { RESTPostAPIChatInputApplicationCommandsJSONBody } from 'discord-ap
 
 export interface Track {
     id: string;
+    /** Fournisseur du catalogue. Les anciennes pistes sans valeur restent YouTube. */
+    provider?: 'youtube' | 'soundcloud' | (string & {});
+    /** Identifiant de la piste chez le fournisseur. Utilise `id` par défaut. */
+    sourceId?: string;
+    /** URL canonique stable. Utilise `url` par défaut. */
+    canonicalUrl?: string;
+    /** Métadonnées techniques optionnelles utilisées pour éviter un transcodage inutile. */
+    codec?: string;
+    container?: string;
+    isLive?: boolean;
     title: string;
     url: string;
     duration: number; // en secondes
@@ -32,6 +42,7 @@ export interface SearchResult {
     channelId?: string;
     durationSeconds?: number;
     viewCount?: number;
+    sourceRank?: number;
     isOfficial?: boolean;
 }
 
@@ -65,8 +76,6 @@ export interface GuildQueue {
     reconnectAttempts: number;
     shouldKeepConnection: boolean;
     isManualDisconnect: boolean;
-    crossfadeInProgress: boolean;
-    crossfadeTargetTrackId: string | null;
     lastStartMetrics: {
         joinMs: number | null;
         warmupMs: number | null;

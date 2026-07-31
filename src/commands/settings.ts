@@ -2,7 +2,7 @@ import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'd
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { buildSettingsMessage } from '../utils/settings-ui.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
-import { ensureCanManageSettings, getInteractionLocale, replyEphemeral } from '../utils/commandHelpers.js';
+import { ensureCanManageSettings, replyEphemeral } from '../utils/commandHelpers.js';
 
 export const data = new SlashCommandBuilder()
     .setName('settings')

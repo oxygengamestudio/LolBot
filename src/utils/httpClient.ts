@@ -16,11 +16,12 @@ export interface HttpRequestOptions {
     timeoutMs?: number;
     maxRedirects?: number;
     maxBytes?: number;
-    responseType?: 'text' | 'buffer';
+    responseType?: 'text' | 'buffer' | 'none';
     decompress?: boolean;
+    signal?: AbortSignal;
 }
 
-export interface HttpResponse<TBody extends string | Buffer> {
+export interface HttpResponse<TBody extends string | Buffer | null> {
     statusCode: number;
     headers: IncomingHttpHeaders;
     body: TBody;
@@ -45,9 +46,12 @@ function getDecodedStream(res: IncomingMessage): NodeJS.ReadableStream {
     return res;
 }
 
+export function httpRequest(options: HttpRequestOptions & { responseType: 'none' }): Promise<HttpResponse<null>>;
+export function httpRequest(options: HttpRequestOptions & { responseType: 'buffer' }): Promise<HttpResponse<Buffer>>;
+export function httpRequest(options: HttpRequestOptions & { responseType?: 'text' }): Promise<HttpResponse<string>>;
 export async function httpRequest(
     options: HttpRequestOptions
-): Promise<HttpResponse<string | Buffer>> {
+): Promise<HttpResponse<string | Buffer | null>> {
     const {
         url,
         method = 'GET',
@@ -59,6 +63,7 @@ export async function httpRequest(
         maxBytes = DEFAULT_MAX_BYTES,
         responseType = 'text',
         decompress = true,
+        signal,
     } = options;
 
     return requestInternal(
@@ -73,16 +78,17 @@ export async function httpRequest(
             maxBytes,
             responseType,
             decompress,
+            signal,
         },
         0
     );
 }
 
 async function requestInternal(
-    options: Required<Omit<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress'>> &
-        Pick<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress'>,
+    options: Required<Omit<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>> &
+        Pick<HttpRequestOptions, 'headers' | 'body' | 'method' | 'timeoutMs' | 'maxRedirects' | 'maxBytes' | 'responseType' | 'decompress' | 'signal'>,
     redirectCount: number
-): Promise<HttpResponse<string | Buffer>> {
+): Promise<HttpResponse<string | Buffer | null>> {
     const {
         url,
         method = 'GET',
@@ -94,6 +100,7 @@ async function requestInternal(
         maxBytes = DEFAULT_MAX_BYTES,
         responseType = 'text',
         decompress = true,
+        signal,
     } = options;
 
     if (redirectCount > maxRedirects) {
@@ -112,6 +119,26 @@ async function requestInternal(
     };
 
     return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            const error = new Error('HTTP request aborted');
+            error.name = 'AbortError';
+            reject(error);
+            return;
+        }
+
+        let settled = false;
+        const finishResolve = (value: HttpResponse<string | Buffer | null>) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener('abort', onAbort);
+            resolve(value);
+        };
+        const finishReject = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener('abort', onAbort);
+            reject(error);
+        };
         const req = transport.request(requestOptions, (res) => {
             const statusCode = res.statusCode ?? 0;
 
@@ -142,21 +169,33 @@ async function requestInternal(
                         maxBytes,
                         responseType,
                         decompress,
+                        signal,
                     },
                     redirectCount + 1
                 )
-                    .then(resolve)
-                    .catch(reject);
+                    .then(finishResolve)
+                    .catch(finishReject);
                 return;
             }
 
             if (statusCode < 200 || statusCode >= 300) {
                 res.resume();
-                reject(new Error(`HTTP ${statusCode} from ${sanitizeUrlForLogs(url)}`));
+                finishReject(new Error(`HTTP ${statusCode} from ${sanitizeUrlForLogs(url)}`));
                 return;
             }
 
-            const source = decompress ? getDecodedStream(res) : res;
+            if (responseType === 'none') {
+                res.destroy();
+                finishResolve({
+                    statusCode,
+                    headers: res.headers,
+                    body: null,
+                    finalUrl: parsed.toString(),
+                });
+                return;
+            }
+
+            const source: NodeJS.ReadableStream = decompress ? getDecodedStream(res) : res;
             const chunks: Buffer[] = [];
             let totalBytes = 0;
 
@@ -173,7 +212,7 @@ async function requestInternal(
             source.on('end', () => {
                 const buffer = Buffer.concat(chunks);
                 const responseBody = responseType === 'buffer' ? buffer : buffer.toString('utf8');
-                resolve({
+                finishResolve({
                     statusCode,
                     headers: res.headers,
                     body: responseBody as string | Buffer,
@@ -181,13 +220,20 @@ async function requestInternal(
                 });
             });
 
-            source.on('error', reject);
+            source.on('error', finishReject);
         });
+
+        const onAbort = () => {
+            const error = new Error('HTTP request aborted');
+            error.name = 'AbortError';
+            req.destroy(error);
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
 
         req.setTimeout(timeoutMs, () => {
             req.destroy(new Error(`Request timeout after ${timeoutMs}ms for ${sanitizeUrlForLogs(url)}`));
         });
-        req.on('error', reject);
+        req.on('error', finishReject);
 
         if (body) {
             req.write(body);

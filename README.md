@@ -2,6 +2,8 @@
 
 Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, GitHub Actions et Pterodactyl.
 
+`/play` accepte les recherches et liens YouTube ainsi que les liens de pistes SoundCloud publiques individuelles, y compris les liens courts `on.soundcloud.com`. La recherche SoundCloud, les profils, playlists/sets et liens privés ne sont pas pris en charge. SoundCloud réutilise le binaire `yt-dlp` existant et ne nécessite aucune variable d'environnement supplémentaire.
+
 ## Requirements
 
 - Node.js >= 22.12.0
@@ -20,12 +22,11 @@ Use `.env.example` as template for local and preprod runs.
 | `DISCORD_CLIENT_ID` | Yes | Discord application client ID. |
 | `DISCORD_GUILD_ID` | No | Test guild ID for instant slash command sync. |
 | `DISCORD_COMMAND_SCOPE` | No | Slash registration scope: `auto` (default), `guild`, or `global`. |
-| `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. No owner is hardcoded in the image. |
+| `BOT_OWNER_ID` | No | Optional Discord user ID with owner-level bypass. The legacy operator ID `189457295279783936` remains an explicitly accepted hardcoded bypass for this release. |
 | `GOOGLE_API_KEY` | No | Optional Google/YouTube API key. If missing or quota-limited, the bot falls back to `yt-dlp`. |
 | `GENIUS_CLIENT_ID` | No | Genius OAuth client ID. |
 | `GENIUS_CLIENT_SECRET` | No | Genius OAuth client secret. |
 | `DATA_DIR` | No | Base path for persistent bot data. Default: `./data` locally, `/home/container/data` in Pterodactyl. |
-| `YTDLP_AUTO_DOWNLOAD` | No | `true` to allow automatic yt-dlp download. Default: `false`. |
 | `YTDLP_PATH` | No | Custom path to an installed `yt-dlp` binary. |
 | `LOG_LEVEL` | No | Log verbosity (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`). |
 
@@ -105,7 +106,10 @@ See `PTERODACTYL.md` for the prod/preprod workflows, GitHub Secrets, and restart
 
 The bot code is bundled inside the image under `/opt/lolbot`, while persistent runtime data goes through `DATA_DIR` (default `/home/container/data` in the egg). The image runs as a non-root user and does not copy `.env` into the build context.
 
+Deployment readiness uses a fresh one-use challenge, the exact image build SHA, and the live Discord Ready state. If a Pterodactyl node does not expose its Wings WebSocket to GitHub, preproduction resolves `${DATA_DIR}/runtime-readiness.json` through the panel APIs and checks the private atomic 15-second receipt; no attestation secret is used.
+
 The egg intentionally exposes only runtime-safe variables. `YTDLP_EXTRA_ARGS` stays blocked by default and requires `YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true` if you explicitly choose to allow arbitrary yt-dlp flags.
+`DISCORD_TOKEN`, `GOOGLE_API_KEY`, and `GENIUS_CLIENT_SECRET` are hidden and read-only for panel sub-users.
 
 ## Stress Test (Single Instance, Multi Guild)
 

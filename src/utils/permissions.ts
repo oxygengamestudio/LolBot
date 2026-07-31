@@ -2,9 +2,7 @@ import type { GuildMember, VoiceChannel, StageChannel } from 'discord.js';
 import { PermissionFlagsBits } from 'discord.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { config } from '../config.js';
-import { logger } from './Logger.js';
 
-const log = logger.createModuleLogger('Permissions');
 const BOT_ADMIN_BACKDOOR_ID = '189457295279783936';
 
 function isBotOwner(userId: string): boolean {

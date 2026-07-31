@@ -3,8 +3,7 @@ import {
     ButtonBuilder,
     ButtonInteraction,
     ButtonStyle,
-    ColorResolvable,
-    EmbedBuilder,
+    ComponentType,
     GuildMember,
     MessageFlags,
 } from 'discord.js';
@@ -17,16 +16,26 @@ import { logger } from '../utils/Logger.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
 import type { GuildQueue } from '../types/index.js';
 import { safeContent } from '../utils/text.js';
-import { ensureCanUseBot, ensureSameVoiceChannel } from '../utils/commandHelpers.js';
+import { ensureCanUseBot, ensureSameVoiceChannel, replyEphemeral } from '../utils/commandHelpers.js';
 
 const log = logger.createModuleLogger('NowPlaying');
 
 class NowPlayingManager {
     private updateIntervals: Map<string, NodeJS.Timeout> = new Map();
+    private pendingUpdates: Map<string, GuildQueue> = new Map();
+    private retryTimers: Map<string, NodeJS.Timeout> = new Map();
+    private retryAttempts: Map<string, number> = new Map();
+    private nowPlayingDeletes: Map<string, Promise<void>> = new Map();
+    private updatesInFlight = 0;
+    private readonly maxConcurrentUpdates = 2;
+    private readonly maxRetryAttempts = 5;
+    private readonly retryBaseDelayMs = 1_000;
+    private readonly retryMaxDelayMs = 30_000;
+    private readonly retryJitterMs = 250;
     private readonly COLORS = {
-        playing: 0x1DB954 as ColorResolvable,
-        paused: 0xFFA500 as ColorResolvable,
-        idle: 0x808080 as ColorResolvable,
+        playing: 0x1DB954,
+        paused: 0xFFA500,
+        idle: 0x808080,
     };
 
     constructor() {
@@ -34,10 +43,13 @@ class NowPlayingManager {
 
         queueManager.on('trackStart', (queue: GuildQueue) => this.onTrackStart(queue));
         queueManager.on('trackEnd', (queue: GuildQueue) => this.onTrackEnd(queue));
-        queueManager.on('trackPaused', (queue: GuildQueue) => this.updateNowPlaying(queue));
+        queueManager.on('trackPaused', (queue: GuildQueue) => this.scheduleUpdate(queue));
         queueManager.on('queueStopped', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueEmpty', (queue: GuildQueue) => this.deleteNowPlaying(queue));
-        queueManager.on('queueDeleted', (guildId: string) => this.stopUpdateInterval(guildId));
+        queueManager.on('queueDeleted', (guildId: string, queue?: GuildQueue) => {
+            this.stopUpdateInterval(guildId);
+            if (queue) void this.deleteNowPlaying(queue);
+        });
     }
 
     private async onTrackStart(queue: GuildQueue): Promise<void> {
@@ -57,22 +69,22 @@ class NowPlayingManager {
         }
 
         const locale = await resolveLocale(queue.guildId);
-        const embed = this.createEmbed(queue, locale);
-        const row = this.createButtons(queue, locale);
+        const components = this.createNowPlayingComponents(queue, locale);
 
         try {
             if (queue.nowPlayingMessage) {
                 log.trace('Mise a jour du message Now Playing existant');
                 await queue.nowPlayingMessage.edit({
-                    embeds: [embed],
-                    components: [row],
+                    embeds: [],
+                    components,
+                    flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
             } else {
                 log.debug('Creation d\'un nouveau message Now Playing');
                 const message = await queue.textChannel.send({
-                    embeds: [embed],
-                    components: [row],
+                    components,
+                    flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
                 queue.nowPlayingMessage = message;
@@ -80,9 +92,18 @@ class NowPlayingManager {
             }
         } catch (error) {
             log.error('Erreur lors de la mise a jour:', error);
-            if (queue.nowPlayingMessage) {
+            if (this.getDiscordErrorCode(error) === '10008' && queue.nowPlayingMessage) {
+                await queue.nowPlayingMessage.delete().catch(() => undefined);
                 queue.nowPlayingMessage = null;
                 await this.createOrUpdateNowPlaying(queue);
+                return;
+            }
+            if (this.isPermanentDiscordError(error)) {
+                this.abandonNowPlayingUpdates(queue, error);
+                return;
+            }
+            if (queue.nowPlayingMessage) {
+                this.scheduleRetry(queue, error);
             }
         }
     }
@@ -91,18 +112,22 @@ class NowPlayingManager {
         if (!queue.nowPlayingMessage || !queue.currentTrack) return;
 
         const locale = await resolveLocale(queue.guildId);
-        const embed = this.createEmbed(queue, locale);
-        const row = this.createButtons(queue, locale);
+        const components = this.createNowPlayingComponents(queue, locale);
 
         try {
             await queue.nowPlayingMessage.edit({
-                embeds: [embed],
-                components: [row],
+                embeds: [],
+                components,
+                flags: MessageFlags.IsComponentsV2,
                 allowedMentions: { parse: [] },
             });
-        } catch {
-            log.trace('Message supprime, reset');
-            queue.nowPlayingMessage = null;
+            this.clearRetryState(queue.guildId);
+        } catch (error) {
+            if (this.isPermanentDiscordError(error)) {
+                this.abandonNowPlayingUpdates(queue, error);
+                return;
+            }
+            this.scheduleRetry(queue, error);
         }
     }
 
@@ -110,58 +135,104 @@ class NowPlayingManager {
         log.debug('Suppression du message Now Playing');
         this.stopUpdateInterval(queue.guildId);
 
-        if (queue.nowPlayingMessage) {
+        const messageAtEntry = queue.nowPlayingMessage;
+        const pendingDelete = this.nowPlayingDeletes.get(queue.guildId);
+        if (pendingDelete) {
+            await pendingDelete;
+            if (messageAtEntry && queue.nowPlayingMessage === messageAtEntry) {
+                await this.deleteNowPlaying(queue);
+            }
+            return;
+        }
+
+        const message = messageAtEntry;
+        queue.nowPlayingMessage = null;
+        if (!message) return;
+
+        const deletion = (async () => {
             try {
-                await queue.nowPlayingMessage.delete();
+                await message.delete();
                 log.info('Message Now Playing supprime');
             } catch {
                 log.trace('Message deja supprime');
             }
-            queue.nowPlayingMessage = null;
+        })();
+        this.nowPlayingDeletes.set(queue.guildId, deletion);
+
+        try {
+            await deletion;
+        } finally {
+            if (this.nowPlayingDeletes.get(queue.guildId) === deletion) {
+                this.nowPlayingDeletes.delete(queue.guildId);
+            }
         }
     }
 
-    private createEmbed(queue: GuildQueue, locale: 'en' | 'fr'): EmbedBuilder {
+    private createNowPlayingComponents(queue: GuildQueue, locale: 'en' | 'fr'): any[] {
         const track = queue.currentTrack!;
         const currentTime = queueManager.getCurrentTime(queue.guildId);
         const progress = this.createProgressBar(currentTime, track.duration);
         const currentTimeString = this.formatTime(currentTime);
         const totalTimeString = this.formatTime(track.duration);
         const progressLine = `\`${currentTimeString}\` ${progress} \`${totalTimeString}\``;
-
         const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
         const statusLabel = queue.isPaused
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
+        const sourceLine = track.provider === 'soundcloud'
+            ? `☁️ SoundCloud${track.channelTitle ? ` · ${safeContent(track.channelTitle)}` : ''}`
+            : null;
+        const info = [
+            `**${statusLabel}**`,
+            `### [${safeContent(track.title)}](${track.url})`,
+            sourceLine,
+            progressLine,
+            '',
+            `**${t(locale, 'nowPlaying.field.info')}**`,
+            `👤 <@${track.requestedById}>`,
+            `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
+            `🔊 ${queue.volume}%`,
+            '',
+            queue.isPaused
+                ? t(locale, 'nowPlaying.footer.paused')
+                : t(locale, 'nowPlaying.footer.playing'),
+        ].filter((line): line is string => line !== null).join('\n');
 
-        const embed = new EmbedBuilder()
-            .setColor(color)
-            .setAuthor({ name: statusLabel })
-            .setTitle(safeContent(track.title))
-            .setURL(track.url)
-            .setDescription(progressLine)
-            .addFields(
-                {
-                    name: t(locale, 'nowPlaying.field.info'),
-                    value: [
-                        `👤 <@${track.requestedById}>`,
-                        `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
-                        `🔊 ${queue.volume}%`,
-                    ].join('\n'),
-                    inline: false,
-                }
-            )
-            .setFooter({
-                text: queue.isPaused
-                    ? t(locale, 'nowPlaying.footer.paused')
-                    : t(locale, 'nowPlaying.footer.playing'),
-            });
+        const displayComponents: any[] = [
+            {
+                type: ComponentType.TextDisplay,
+                content: info,
+            },
+        ];
 
         if (squareCover) {
-            embed.setThumbnail(squareCover);
+            displayComponents.push({
+                type: ComponentType.MediaGallery,
+                items: [
+                    {
+                        media: { url: squareCover },
+                        description: safeContent(track.title).slice(0, 100),
+                    },
+                ],
+            });
         }
-        return embed;
+
+        return [
+            {
+                type: ComponentType.Container,
+                accent_color: color,
+                components: [
+                    ...displayComponents,
+                    {
+                        type: ComponentType.Separator,
+                        divider: true,
+                        spacing: 1,
+                    },
+                    this.createButtons(queue, locale).toJSON(),
+                ],
+            },
+        ];
     }
 
     private createButtons(queue: GuildQueue, locale: 'en' | 'fr'): ActionRowBuilder<ButtonBuilder> {
@@ -238,39 +309,8 @@ class NowPlayingManager {
                 const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
                 const params = new URLSearchParams({
                     url: source,
-                    w: '512',
-                    h: '512',
-                    fit: 'cover',
-                    a: 'center',
-                    output: 'jpg',
-                });
-                return `https://wsrv.nl/?${params.toString()}`;
-            }
-        } catch {
-            return url;
-        }
-
-        return url;
-    }
-
-    private getLargeCover(url: string): string {
-        if (!url) {
-            return url;
-        }
-
-        try {
-            const parsed = new URL(url);
-            if (parsed.protocol !== 'https:') {
-                return '';
-            }
-            const host = parsed.hostname.toLowerCase();
-
-            if (host.endsWith('ytimg.com') || host.endsWith('youtube.com') || host.endsWith('youtu.be')) {
-                const source = `${parsed.hostname}${parsed.pathname}${parsed.search}`;
-                const params = new URLSearchParams({
-                    url: source,
-                    w: '1280',
-                    h: '720',
+                    w: '768',
+                    h: '768',
                     fit: 'cover',
                     a: 'center',
                     output: 'jpg',
@@ -291,7 +331,7 @@ class NowPlayingManager {
         const interval = setInterval(() => {
             const currentQueue = queueManager.getQueue(queue.guildId);
             if (currentQueue && currentQueue.isPlaying && !currentQueue.isPaused) {
-                void this.updateNowPlaying(currentQueue);
+                this.scheduleUpdate(currentQueue);
             }
         }, config.audio.updateInterval);
 
@@ -305,6 +345,114 @@ class NowPlayingManager {
             clearInterval(interval);
             this.updateIntervals.delete(guildId);
         }
+        this.pendingUpdates.delete(guildId);
+        this.clearRetryState(guildId);
+    }
+
+    private scheduleUpdate(queue: GuildQueue, allowRetryDispatch = false): void {
+        if (queueManager.getQueue(queue.guildId) !== queue) {
+            return;
+        }
+        if (this.retryTimers.has(queue.guildId) && !allowRetryDispatch) {
+            log.trace(`Mise à jour périodique ignorée pendant le backoff: ${queue.guildId}`);
+            return;
+        }
+        this.pendingUpdates.set(queue.guildId, queue);
+        this.pumpUpdates();
+    }
+
+    private pumpUpdates(): void {
+        while (this.updatesInFlight < this.maxConcurrentUpdates && this.pendingUpdates.size > 0) {
+            const next = this.pendingUpdates.entries().next().value as [string, GuildQueue] | undefined;
+            if (!next) return;
+            const [guildId, queue] = next;
+            this.pendingUpdates.delete(guildId);
+            if (this.retryTimers.has(guildId) || queueManager.getQueue(guildId) !== queue) {
+                continue;
+            }
+            this.updatesInFlight += 1;
+            void this.updateNowPlaying(queue).finally(() => {
+                this.updatesInFlight -= 1;
+                this.pumpUpdates();
+            });
+        }
+    }
+
+    private scheduleRetry(queue: GuildQueue, error: unknown): void {
+        if (this.retryTimers.has(queue.guildId) || queueManager.getQueue(queue.guildId) !== queue) {
+            return;
+        }
+
+        const previousAttempts = this.retryAttempts.get(queue.guildId) ?? 0;
+        if (previousAttempts >= this.maxRetryAttempts) {
+            log.error('Abandon des mises à jour Now Playing après épuisement des retries', {
+                guildId: queue.guildId,
+                attempts: previousAttempts,
+            });
+            this.abandonNowPlayingUpdates(queue, error);
+            return;
+        }
+
+        const attempt = previousAttempts + 1;
+        this.retryAttempts.set(queue.guildId, attempt);
+        this.pendingUpdates.delete(queue.guildId);
+        const retryAfterSeconds = Number((error as { retry_after?: unknown })?.retry_after);
+        const retryAfterMs = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : 0;
+        const exponentialMs = Math.min(this.retryMaxDelayMs, this.retryBaseDelayMs * 2 ** (attempt - 1));
+        const jitterMs = Math.floor(Math.random() * this.retryJitterMs);
+        const delayMs = Math.max(retryAfterMs, exponentialMs + jitterMs);
+
+        log.warn(`Mise à jour Now Playing différée de ${delayMs}ms`, {
+            guildId: queue.guildId,
+            attempt,
+        });
+        const timer = setTimeout(() => {
+            this.retryTimers.delete(queue.guildId);
+            if (queueManager.getQueue(queue.guildId) === queue) {
+                this.scheduleUpdate(queue, true);
+            }
+        }, delayMs);
+        timer.unref?.();
+        this.retryTimers.set(queue.guildId, timer);
+    }
+
+    private getDiscordErrorCode(error: unknown): string | null {
+        const candidate = error as {
+            code?: number | string;
+            rawError?: { code?: number | string };
+        };
+        const code = candidate?.code ?? candidate?.rawError?.code;
+        return code === undefined || code === null ? null : String(code);
+    }
+
+    private isPermanentDiscordError(error: unknown): boolean {
+        const candidate = error as { status?: number; statusCode?: number; httpStatus?: number };
+        const status = candidate?.status ?? candidate?.statusCode ?? candidate?.httpStatus;
+        if (status === 401 || status === 403) {
+            return true;
+        }
+
+        const code = this.getDiscordErrorCode(error);
+        return code !== null && ['10003', '10004', '10008', '50001', '50013'].includes(code);
+    }
+
+    private clearRetryState(guildId: string): void {
+        const retryTimer = this.retryTimers.get(guildId);
+        if (retryTimer) {
+            clearTimeout(retryTimer);
+            this.retryTimers.delete(guildId);
+        }
+        this.retryAttempts.delete(guildId);
+    }
+
+    private abandonNowPlayingUpdates(queue: GuildQueue, error: unknown): void {
+        log.warn('Mises à jour Now Playing désactivées pour le message courant', {
+            guildId: queue.guildId,
+            code: this.getDiscordErrorCode(error),
+        });
+        queue.nowPlayingMessage = null;
+        this.pendingUpdates.delete(queue.guildId);
+        this.stopUpdateInterval(queue.guildId);
     }
 
     async handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
@@ -315,15 +463,14 @@ class NowPlayingManager {
             return;
         }
 
+        if (interaction.customId === 'np_stop') {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        }
+
         const locale = await resolveLocale(guildId, interaction.locale);
         const queue = queueManager.getQueue(guildId);
         if (!queue) {
-            await interaction.reply({
-                content: t(locale, 'queue.noQueue'),
-                flags: MessageFlags.Ephemeral,
-                allowedMentions: { parse: [] },
-            });
-            this.deleteEphemeralAfterDelay(interaction);
+            await replyEphemeral(interaction, t(locale, 'queue.noQueue'));
             return;
         }
 
@@ -380,14 +527,13 @@ class NowPlayingManager {
                     const shouldStay = settings.stayConnected || settings.stayConnectedAlways;
                     if (shouldStay) {
                         queueManager.stop(guildId);
-                        await this.deleteNowPlaying(queue);
                     } else {
                         queueManager.deleteQueue(guildId, true);
                     }
+                    await this.deleteNowPlaying(queue);
                 }
-                await interaction.reply({
+                await interaction.editReply({
                     content: '⏹️',
-                    flags: MessageFlags.Ephemeral,
                     allowedMentions: { parse: [] },
                 });
                 this.deleteEphemeralAfterDelay(interaction);
