@@ -1,0 +1,9 @@
+vulnerabilities:
+  - id: CVE-2026-14257
+    purls:
+      - pkg:npm/brace-expansion@1.1.18
+    expired_at: 2026-08-31
+    statement: >-
+      brace-expansion 1.1.18 is the upstream 1.x maintenance backport of the
+      EXPANSION_MAX_LENGTH fix; scripts/audit-high.mjs verifies the locked
+      version and patched source before this image scan runs.

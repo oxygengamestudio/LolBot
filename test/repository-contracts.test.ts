@@ -56,6 +56,7 @@ test('deployment workflows cannot skip the shared quality gate', async () => {
         assert.match(trivyGate, /scanners:\s*vuln/);
         assert.match(trivyGate, /severity:\s*HIGH,CRITICAL/);
         assert.match(trivyGate, /ignore-unfixed:\s*false/);
+        assert.match(trivyGate, /trivyignores:\s*\.trivyignore\.yaml/);
         assert.match(trivyGate, /exit-code:\s*'1'/);
         assert.doesNotMatch(trivyGate, /continue-on-error:|\n\s+if:/);
         assert.doesNotMatch(source, /ignore-unfixed:\s*true/);
@@ -87,6 +88,17 @@ test('the quality gate runs audit, tests, typecheck, build, and CodeQL', async (
     assert.match(auditGate, /PATCHED_BRACE_VERSION = '1\.1\.18'/);
     assert.match(auditGate, /EXPANSION_MAX_LENGTH/);
     assert.match(auditGate, /Blocking HIGH\/CRITICAL audit findings/);
+
+    const trivyIgnore = await read('.trivyignore.yaml');
+    assert.equal(
+        [...trivyIgnore.matchAll(/^\s*- id:/gm)].length,
+        1,
+        'Trivy doit limiter cette exception au seul CVE rétroporté',
+    );
+    assert.match(trivyIgnore, /^\s*- id: CVE-2026-14257$/m);
+    assert.match(trivyIgnore, /^\s*- pkg:npm\/brace-expansion@1\.1\.18$/m);
+    assert.match(trivyIgnore, /^\s*expired_at: 2026-08-31$/m);
+    assert.match(trivyIgnore, /EXPANSION_MAX_LENGTH/);
 });
 
 test('third-party GitHub actions are pinned to immutable commit SHAs', async () => {

@@ -87,6 +87,7 @@ jobs:
           scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: false
+          trivyignores: .trivyignore.yaml
           exit-code: '1'
           timeout: 10m
           skip-setup-trivy: true
