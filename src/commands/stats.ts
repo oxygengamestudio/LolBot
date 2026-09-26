@@ -6,13 +6,15 @@ import { ensureCanUseBot, getInteractionLocale, replyEphemeral } from '../utils/
 import { logger } from '../utils/Logger.js';
 import { safeContent } from '../utils/text.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
+import { guildSettingsManager } from '../services/GuildSettingsManager.js';
+import { queueRecoveryManager } from '../services/QueueRecoveryManager.js';
 
 const log = logger.createModuleLogger('StatsCmd');
 
 export const data = new SlashCommandBuilder()
     .setName('stats')
-    .setDescription('Show voice and audio stats')
-    .setDescriptionLocalizations(commandDescriptionLocalizations('Affiche les informations de connexion et la qualite audio', 'Show voice and audio stats'))
+    .setDescription('Show audio stats and bot diagnostics')
+    .setDescriptionLocalizations(commandDescriptionLocalizations('Statistiques audio et diagnostic du bot', 'Show audio stats and bot diagnostics'))
     .setDMPermission(false);
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -53,6 +55,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     const outputBitrate = audioWrapper.getDiscordOutputBitrateKbps();
     const sourceMode = queue ? audioWrapper.getLastSourceMode(guildId) : 'unknown';
     const runtime = runtimeTelemetry.getSnapshot();
+    const diagnostics = audioWrapper.getDiagnostics();
+    const settings = await guildSettingsManager.getSettings(guildId);
+    const build = /^[a-f0-9]{7,40}$/i.test(process.env.BOT_BUILD_SHA ?? '') ? process.env.BOT_BUILD_SHA!.slice(0, 8) : 'local';
 
     const audioQuality = [
         `${t(locale, 'stats.source')}: ${sourceBitrate ? `${sourceBitrate} kbps` : 'n/a'}`,
@@ -73,6 +78,8 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         .setColor(0x5865F2)
         .setTitle(t(locale, 'stats.title'))
         .addFields(
+            { name: 'Diagnostic', value: `FFmpeg: ${diagnostics.ffmpeg ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')} | yt-dlp: ${diagnostics.ytdlp ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')}\nNode ${process.version} | build ${build}\n${locale === 'fr' ? 'Reglages en attente' : 'Pending settings'}: ${guildSettingsManager.pendingWrites}`, inline: false },
+            { name: locale === 'fr' ? 'File et reprise' : 'Queue and recovery', value: `${queue?.tracks.length ?? 0} ${locale === 'fr' ? 'pistes en attente' : 'upcoming tracks'}\n${locale === 'fr' ? 'Reprise' : 'Recovery'}: ${settings.queueRecoveryEnabled ? 'ON' : 'OFF'}${queueRecoveryManager.hasOffer(guildId) ? ' (confirmation)' : ''}`, inline: true },
             { name: t(locale, 'stats.voiceConnection'), value: `Etat: ${connectionStatus}`, inline: true },
             { name: t(locale, 'stats.ping'), value: formatPing(wsPing, udpPing), inline: true },
             { name: t(locale, 'stats.voiceChannel'), value: t(locale, 'stats.queuedMembers', { channel: safeContent(voiceChannelName), count: membersCount }), inline: false },
@@ -92,7 +99,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
             {
                 name: t(locale, 'stats.nowPlaying'),
                 value: currentTrack
-                    ? t(locale, 'stats.track', { title: safeContent(currentTrack.title), duration: formatDuration(currentTrack.duration) })
+                    ? t(locale, 'stats.track', { title: safeContent(currentTrack.title).slice(0, 400), duration: formatDuration(currentTrack.duration) })
                     : t(locale, 'stats.none'),
                 inline: false,
             }

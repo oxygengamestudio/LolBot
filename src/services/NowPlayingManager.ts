@@ -26,6 +26,9 @@ class NowPlayingManager {
     private retryTimers: Map<string, NodeJS.Timeout> = new Map();
     private retryAttempts: Map<string, number> = new Map();
     private nowPlayingDeletes: Map<string, Promise<void>> = new Map();
+    private renders = new WeakMap<GuildQueue, Promise<void>>();
+    private renderDirty = new WeakSet<GuildQueue>();
+    private generations = new WeakMap<GuildQueue, number>();
     private updatesInFlight = 0;
     private readonly maxConcurrentUpdates = 2;
     private readonly maxRetryAttempts = 5;
@@ -55,7 +58,9 @@ class NowPlayingManager {
     private async onTrackStart(queue: GuildQueue): Promise<void> {
         log.debug(`Track start: ${queue.currentTrack?.title}`);
         await this.createOrUpdateNowPlaying(queue);
-        this.startUpdateInterval(queue);
+        if (queueManager.getQueue(queue.guildId) === queue && queue.currentTrack && !queue.isStopping) {
+            this.startUpdateInterval(queue);
+        }
     }
 
     private async onTrackEnd(_queue: GuildQueue): Promise<void> {
@@ -63,12 +68,33 @@ class NowPlayingManager {
     }
 
     async createOrUpdateNowPlaying(queue: GuildQueue): Promise<void> {
-        if (!queue.currentTrack) {
+        if (!queue.currentTrack || queue.isStopping) return;
+        const pending = this.renders.get(queue);
+        if (pending) {
+            this.renderDirty.add(queue);
+            return pending;
+        }
+        const generation = this.generations.get(queue) ?? 0;
+        const work = Promise.resolve().then(async () => {
+            do {
+                this.renderDirty.delete(queue);
+                await this.renderNowPlaying(queue, generation);
+            } while (this.renderDirty.has(queue) && !this.retryTimers.has(queue.guildId) &&
+                generation === (this.generations.get(queue) ?? 0) && queue.currentTrack && !queue.isStopping);
+        });
+        this.renders.set(queue, work);
+        try { await work; }
+        finally { this.renders.delete(queue); this.renderDirty.delete(queue); }
+    }
+
+    private async renderNowPlaying(queue: GuildQueue, generation: number): Promise<void> {
+        if (!queue.currentTrack || queue.isStopping || generation !== (this.generations.get(queue) ?? 0)) {
             log.trace('Pas de track actuel, skip');
             return;
         }
 
         const locale = await resolveLocale(queue.guildId);
+        if (!queue.currentTrack || queue.isStopping || generation !== (this.generations.get(queue) ?? 0)) return;
         const components = this.createNowPlayingComponents(queue, locale);
 
         try {
@@ -87,15 +113,21 @@ class NowPlayingManager {
                     flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
+                if (!queue.currentTrack || queue.isStopping || generation !== (this.generations.get(queue) ?? 0)) {
+                    await message.delete().catch(() => undefined);
+                    return;
+                }
                 queue.nowPlayingMessage = message;
                 log.info('Message Now Playing cree');
             }
+            this.clearRetryState(queue.guildId);
         } catch (error) {
+            if (generation !== (this.generations.get(queue) ?? 0) || queue.isStopping || !queue.currentTrack) return;
             log.error('Erreur lors de la mise a jour:', error);
             if (this.getDiscordErrorCode(error) === '10008' && queue.nowPlayingMessage) {
                 await queue.nowPlayingMessage.delete().catch(() => undefined);
                 queue.nowPlayingMessage = null;
-                await this.createOrUpdateNowPlaying(queue);
+                await this.renderNowPlaying(queue, generation);
                 return;
             }
             if (this.isPermanentDiscordError(error)) {
@@ -110,30 +142,16 @@ class NowPlayingManager {
 
     async updateNowPlaying(queue: GuildQueue): Promise<void> {
         if (!queue.nowPlayingMessage || !queue.currentTrack) return;
-
-        const locale = await resolveLocale(queue.guildId);
-        const components = this.createNowPlayingComponents(queue, locale);
-
-        try {
-            await queue.nowPlayingMessage.edit({
-                embeds: [],
-                components,
-                flags: MessageFlags.IsComponentsV2,
-                allowedMentions: { parse: [] },
-            });
-            this.clearRetryState(queue.guildId);
-        } catch (error) {
-            if (this.isPermanentDiscordError(error)) {
-                this.abandonNowPlayingUpdates(queue, error);
-                return;
-            }
-            this.scheduleRetry(queue, error);
-        }
+        await this.createOrUpdateNowPlaying(queue);
     }
 
     async deleteNowPlaying(queue: GuildQueue): Promise<void> {
         log.debug('Suppression du message Now Playing');
         this.stopUpdateInterval(queue.guildId);
+        this.generations.set(queue, (this.generations.get(queue) ?? 0) + 1);
+        this.renderDirty.delete(queue);
+        const pendingRender = this.renders.get(queue);
+        if (pendingRender) await pendingRender;
 
         const messageAtEntry = queue.nowPlayingMessage;
         const pendingDelete = this.nowPlayingDeletes.get(queue.guildId);

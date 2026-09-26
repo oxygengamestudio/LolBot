@@ -12,6 +12,7 @@ import { logger } from '../utils/Logger.js';
 import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
 import { mediaCacheManager } from './MediaCacheManager.js';
 import { sponsorBlockService } from './SponsorBlockService.js';
+import { BoundedTtlCache } from '../utils/BoundedTtlCache.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
@@ -94,7 +95,8 @@ interface SponsorSegment {
 
 export class AudioWrapper extends EventEmitter {
     private cache: Map<string, CacheEntry> = new Map();
-    private bitrateCache: Map<string, { bitrate: number | null; timestamp: number }> = new Map();
+    private bitrateCache = new BoundedTtlCache<string, number | null>(500, 60 * 60 * 1000);
+    private bitratePending = new Map<string, Promise<number | null>>();
     private preloadingGuilds: Set<string> = new Set();
     private ffmpegPath: string = 'ffmpeg';
     private ytdlpPath: string = 'yt-dlp';
@@ -116,7 +118,6 @@ export class AudioWrapper extends EventEmitter {
     private readonly maxMetadataOutputBytes = 2 * 1024 * 1024;
     private readonly processKillGraceMs = 2_000;
     private readonly warmResourceTtlMs = 90_000;
-    private readonly bitrateCacheTtlMs = 60 * 60 * 1000;
     private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
@@ -805,18 +806,25 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const infoEstimate = this.bitrateCache.get(track.url);
-        if (infoEstimate && Date.now() - infoEstimate.timestamp < this.bitrateCacheTtlMs) {
-            return infoEstimate.bitrate;
-        }
+        return infoEstimate ?? null;
+    }
 
-        return null;
+    getDiagnostics() {
+        return { ffmpeg: this.ffmpegAvailable, ytdlp: this.ytdlpAvailable,
+            bitrateEntries: this.bitrateCache.size, warmups: this.warmupInFlight.size };
     }
 
     async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
         const cached = this.bitrateCache.get(url);
-        if (cached && Date.now() - cached.timestamp < this.bitrateCacheTtlMs) {
-            return cached.bitrate;
-        }
+        if (cached !== undefined) return cached;
+        if (this.bitratePending.has(url)) return this.bitratePending.get(url)!;
+        if (this.bitratePending.size >= 4) return null;
+        const pending = this.lookupAudioBitrate(url, guildId).finally(() => this.bitratePending.delete(url));
+        this.bitratePending.set(url, pending);
+        return pending;
+    }
+
+    private async lookupAudioBitrate(url: string, guildId: string): Promise<number | null> {
 
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
         if (!dependenciesOk) {
@@ -827,7 +835,7 @@ export class AudioWrapper extends EventEmitter {
         const primary = await this.fetchYtdlpInfo(guildId, url, includeCookies);
         if (primary.info) {
             const bitrate = this.extractAudioBitrateKbps(primary.info);
-            this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+            this.bitrateCache.set(url, bitrate);
             return bitrate;
         }
 
@@ -835,12 +843,12 @@ export class AudioWrapper extends EventEmitter {
             const fallback = await this.fetchYtdlpInfo(guildId, url, false);
             if (fallback.info) {
                 const bitrate = this.extractAudioBitrateKbps(fallback.info);
-                this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+                this.bitrateCache.set(url, bitrate);
                 return bitrate;
             }
         }
 
-        this.bitrateCache.set(url, { bitrate: null, timestamp: Date.now() });
+        this.bitrateCache.set(url, null);
         return null;
     }
 

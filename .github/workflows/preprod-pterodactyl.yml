@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: lolbot-preprod-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   quality:
@@ -27,6 +27,7 @@ jobs:
   docker:
     name: Build and push GHCR image
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: quality
     if: github.ref == 'refs/heads/pre-prod'
     permissions:
@@ -62,6 +63,8 @@ jobs:
           load: true
           push: false
           provenance: false
+          cache-from: type=gha,scope=lolbot-preprod
+          cache-to: type=gha,scope=lolbot-preprod,mode=max
           build-args: |
             BOT_BUILD_SHA=${{ github.sha }}
           tags: |
@@ -100,6 +103,7 @@ jobs:
   restart:
     name: Restart Pterodactyl preprod
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     needs: docker
 
     steps:

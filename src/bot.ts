@@ -20,6 +20,7 @@ import { config } from './config.js';
 import { commands } from './commands/index.js';
 import { queueManager } from './services/QueueManager.js';
 import { nowPlayingManager } from './services/NowPlayingManager.js';
+import { queueRecoveryManager } from './services/QueueRecoveryManager.js';
 import { queueViewManager } from './services/QueueViewManager.js';
 import { guildSettingsManager } from './services/GuildSettingsManager.js';
 import { handleLyricsDelete } from './utils/lyrics.js';
@@ -48,7 +49,7 @@ import { resolveLocale, t } from './utils/i18n.js';
 import { safeContent } from './utils/text.js';
 import fs from 'fs';
 import { join } from 'path';
-import { handlePlaylistChoice, handleSelection as handlePlaySelection } from './commands/play.js';
+import { handlePlaylistChoice } from './commands/play.js';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
@@ -298,6 +299,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     // Enregistrer les commandes au démarrage
     await registerCommands();
+    await queueRecoveryManager.start(client);
 
     // Définir le status initial
     updateIdleStatus();
@@ -317,6 +319,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
 // Événement: Interaction (commandes slash, boutons, autocomplete)
 client.on(Events.InteractionCreate, async (interaction) => {
+    if (isShuttingDown) return;
     log.trace(`Interaction reçue: ${interaction.type}`);
 
     try {
@@ -330,13 +333,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return;
         }
 
-        if (interaction.isStringSelectMenu() && interaction.customId.startsWith('play_select:')) {
-            await handlePlaySelection(interaction);
-            return;
-        }
 
         if (interaction.isButton() && interaction.customId.startsWith('play_playlist:')) {
             await handlePlaylistChoice(interaction);
+            return;
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('recovery:')) {
+            await queueRecoveryManager.handleButton(interaction);
             return;
         }
 
@@ -661,6 +665,14 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
                 sponsorBlockEnabled: !settings.sponsorBlockEnabled,
             });
             await interaction.update(buildSettingsMessage(updated));
+            return;
+        }
+        case SETTINGS_BUTTON_IDS.recovery: {
+            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                queueRecoveryEnabled: !settings.queueRecoveryEnabled,
+            });
+            await interaction.update(buildSettingsMessage(updated));
+            await queueRecoveryManager.settingsChanged(interaction.guildId);
             return;
         }
         default:
@@ -1142,6 +1154,11 @@ async function gracefulShutdown(reason: NodeJS.Signals | 'unhandledRejection' | 
     }
     settingsPromptStates.clear();
     settingsPromptByUser.clear();
+
+    await queueRecoveryManager.shutdown().catch(error => {
+        log.error('Queue recovery flush failed:', error);
+        exitCode = exitCode || 1;
+    });
 
     const guildIds = Array.from(queueManager.getAllQueues().keys());
     for (const guildId of guildIds) {

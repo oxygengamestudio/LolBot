@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync } from 'fs';
-import { readFile, rename, rm, writeFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
+import { writeJsonAtomic } from '../utils/atomicJson.js';
 import { join } from 'path';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
@@ -13,24 +14,28 @@ type StoredGuildSettings = Partial<GuildSettings> & {
     };
 };
 
-class GuildSettingsManager {
+export class GuildSettingsManager {
     private cache: Map<string, GuildSettings> = new Map();
     private saveQueue: Map<string, NodeJS.Timeout> = new Map();
     private localeConfigured: Map<string, boolean> = new Map();
+    private loads = new Map<string, Promise<GuildSettings>>();
+    private mutations = new Map<string, Promise<unknown>>();
+    private writes = new Map<string, Promise<void>>();
+    private dirty = new Set<string>();
 
-    constructor() {
+    constructor(private readonly guildsDir = config.paths.guilds, private readonly dataDir = config.paths.data) {
         this.ensureGuildsDir();
     }
 
     private ensureGuildsDir(): void {
-        if (!existsSync(config.paths.guilds)) {
-            mkdirSync(config.paths.guilds, { recursive: true });
+        if (!existsSync(this.guildsDir)) {
+            mkdirSync(this.guildsDir, { recursive: true });
             log.debug('Dossier guild créé');
         }
     }
 
     private ensureGuildDir(guildId: string): void {
-        const guildDir = join(config.paths.guilds, guildId);
+        const guildDir = join(this.guildsDir, guildId);
         if (!existsSync(guildDir)) {
             mkdirSync(guildDir, { recursive: true });
             log.debug(`Dossier guild créé pour ${guildId}`);
@@ -54,6 +59,7 @@ class GuildSettingsManager {
             allowedRoles: [],
             blockedRoles: [],
             sponsorBlockEnabled: false,
+            queueRecoveryEnabled: false,
         };
     }
 
@@ -92,6 +98,7 @@ class GuildSettingsManager {
             guildId,
             locale,
             volume,
+            queueRecoveryEnabled: settings.queueRecoveryEnabled === true,
             stayConnected: typeof settings.stayConnected === 'boolean' ? settings.stayConnected : defaults.stayConnected,
             stayConnectedAlways:
                 typeof settings.stayConnectedAlways === 'boolean'
@@ -101,8 +108,7 @@ class GuildSettingsManager {
                 typeof settings.pauseOnEmptyChannelWhenAlwaysConnected === 'boolean'
                     ? settings.pauseOnEmptyChannelWhenAlwaysConnected
                     : defaults.pauseOnEmptyChannelWhenAlwaysConnected,
-            // Legacy field kept for one release. The former crossfade pipeline was
-            // not sample-continuous and is intentionally disabled during migration.
+            // Keep the upstream migration away from the legacy crossfade pipeline.
             crossfadeEnabled: false,
             sponsorBlockEnabled:
                 typeof settings.sponsorBlockEnabled === 'boolean'
@@ -122,13 +128,20 @@ class GuildSettingsManager {
     }
 
     async getSettings(guildId: string): Promise<GuildSettings> {
+        if (!/^\d{17,20}$/.test(guildId)) throw new Error('Invalid guild ID');
         if (this.cache.has(guildId)) {
             return this.cache.get(guildId)!;
         }
 
-        const settings = await this.loadSettings(guildId);
-        this.cache.set(guildId, settings);
-        return settings;
+        let pending = this.loads.get(guildId);
+        if (!pending) {
+            pending = this.loadSettings(guildId).then(settings => {
+                this.cache.set(guildId, settings);
+                return settings;
+            }).finally(() => this.loads.delete(guildId));
+            this.loads.set(guildId, pending);
+        }
+        return pending;
     }
 
     async isLocaleConfigured(guildId: string): Promise<boolean> {
@@ -142,7 +155,7 @@ class GuildSettingsManager {
 
     private async loadSettings(guildId: string): Promise<GuildSettings> {
         const filePath = this.getFilePath(guildId);
-        const legacyPath = join(config.paths.data, 'guilds', `${guildId}.json`);
+        const legacyPath = join(this.dataDir, 'guilds', `${guildId}.json`);
 
         if (!existsSync(filePath)) {
             if (existsSync(legacyPath)) {
@@ -156,6 +169,7 @@ class GuildSettingsManager {
                     return migrated;
                 } catch (error) {
                     log.error(`Erreur migration settings pour guild ${guildId}:`, error);
+                    throw error;
                 }
             }
 
@@ -169,59 +183,59 @@ class GuildSettingsManager {
         try {
             const data = await readFile(filePath, 'utf-8');
             const parsed = JSON.parse(data) as StoredGuildSettings;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid settings file');
             this.localeConfigured.set(guildId, parsed._meta?.localeConfigured === true);
             return this.normalizeSettings(guildId, parsed);
         } catch (error) {
             log.error(`Erreur lecture settings pour guild ${guildId}:`, error);
             this.localeConfigured.set(guildId, false);
-            return this.getDefaults(guildId);
+            throw error;
         }
     }
 
     async saveSettings(guildId: string, settings: GuildSettings): Promise<void> {
+        if (!/^\d{17,20}$/.test(guildId)) throw new Error('Invalid guild ID');
         this.cache.set(guildId, this.normalizeSettings(guildId, settings));
+        this.dirty.add(guildId);
 
         if (this.saveQueue.has(guildId)) {
             clearTimeout(this.saveQueue.get(guildId)!);
         }
 
-        const timeout = setTimeout(async () => {
-            await this.flushSettings(guildId);
+        const timeout = setTimeout(() => {
             this.saveQueue.delete(guildId);
+            void this.flushSettings(guildId).catch(error => log.error('Settings write failed:', error));
         }, 500);
 
         this.saveQueue.set(guildId, timeout);
     }
 
-    async flushAll(): Promise<void> {
-        const pendingGuildIds = new Set<string>([
-            ...this.cache.keys(),
-            ...this.saveQueue.keys(),
-        ]);
-        for (const timeout of this.saveQueue.values()) {
-            clearTimeout(timeout);
-        }
-        this.saveQueue.clear();
-        await Promise.all(Array.from(pendingGuildIds, (guildId) => this.flushSettings(guildId)));
-    }
-
     private async flushSettings(guildId: string): Promise<void> {
-        const settings = this.cache.get(guildId);
-        if (!settings) return;
-
-        const filePath = this.getFilePath(guildId);
-
-        try {
-            this.ensureGuildDir(guildId);
-            const data = JSON.stringify(this.serializeSettings(guildId, settings), null, 2);
-            await this.writeAtomic(filePath, data);
-            log.debug(`Settings sauvegardés pour guild ${guildId}`);
-        } catch (error) {
-            log.error(`Erreur sauvegarde settings pour guild ${guildId}:`, error);
-        }
+        const existing = this.writes.get(guildId);
+        if (existing) return existing;
+        const pending = (async () => {
+            while (this.dirty.delete(guildId)) {
+                try {
+                    await writeJsonAtomic(this.getFilePath(guildId), this.serializeSettings(guildId, this.cache.get(guildId)!));
+                } catch (error) {
+                    this.dirty.add(guildId);
+                    throw error;
+                }
+            }
+        })().finally(() => this.writes.delete(guildId));
+        this.writes.set(guildId, pending);
+        return pending;
     }
 
     async updateSettings(guildId: string, updates: Partial<GuildSettings>): Promise<GuildSettings> {
+        const previous = this.mutations.get(guildId) ?? Promise.resolve();
+        const pending = previous.catch(() => undefined).then(() => this.applyUpdate(guildId, updates));
+        this.mutations.set(guildId, pending);
+        try { return await pending; }
+        finally { if (this.mutations.get(guildId) === pending) this.mutations.delete(guildId); }
+    }
+
+    private async applyUpdate(guildId: string, updates: Partial<GuildSettings>): Promise<GuildSettings> {
         const current = await this.getSettings(guildId);
         const updated = this.normalizeSettings(guildId, { ...current, ...updates, guildId });
         if (updates.locale === 'fr' || updates.locale === 'en') {
@@ -232,7 +246,7 @@ class GuildSettingsManager {
     }
 
     private getFilePath(guildId: string): string {
-        return join(config.paths.guilds, guildId, 'settings.json');
+        return join(this.guildsDir, guildId, 'settings.json');
     }
 
     private serializeSettings(guildId: string, settings: GuildSettings): StoredGuildSettings {
@@ -250,26 +264,27 @@ class GuildSettingsManager {
         try {
             this.ensureGuildDir(guildId);
             this.localeConfigured.set(guildId, localeConfigured);
-            const data = JSON.stringify(this.serializeSettings(guildId, settings), null, 2);
-            await this.writeAtomic(filePath, data);
+            await writeJsonAtomic(filePath, this.serializeSettings(guildId, settings));
             log.debug(`Settings par défaut créés pour guild ${guildId}`);
         } catch (error) {
             log.error(`Erreur création settings pour guild ${guildId}:`, error);
-        }
-    }
-
-    private async writeAtomic(filePath: string, data: string): Promise<void> {
-        const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-        try {
-            await writeFile(tempPath, data, { encoding: 'utf-8', mode: 0o600 });
-            await rename(tempPath, filePath);
-        } catch (error) {
-            await rm(tempPath, { force: true }).catch(() => undefined);
             throw error;
         }
     }
 
+    async flushAll(): Promise<void> {
+        await Promise.all([...this.mutations.values(), ...this.loads.values()]);
+        for (const timer of this.saveQueue.values()) clearTimeout(timer);
+        this.saveQueue.clear();
+        await Promise.all([...new Set([...this.dirty, ...this.writes.keys()])].map(id => this.flushSettings(id)));
+    }
+
+    get pendingWrites(): number { return this.dirty.size; }
+
     clearCache(guildId?: string): void {
+        if (this.dirty.size || this.writes.size || this.loads.size || this.mutations.size) {
+            throw new Error('Flush pending settings before clearing cache');
+        }
         if (guildId) {
             this.cache.delete(guildId);
             this.localeConfigured.delete(guildId);

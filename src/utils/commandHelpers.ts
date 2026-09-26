@@ -11,7 +11,7 @@ import type {
 } from 'discord.js';
 import { MessageFlags } from 'discord.js';
 import { config } from '../config.js';
-import { canManageSettings, canUseBot } from './permissions.js';
+import { canManageSettings, canUseBot, isBotOwner } from './permissions.js';
 import { resolveLocale, t } from './i18n.js';
 
 type SupportedInteraction =
@@ -123,4 +123,17 @@ export async function checkBasicPermissions(
     member: GuildMember
 ): Promise<boolean> {
     return ensureCanUseBot(interaction, member);
+}
+
+export async function ensureCanControlPlayback(interaction: SupportedInteraction, member: GuildMember, botChannelId: string): Promise<boolean> {
+    if (!(await ensureCanUseBot(interaction, member))) return false;
+    if (isBotOwner(member.user.id)) return true;
+    return ensureSameVoiceChannel(interaction, member, botChannelId);
+}
+
+export async function getFreshInteractionMember(interaction: SupportedInteraction): Promise<GuildMember | null> {
+    if (!interaction.guild) return null;
+    if (isBotOwner(interaction.user.id)) return interaction.member as GuildMember;
+    try { return await interaction.guild.members.fetch({ user: interaction.user.id, force: true }); }
+    catch { return null; }
 }

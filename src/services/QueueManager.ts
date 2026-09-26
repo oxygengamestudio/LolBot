@@ -145,6 +145,7 @@ class QueueManager extends EventEmitter {
         this.clearBufferingWatchdog(guildId);
         this.invalidateQueueSession(guildId);
         if (queue) {
+            this.emit('queueDisconnecting', queue, manualDisconnect);
             queue.isManualDisconnect = manualDisconnect;
             queue.isReconnecting = false;
             queue.reconnectAttempts = 0;
@@ -638,6 +639,8 @@ class QueueManager extends EventEmitter {
         resumeOffset: number,
         recovery: PlaybackRecoveryContext
     ): Promise<boolean> {
+        const settings = await guildSettingsManager.getSettings(queue.guildId).catch(() => null);
+        if (!settings || settings.queueRecoveryEnabled) return false;
         if (!this.isRecoveryCurrent(queue, recovery)) {
             return false;
         }
@@ -1601,6 +1604,7 @@ class QueueManager extends EventEmitter {
         }
 
         const removed = queue.tracks.splice(index, 1)[0] ?? null;
+        this.emit('queueChanged', queue);
         if (removed) {
             log.info(`Piste supprimee: ${removed.title}`);
         }
@@ -1624,6 +1628,7 @@ class QueueManager extends EventEmitter {
         if (count <= 0) return 0;
 
         queue.tracks.splice(safeStart, count);
+        this.emit('queueChanged', queue);
         log.info(`Suppression de ${count} piste(s) de la queue`);
         this.refreshWarmup(queue);
         void this.pruneCache();
@@ -1642,6 +1647,7 @@ class QueueManager extends EventEmitter {
         const count = queue.tracks.length;
         queue.tracks = [];
         log.info(`File d'attente videe (${count} piste(s) supprimee(s))`);
+        this.emit('queueChanged', queue);
         this.refreshWarmup(queue);
         void this.pruneCache();
         return count;
@@ -1671,6 +1677,7 @@ class QueueManager extends EventEmitter {
 
         const insertAt = clampedTo >= queue.tracks.length ? queue.tracks.length : clampedTo;
         queue.tracks.splice(insertAt, 0, track);
+        this.emit('queueChanged', queue);
         log.info(`Piste deplacee: ${track.title} (${fromIndex} -> ${insertAt})`);
         this.refreshWarmup(queue);
         return true;

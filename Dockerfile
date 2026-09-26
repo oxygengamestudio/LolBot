@@ -17,25 +17,24 @@ FROM ${NODE_BASE} AS runtime
 LABEL org.opencontainers.image.source="https://github.com/oxygengamestudio/LolBot" \
     org.opencontainers.image.description="LolBot Discord music bot Pterodactyl image"
 
-ARG BOT_BUILD_SHA=local
-ARG YTDLP_VERSION=2026.07.04
+ARG YTDLP_VERSION=2026.08.19
 ARG TARGETARCH=amd64
 
 ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
-    DATA_DIR=/home/container/data \
-    BOT_BUILD_SHA=${BOT_BUILD_SHA}
+    DATA_DIR=/home/container/data
 
 RUN apk add --no-cache ca-certificates ffmpeg tini \
     && case "${TARGETARCH}" in \
-        amd64) asset='yt-dlp_musllinux'; checksum='f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e' ;; \
-        arm64) asset='yt-dlp_musllinux_aarch64'; checksum='9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7' ;; \
+        amd64) asset='yt-dlp_musllinux'; checksum='f3dec9cfeaf304cec98290fe41c6ad465d4b747d302473559643e7af24929722' ;; \
+        arm64) asset='yt-dlp_musllinux_aarch64'; checksum='17b164c4d258be92bb1ad146cb7c336b783aedb380814aabbcb7d52937f77e57' ;; \
         *) echo "Architecture yt-dlp non prise en charge: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && wget -q -O /usr/local/bin/yt-dlp \
         "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${asset}" \
     && echo "${checksum}  /usr/local/bin/yt-dlp" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/yt-dlp \
+    && printf '%s\n' '--js-runtimes node' > /etc/yt-dlp.conf \
     && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
         /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
         /opt/yarn-v* /usr/local/bin/yarn /usr/local/bin/yarnpkg \
@@ -52,6 +51,9 @@ RUN mkdir -p /home/container /opt/lolbot \
     && chown -R node:node /home/container /opt/lolbot
 
 USER node
+
+ARG BOT_BUILD_SHA=local
+ENV BOT_BUILD_SHA=${BOT_BUILD_SHA}
 
 VOLUME ["/home/container"]
 

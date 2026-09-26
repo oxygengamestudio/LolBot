@@ -129,6 +129,7 @@ export interface GuildSettings {
     pauseOnEmptyChannelWhenAlwaysConnected: boolean;
     crossfadeEnabled: boolean;
     sponsorBlockEnabled: boolean;
+    queueRecoveryEnabled: boolean;
     preferredVoiceChannel: string | null;
     voiceChannelMode: VoiceChannelMode;
     allowedVoiceChannels: string[];

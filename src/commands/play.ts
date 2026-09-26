@@ -16,7 +16,7 @@
 import { youtubeService } from '../services/YouTubeService.js';
 import { soundCloudService } from '../services/SoundCloudService.js';
 import { queueManager } from '../services/QueueManager.js';
-import { canUseBot, canJoinVoiceChannel } from '../utils/permissions.js';
+import { canUseBot, canJoinVoiceChannel, isBotOwner } from '../utils/permissions.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
@@ -24,6 +24,7 @@ import { isKnownInteractionResponseError } from '../utils/discordApiErrors.js';
 import type { SearchResult, Track } from '../types/index.js';
 import { commandDescriptionLocalizations, resolveLocale, t } from '../utils/i18n.js';
 import { safeContent, truncate } from '../utils/text.js';
+import { ensureCanUseBot, ensureVoiceMembership, getFreshInteractionMember, replyEphemeral } from '../utils/commandHelpers.js';
 
 const log = logger.createModuleLogger('PlayCmd');
 const AUTOCOMPLETE_DEBOUNCE_MS = 1_500;
@@ -32,7 +33,6 @@ const AUTOCOMPLETE_HINT_START_TYPING = '__hint_start_typing__';
 const AUTOCOMPLETE_HINT_REFINE = '__hint_refine_query__';
 const AUTOCOMPLETE_HINT_NO_RESULTS = '__hint_no_results__';
 const MAX_AUTOCOMPLETE_OPTIONS = 25;
-const PLAY_SELECTION_PREFIX = 'play_select';
 const PLAY_PLAYLIST_PREFIX = 'play_playlist';
 
 type AutocompleteOption = { name: string; value: string };
@@ -42,17 +42,6 @@ type AutocompleteState = {
     lastApiCallAt: number;
     lastQuery: string;
     lastOptions: AutocompleteOption[];
-};
-type PendingPlaySelection = {
-    createdAt: number;
-    guildId: string;
-    userId: string;
-    textChannelId: string;
-    voiceChannelId: string;
-    requestedBy: string;
-    requestedById: string;
-    query: string;
-    results: SearchResult[];
 };
 type PendingPlaylistChoice = {
     createdAt: number;
@@ -69,7 +58,6 @@ type PendingPlaylistChoice = {
 
 const autocompleteState = new Map<string, AutocompleteState>();
 const autocompleteAbortControllers = new Map<string, { query: string; controller: AbortController }>();
-const pendingSelections = new Map<string, PendingPlaySelection>();
 const pendingPlaylistChoices = new Map<string, PendingPlaylistChoice>();
 
 export const data = new SlashCommandBuilder()
@@ -247,81 +235,6 @@ async function rejectPlayInput(
     deleteEphemeralAfterDelay(interaction);
 }
 
-export async function handleSelection(interaction: StringSelectMenuInteraction): Promise<void> {
-    const selectionId = parseSelectionId(interaction.customId);
-    const payload = selectionId ? pendingSelections.get(selectionId) : null;
-    if (!selectionId || !payload) {
-        await interaction.update({
-            content: 'Cette sélection a expiré. Relance `/play`.',
-            components: [],
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    if (interaction.user.id !== payload.userId || interaction.guildId !== payload.guildId) {
-        await interaction.reply({
-            content: 'Cette sélection ne vous appartient pas.',
-            flags: MessageFlags.Ephemeral,
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    if (!interaction.inCachedGuild() || !(await canUseBot(interaction.member))) {
-        await interaction.reply({
-            content: `❌ ${t(interaction.locale, 'error.noPermission')}`,
-            flags: MessageFlags.Ephemeral,
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    const index = Number.parseInt(interaction.values?.[0] ?? '', 10);
-    if (!Number.isInteger(index) || index < 0 || index >= payload.results.length) {
-        await interaction.update({
-            content: 'Sélection invalide.',
-            components: [],
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    const guild = interaction.guild;
-    const textChannel = guild?.channels.cache.get(payload.textChannelId) as TextChannel | undefined;
-    const voiceChannel = guild?.channels.cache.get(payload.voiceChannelId);
-    if (!guild || !textChannel || !voiceChannel?.isVoiceBased()) {
-        pendingSelections.delete(selectionId);
-        await interaction.update({
-            content: 'Salon introuvable. Relance `/play`.',
-            components: [],
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    if (!(await canJoinVoiceChannel(voiceChannel, guild.id))) {
-        await interaction.update({
-            content: `Je n'ai pas l'autorisation de rejoindre <#${voiceChannel.id}>.`,
-            components: [],
-            allowedMentions: { parse: [] },
-        });
-        return;
-    }
-
-    const result = payload.results[index];
-    const track = await youtubeService.createTrackFromSearch(result, payload.requestedBy, payload.requestedById);
-    pendingSelections.delete(selectionId);
-
-    await interaction.update({
-        content: `Ajout de **${safeContent(track.title)}**...`,
-        components: [],
-        allowedMentions: { parse: [] },
-    });
-
-    const locale = await resolveLocale(guild.id, interaction.locale);
-    await addTrackToQueue(interaction, track, voiceChannel as VoiceChannel | StageChannel, textChannel, locale);
-}
 
 export async function handlePlaylistChoice(interaction: ButtonInteraction): Promise<void> {
     const parsed = parsePlaylistChoiceId(interaction.customId);
@@ -370,7 +283,7 @@ export async function handlePlaylistChoice(interaction: ButtonInteraction): Prom
     // The member may have left voice while the playlist confirmation was pending.
     // Keep using the channel selected when /play ran (including a preferred channel),
     // but never resolve media or enqueue tracks for a member who is no longer in voice.
-    if (!member.voice.channel) {
+    if (!member.voice.channel && !isBotOwner(member.user.id)) {
         pendingPlaylistChoices.delete(parsed.id);
         await interaction.update({
             content: `❌ ${t(interaction.locale, 'error.mustBeInVoice')}`,
@@ -388,6 +301,8 @@ export async function handlePlaylistChoice(interaction: ButtonInteraction): Prom
         });
         return;
     }
+
+    if (!(await ensurePlayAccess(interaction, voiceChannel as VoiceChannel | StageChannel, false))) return;
 
     pendingPlaylistChoices.delete(parsed.id);
     await interaction.update({
@@ -421,12 +336,6 @@ export async function handlePlaylistChoice(interaction: ButtonInteraction): Prom
     );
 }
 
-function parseSelectionId(customId: string): string | null {
-    if (!customId.startsWith(`${PLAY_SELECTION_PREFIX}:`)) {
-        return null;
-    }
-    return customId.split(':', 2)[1] ?? null;
-}
 
 function parsePlaylistChoiceId(customId: string): { id: string; choice: 'video' | 'playlist' } | null {
     if (!customId.startsWith(`${PLAY_PLAYLIST_PREFIX}:`)) {
@@ -671,6 +580,8 @@ async function ensureQueueForPlayback(
     textChannel: TextChannel,
     locale: 'en' | 'fr'
 ) {
+    if (!(await ensurePlayAccess(interaction, voiceChannel, true))) return null;
+
     let queue = queueManager.getQueue(interaction.guildId!);
     if (!queue) {
         log.debug('Creation d\'une nouvelle queue');
@@ -679,15 +590,6 @@ async function ensureQueueForPlayback(
 
     if (queue.voiceChannel.id === voiceChannel.id) {
         return queue;
-    }
-
-    if (!(await canJoinVoiceChannel(voiceChannel, interaction.guildId!))) {
-        await interaction.editReply({
-            content: `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${voiceChannel.id}>` })}`,
-            components: [],
-            allowedMentions: { parse: [] },
-        });
-        return null;
     }
 
     const moved = await queueManager.moveToChannel(queue, voiceChannel);
@@ -700,7 +602,31 @@ async function ensureQueueForPlayback(
         return null;
     }
 
+    if (!(await ensurePlayAccess(interaction, voiceChannel, true))) return null;
     return queue;
+}
+
+async function ensurePlayAccess(
+    interaction: PlayInteraction,
+    target: VoiceChannel | StageChannel,
+    refreshMember: boolean
+): Promise<boolean> {
+    const member = refreshMember ? await getFreshInteractionMember(interaction) : interaction.member as GuildMember;
+    if (!member || !(await ensureCanUseBot(interaction, member))) return false;
+    const locale = await resolveLocale(interaction.guildId, interaction.locale);
+    if (!isBotOwner(member.user.id)) {
+        if (!(await ensureVoiceMembership(interaction, member))) return false;
+        const settings = await guildSettingsManager.getSettings(interaction.guildId!);
+        if (member.voice.channelId !== target.id && settings.preferredVoiceChannel !== target.id) {
+            await replyEphemeral(interaction, `❌ ${t(locale, 'error.sameVoice')}`);
+            return false;
+        }
+    }
+    if (!(await canJoinVoiceChannel(target, interaction.guildId!))) {
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.voiceJoinDenied', { channel: `<#${target.id}>` })}`);
+        return false;
+    }
+    return true;
 }
 
 async function handleSearchAuto(
@@ -858,6 +784,10 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
 
     const state = autocompleteState.get(key);
     const now = Date.now();
+    for (const [id, entry] of autocompleteState) {
+        if (now - entry.lastApiCallAt >= 60_000) autocompleteState.delete(id);
+    }
+    while (autocompleteState.size >= 1_000) autocompleteState.delete(autocompleteState.keys().next().value!);
 
     if (state && state.lastQuery === query) {
         await safeAutocompleteRespond(interaction, state.lastOptions);
@@ -875,6 +805,7 @@ export async function autocomplete(interaction: AutocompleteInteraction): Promis
     }
 
     const activeSearch = autocompleteAbortControllers.get(key);
+    autocompleteState.set(key, { lastApiCallAt: now, lastQuery: query, lastOptions: state?.lastOptions ?? [] });
     if (activeSearch && activeSearch.query !== query) {
         cancelAutocomplete(key);
     }
@@ -967,9 +898,7 @@ function getAutocompleteKey(interaction: {
     channelId?: string | null;
     user: { id: string };
 }): string {
-    const guildId = interaction.guildId ?? 'dm';
-    const channelId = interaction.channelId ?? 'unknown-channel';
-    return `${guildId}:${channelId}:${interaction.user.id}`;
+    return interaction.user.id;
 }
 
 async function safeAutocompleteRespond(

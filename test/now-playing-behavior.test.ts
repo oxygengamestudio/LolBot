@@ -235,6 +235,41 @@ test('Now Playing identifies SoundCloud, links the canonical track, and shows th
     assert.match(content, /SoundCloud · \$KORCH/);
 });
 
+test('concurrent player refreshes coalesce without overlapping Discord edits', async () => {
+    let active = 0;
+    let maximum = 0;
+    let calls = 0;
+    const queue = createQueue('guild-coalesced', async () => {
+        maximum = Math.max(maximum, ++active);
+        calls += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        active -= 1;
+    });
+    await Promise.all(Array.from({ length: 20 }, () => nowPlayingManager.updateNowPlaying(queue)));
+    assert.equal(maximum, 1);
+    assert.ok(calls <= 2);
+});
+
+test('stop during slow message creation removes the late message and leaves no timer', async () => {
+    let release!: (value: unknown) => void;
+    let sends = 0;
+    let deletes = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const queue = createQueue('guild-late-send', async () => undefined);
+    queue.nowPlayingMessage = null;
+    queue.textChannel.send = (async () => { sends += 1; return gate; }) as never;
+    const creation = nowPlayingManager.onTrackStart(queue);
+    await waitFor(() => sends === 1);
+    queue.currentTrack = null;
+    queue.isStopping = true;
+    const deletion = nowPlayingManager.deleteNowPlaying(queue);
+    release({ delete: async () => { deletes += 1; } });
+    await Promise.all([creation, deletion]);
+    assert.equal(deletes, 1);
+    assert.equal(queue.nowPlayingMessage, null);
+    assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), false);
+});
+
 function makeStopButton(guildId: string, events: string[]) {
     const interaction: Record<string, any> = {
         customId: 'np_stop',

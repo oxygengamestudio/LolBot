@@ -4,6 +4,14 @@ Bot Discord TypeScript de musique, bilingue FR/EN, deployable avec Docker, GitHu
 
 `/play` accepte les recherches et liens YouTube ainsi que les liens de pistes SoundCloud publiques individuelles, y compris les liens courts `on.soundcloud.com`. La recherche SoundCloud, les profils, playlists/sets et liens privés ne sont pas pris en charge. SoundCloud réutilise le binaire `yt-dlp` existant et ne nécessite aucune variable d'environnement supplémentaire.
 
+## Reprise et diagnostic
+
+- Dans `/settings`, le bouton **Reprise** active une sauvegarde de la file par serveur, desactivee par defaut.
+- Apres un redemarrage ou une deconnexion vocale durable, le bot propose **Reprendre** ou **Ignorer** dans le salon texte de la session. Il ne rejoint pas le vocal et ne lance aucune piste avant confirmation.
+- La sauvegarde expire apres 24 heures. La piste interrompue reprend depuis le debut ; les liens YouTube et SoundCloud publics sont conserves, pas les URL temporaires de flux.
+- La confirmation exige les droits actuels et la presence dans le salon vocal cible. Le compte proprietaire conserve son acces distant intentionnel. Un arret manuel, une file terminee ou la desactivation de l'option efface la sauvegarde.
+- `/stats` regroupe les statistiques audio et le diagnostic : CPU, memoire, latence, cache, reprises, etat FFmpeg/yt-dlp, version Node et identifiant du build. Aucune cle ni chemin de fichier sensible n'est affiche.
+
 ## Requirements
 
 - Node.js >= 22.12.0
@@ -79,6 +87,8 @@ The deployment split is branch-based:
 
 - Push to `main`: build the prod image, push `ghcr.io/oxygengamestudio/lolbot:prod` and `:latest`, then restart the prod Pterodactyl server.
 - Push to `pre-prod`: build the preprod image, push `ghcr.io/oxygengamestudio/lolbot:preprod`, then restart the preprod Pterodactyl server.
+
+Operational policy: push to `pre-prod` only unless production is explicitly requested. Preprod builds use a shared Docker cache and do not cancel an in-progress deployment. Tests, dependency audit, image security scan, and the exact-build Discord readiness check must succeed.
 
 ### GitHub repository configuration
 

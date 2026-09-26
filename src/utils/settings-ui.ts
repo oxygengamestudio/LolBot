@@ -23,6 +23,7 @@ export const SETTINGS_BUTTON_IDS = {
     always: 'settings_always',
     pauseOnEmpty: 'settings_pause_on_empty',
     sponsor: 'settings_sponsor',
+    recovery: 'settings_recovery',
     preferred: 'settings_preferred',
     voice: 'settings_voice',
     roles: 'settings_roles',
@@ -59,6 +60,7 @@ export function buildSettingsMessage(settings: GuildSettings): {
 } {
     const locale = settings.locale;
     const lines = [
+        `${locale === 'fr' ? 'Reprise sur confirmation' : 'Recovery on confirmation'}: ${booleanLabel(locale, settings.queueRecoveryEnabled)}`,
         `🔊 ${t(locale, 'settings.volume')}: ${settings.volume}%`,
         `🌐 ${t(locale, 'settings.language')}: ${localeLabel(locale)}`,
         `📌 ${t(locale, 'settings.stayConnected')}: ${booleanLabel(locale, settings.stayConnected)}`,
@@ -111,6 +113,10 @@ export function buildSettingsMessage(settings: GuildSettings): {
     );
 
     const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.recovery)
+            .setLabel(locale === 'fr' ? 'Reprise' : 'Recovery')
+            .setStyle(settings.queueRecoveryEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.pauseOnEmpty)
             .setEmoji('⏸️')

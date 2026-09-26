@@ -21,7 +21,7 @@ import { config } from '../config.js';
 import { resolveLocale, t } from '../utils/i18n.js';
 import type { GuildQueue } from '../types/index.js';
 import { safeContent } from '../utils/text.js';
-import { ensureCanUseBot } from '../utils/commandHelpers.js';
+import { ensureCanUseBot, ensureCanControlPlayback } from '../utils/commandHelpers.js';
 
 interface QueueViewState {
     messageId: string;
@@ -69,6 +69,8 @@ class QueueViewManager {
             return;
         }
 
+        if (!(await ensureCanUseBot(interaction, interaction.member as GuildMember))) return;
+
         const locale = await resolveLocale(guildId, interaction.locale);
         const queue = queueManager.getQueue(guildId);
         if (!queue) {
@@ -103,15 +105,8 @@ class QueueViewManager {
     async handleComponentInteraction(
         interaction: ButtonInteraction | StringSelectMenuInteraction
     ): Promise<void> {
-        if (!interaction.inCachedGuild()) {
-            return;
-        }
-
         const member = interaction.member as GuildMember;
-        if (!(await ensureCanUseBot(interaction, member))) {
-            return;
-        }
-
+        if (!interaction.inCachedGuild() || !(await ensureCanUseBot(interaction, member))) return;
         const messageId = interaction.message.id;
         const state = await this.getState(messageId, interaction);
         if (!state) {
@@ -143,6 +138,10 @@ class QueueViewManager {
             const page = Number.parseInt(customId.replace('queue_page_', ''), 10);
             state.page = Number.isNaN(page) ? state.page : page;
             await this.updateView(interaction, queue, state);
+            return;
+        }
+
+        if (!(await ensureCanControlPlayback(interaction, interaction.member as GuildMember, queue.voiceChannel.id))) {
             return;
         }
 
@@ -186,18 +185,9 @@ class QueueViewManager {
             return;
         }
 
-        if (!interaction.inCachedGuild()) {
-            return;
-        }
-
-        const member = interaction.member as GuildMember;
-        if (!(await ensureCanUseBot(interaction, member))) {
-            return;
-        }
-
         const messageId = interaction.customId.split(':')[1];
         const state = messageId ? this.views.get(messageId) : null;
-        if (!state) {
+        if (!state || state.userId !== interaction.user.id || state.guildId !== interaction.guildId) {
             const locale = await resolveLocale(interaction.guildId, interaction.locale);
             await this.replyInfo(interaction, t(locale, 'queue.invalidAction'));
             return;
@@ -214,6 +204,10 @@ class QueueViewManager {
 
         if (state.selectedIndex === null) {
             await this.replyInfo(interaction, t(state.locale, 'queue.noSelection'));
+            return;
+        }
+
+        if (!(await ensureCanControlPlayback(interaction, interaction.member as GuildMember, queue.voiceChannel.id))) {
             return;
         }
 
@@ -265,26 +259,11 @@ class QueueViewManager {
         interaction: ButtonInteraction | StringSelectMenuInteraction
     ): Promise<QueueViewState | null> {
         const existing = this.views.get(messageId);
-        if (existing) {
-            if (existing.userId !== interaction.user.id) {
-                return null;
-            }
-            existing.locale = await resolveLocale(existing.guildId, interaction.locale);
-            return existing;
+        if (!existing || existing.userId !== interaction.user.id || existing.guildId !== interaction.guildId) {
+            return null;
         }
-
-        const state: QueueViewState = {
-            messageId,
-            guildId: interaction.guildId ?? '',
-            userId: interaction.user.id,
-            locale: await resolveLocale(interaction.guildId, interaction.locale),
-            page: 1,
-            selectedIndex: null,
-        };
-
-        this.views.set(messageId, state);
-        this.activeByUser.set(this.getUserKey(state.guildId, state.userId), messageId);
-        return state;
+        existing.locale = await resolveLocale(existing.guildId, interaction.locale);
+        return existing;
     }
 
     private async updateView(

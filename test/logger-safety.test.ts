@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { logger } from '../src/utils/Logger.js';
+
+// This test exercises output explicitly; the offline suite otherwise suppresses logs.
+process.env.LOG_LEVEL = 'INFO';
+const { logger } = await import('../src/utils/Logger.js');
 
 test('user-controlled log text cannot inject a second console line', () => {
     const output: string[] = [];

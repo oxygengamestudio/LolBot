@@ -137,7 +137,7 @@ test('the readiness receipt is atomically replaced with private permissions', ()
         assert.equal(writeRuntimeReadinessReceipt(receipt, dataDir), true);
         const receiptPath = join(dataDir, 'runtime-readiness.json');
         assert.deepEqual(JSON.parse(readFileSync(receiptPath, 'utf8')), receipt);
-        assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
+        if (process.platform !== 'win32') assert.equal(statSync(receiptPath).mode & 0o777, 0o600);
         assert.deepEqual(readdirSync(dataDir), ['runtime-readiness.json']);
         assert.equal(clearRuntimeReadinessReceipt(dataDir), true);
         assert.deepEqual(readdirSync(dataDir), []);

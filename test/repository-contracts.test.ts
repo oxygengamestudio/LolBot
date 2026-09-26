@@ -12,16 +12,16 @@ function assertRuntimeImageContract(source: string): void {
         'FROM ${NODE_BASE} AS build',
         'FROM ${NODE_BASE} AS runtime',
     ]);
-    assert.match(source, /ARG YTDLP_VERSION=2026\.07\.04/);
+    assert.match(source, /ARG YTDLP_VERSION=2026\.08\.19/);
 
     const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
     assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
     assert.match(runtimeStage, /apk add --no-cache ca-certificates ffmpeg tini/);
     assert.ok(runtimeStage.includes(
-        "amd64) asset='yt-dlp_musllinux'; checksum='f7439ec2e3ffe69e06ac233f83f0d9687b89105939129bddcbf74e5de0f2b40e' ;;"
+        "amd64) asset='yt-dlp_musllinux'; checksum='f3dec9cfeaf304cec98290fe41c6ad465d4b747d302473559643e7af24929722' ;;"
     ));
     assert.ok(runtimeStage.includes(
-        "arm64) asset='yt-dlp_musllinux_aarch64'; checksum='9a6a4de88f35dc68c1763945fbb417e092ebd9afc5d66052ac31b68d405a12a7' ;;"
+        "arm64) asset='yt-dlp_musllinux_aarch64'; checksum='17b164c4d258be92bb1ad146cb7c336b783aedb380814aabbcb7d52937f77e57' ;;"
     ));
     assert.ok(runtimeStage.includes(
         '&& wget -q -O /usr/local/bin/yt-dlp \\\n'
@@ -335,8 +335,10 @@ test('protected command and component entry points keep their permission gates',
 
     const seekSource = await read('src/commands/seek.ts');
     assert.match(seekSource, /await ensureCanUseBot\(interaction, member\)/);
-    assert.match(seekSource, /await ensureVoiceMembership\(interaction, member\)/);
-    assert.match(seekSource, /await ensureSameVoiceChannel\(interaction, member, queue\.voiceChannel\.id\)/);
+    assert.match(seekSource, /await ensureCanControlPlayback\(interaction, member, queue\.voiceChannel\.id\)/);
+    const helpers = await read('src/utils/commandHelpers.ts');
+    assert.match(helpers, /ensureCanControlPlayback[\s\S]*isBotOwner\(member\.user\.id\)/);
+    assert.match(helpers, /ensureCanControlPlayback[\s\S]*ensureSameVoiceChannel\(interaction, member, botChannelId\)/);
 });
 
 test('the explicitly accepted Discord administrator identifier remains supported', async () => {

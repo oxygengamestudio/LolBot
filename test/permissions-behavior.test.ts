@@ -191,8 +191,9 @@ test('/play autocomplete returns no catalogue data to a denied member', async ()
     assert.deepEqual(responses, [[]]);
 });
 
-test('a delayed playlist choice is rejected when the accepted administrator has left voice', async () => {
-    const acceptedAdministrator = member('189457295279783936');
+test('a delayed playlist choice is rejected when a server administrator has left voice', async () => {
+    const acceptedAdministrator = member('200000000000000006');
+    acceptedAdministrator.permissions.has = () => true;
     const voiceChannel = { id: 'voice-playlist', isVoiceBased: () => true };
     const textChannel = { id: 'text-playlist' };
     const channels = new Map<string, unknown>([
@@ -267,6 +268,8 @@ test('queue and lyrics components re-check permissions when clicked', async () =
     const lyricsReplies: Array<Record<string, unknown>> = [];
     const base = {
         inCachedGuild: () => true,
+        inGuild: () => true,
+        user: deniedMember.user,
         member: deniedMember,
         guildId: deniedSettings.guildId,
         locale: 'fr',
