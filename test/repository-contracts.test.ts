@@ -7,7 +7,7 @@ async function read(path: string): Promise<string> {
 }
 
 function assertRuntimeImageContract(source: string): void {
-    assert.match(source, /ARG NODE_BASE=node:24\.18\.0-alpine3\.24@sha256:[0-9a-f]{64}/);
+    assert.match(source, /ARG NODE_BASE=node:24\.21\.0-alpine3\.24@sha256:[0-9a-f]{64}/);
     assert.deepEqual(source.match(/^FROM .+$/gm), [
         'FROM ${NODE_BASE} AS build',
         'FROM ${NODE_BASE} AS runtime',
@@ -17,6 +17,8 @@ function assertRuntimeImageContract(source: string): void {
     const runtimeStage = source.split('FROM ${NODE_BASE} AS runtime')[1];
     assert.ok(runtimeStage, 'le stage runtime doit utiliser la base épinglée');
     assert.match(runtimeStage, /apk add --no-cache ca-certificates ffmpeg tini/);
+    assert.match(runtimeStage, /apk upgrade --no-cache/);
+    assert.match(runtimeStage, /'libcrypto3>=3\.5\.8-r0' 'libssl3>=3\.5\.8-r0'/);
     assert.ok(runtimeStage.includes(
         "amd64) asset='yt-dlp_musllinux'; checksum='f3dec9cfeaf304cec98290fe41c6ad465d4b747d302473559643e7af24929722' ;;"
     ));

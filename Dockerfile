@@ -1,10 +1,10 @@
-ARG NODE_BASE=node:24.18.0-alpine3.24@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
+ARG NODE_BASE=node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
 
 FROM ${NODE_BASE} AS build
 
 WORKDIR /opt/lolbot
 
-RUN apk add --no-cache build-base py3-setuptools python3
+RUN apk upgrade --no-cache && apk add --no-cache build-base py3-setuptools python3
 
 COPY package.json package-lock.json tsconfig.json ./
 RUN npm ci
@@ -24,7 +24,8 @@ ENV NODE_ENV=production \
     LOG_LEVEL=INFO \
     DATA_DIR=/home/container/data
 
-RUN apk add --no-cache ca-certificates ffmpeg tini \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates ffmpeg tini 'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0' \
     && case "${TARGETARCH}" in \
         amd64) asset='yt-dlp_musllinux'; checksum='f3dec9cfeaf304cec98290fe41c6ad465d4b747d302473559643e7af24929722' ;; \
         arm64) asset='yt-dlp_musllinux_aarch64'; checksum='17b164c4d258be92bb1ad146cb7c336b783aedb380814aabbcb7d52937f77e57' ;; \
