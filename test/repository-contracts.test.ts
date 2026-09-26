@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 async function read(path: string): Promise<string> {
-    return readFile(new URL(`../${path}`, import.meta.url), 'utf8');
+    return (await readFile(new URL(`../${path}`, import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
 }
 
 function assertRuntimeImageContract(source: string): void {
