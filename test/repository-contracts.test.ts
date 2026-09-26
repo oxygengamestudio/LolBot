@@ -103,6 +103,13 @@ test('the quality gate runs audit, tests, typecheck, build, and CodeQL', async (
     assert.match(trivyIgnore, /EXPANSION_MAX_LENGTH/);
 });
 
+test('preprod tolerates only optional cache export failures and serializes deployments', async () => {
+    const source = await read('.github/workflows/preprod-pterodactyl.yml');
+    assert.match(source, /cancel-in-progress: false/);
+    assert.match(source, /cache-to: type=gha,[^\n]*version=2,[^\n]*ignore-error=true,[^\n]*timeout=3m/);
+    assert.doesNotMatch(source, /continue-on-error:/);
+});
+
 test('third-party GitHub actions are pinned to immutable commit SHAs', async () => {
     for (const workflow of ['quality.yml', 'preprod-pterodactyl.yml', 'prod.yml']) {
         const source = await read(`.github/workflows/${workflow}`);

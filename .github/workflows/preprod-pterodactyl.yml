@@ -63,8 +63,8 @@ jobs:
           load: true
           push: false
           provenance: false
-          cache-from: type=gha,scope=lolbot-preprod
-          cache-to: type=gha,scope=lolbot-preprod,mode=max
+          cache-from: type=gha,scope=lolbot-preprod,version=2,timeout=3m
+          cache-to: type=gha,scope=lolbot-preprod,mode=max,version=2,ignore-error=true,timeout=3m
           build-args: |
             BOT_BUILD_SHA=${{ github.sha }}
           tags: |
