@@ -250,6 +250,65 @@ test('direct FFmpeg failure is visible without leaking its signed input URL', { 
     }
 });
 
+test('direct FFmpeg drains bounded stderr after audio EOF before classifying its exit', { skip: process.platform === 'win32' }, async () => {
+    const executablePath = join(testDataDir, 'late-error-ffmpeg');
+    await writeFile(executablePath, [
+        `#!${process.execPath}`,
+        'process.stdout.end(() => process.stdout.destroy())',
+        "setTimeout(() => { process.stderr.write('HTTP error 403 Forbidden\\n'); process.exitCode = 1; }, 25)",
+    ].join('\n'));
+    await chmod(executablePath, 0o700);
+    const { logger } = await import('../src/utils/Logger.js');
+    const originalPath = wrapper.ffmpegPath;
+    const originalWarn = logger.warn;
+    const warnings: unknown[] = [];
+    logger.warn = (_module: string, message: string, data?: unknown) => { warnings.push([message, data]); };
+    wrapper.ffmpegPath = executablePath;
+    try {
+        const startedAt = Date.now();
+        const created = await wrapper.createResourceWithDirectUrl('guild-late-error', track('late-error'), 'https://media.invalid/audio', 0);
+        assert.equal(created, null);
+        assert.ok(warnings.some((entry) => JSON.stringify(entry).includes('http_403')),
+            'audio EOF must not destroy stderr or kill the child before its final diagnostic');
+        assert.ok(Date.now() - startedAt < 2_500, 'waiting for the process remains bounded');
+    } finally {
+        wrapper.ffmpegPath = originalPath;
+        logger.warn = originalWarn;
+    }
+});
+
+test('yt-dlp fallback also retains FFmpeg diagnostics delivered after audio EOF', { skip: process.platform === 'win32' }, async () => {
+    const executablePath = join(testDataDir, 'late-error-fallback-ffmpeg');
+    await writeFile(executablePath, [
+        `#!${process.execPath}`,
+        'process.stdout.end(() => process.stdout.destroy())',
+        "setTimeout(() => { process.stderr.write('HTTP error 503 Service Unavailable\\n'); process.exitCode = 1; }, 25)",
+    ].join('\n'));
+    await chmod(executablePath, 0o700);
+    const { logger } = await import('../src/utils/Logger.js');
+    const originalFfmpegPath = wrapper.ffmpegPath;
+    const originalYtdlpPath = wrapper.ytdlpPath;
+    const originalArgs = wrapper.getYtdlpExtraArgs;
+    const originalWarn = logger.warn;
+    const originalError = logger.error;
+    const diagnostics: unknown[] = [];
+    logger.warn = logger.error = (_module: string, message: string, data?: unknown) => { diagnostics.push([message, data]); };
+    wrapper.ffmpegPath = executablePath;
+    wrapper.ytdlpPath = process.execPath;
+    wrapper.getYtdlpExtraArgs = () => ['-e', "process.stdout.write('input')", '--'];
+    try {
+        const result = await wrapper.createResourceWithYtdlpArgs('guild-late-fallback', track('late-fallback'), false, 0, []);
+        assert.equal(result.resource, null);
+        await waitFor(() => diagnostics.some((entry) => JSON.stringify(entry).includes('http_503')));
+    } finally {
+        wrapper.ffmpegPath = originalFfmpegPath;
+        wrapper.ytdlpPath = originalYtdlpPath;
+        wrapper.getYtdlpExtraArgs = originalArgs;
+        logger.warn = originalWarn;
+        logger.error = originalError;
+    }
+});
+
 test('readiness requires an actual encoded frame and allows FFmpeg to drain after yt-dlp succeeds', async () => {
     const empty = new PassThrough({ objectMode: true });
     const emptyReady = wrapper.waitForReadableStreamReady(empty, 500);

@@ -280,8 +280,20 @@ export class AudioWrapper extends EventEmitter {
         return safeEnv;
     }
 
-    private terminateProcess(child: ChildProcess): void {
+    private terminateProcess(child: ChildProcess, drainAfterAudioEnd = false): void {
         if (child.exitCode !== null || child.signalCode !== null) {
+            return;
+        }
+        if (drainAfterAudioEnd) {
+            // stdout and stderr are independent pipes: audio EOF can precede the
+            // final error. Give the child a short, bounded chance to flush/exit.
+            const drainTimer = setTimeout(() => {
+                child.removeListener('close', onClose);
+                this.terminateProcess(child);
+            }, 250);
+            const onClose = () => clearTimeout(drainTimer);
+            drainTimer.unref?.();
+            child.once('close', onClose);
             return;
         }
         try {
@@ -1181,7 +1193,7 @@ export class AudioWrapper extends EventEmitter {
         const fullyClosed = new Promise<void>((resolve) => { markFullyClosed = resolve; });
 
         let tornDown = false;
-        const teardown = (reason: string) => {
+        const teardown = (reason: string, drainAfterAudioEnd = false) => {
             if (tornDown) {
                 return;
             }
@@ -1200,13 +1212,9 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            try {
-                ffmpeg.stderr?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            this.terminateProcess(ffmpeg);
+            // Keep the bounded stderr reader alive until process close. Destroying
+            // it here loses diagnostics when Linux delivers stdout EOF first.
+            this.terminateProcess(ffmpeg, drainAfterAudioEnd);
             void this.cleanupRunDirectory(runDir);
         };
 
@@ -1254,7 +1262,7 @@ export class AudioWrapper extends EventEmitter {
             metadata.outputBytes! += data.length;
         });
         stdout.once('close', () => teardown('direct audio stream closed'));
-        stdout.once('end', () => teardown('direct audio stream ended'));
+        stdout.once('end', () => teardown('direct audio stream ended', true));
         stdout.once('error', () => teardown('direct audio stream error'));
 
         const resource = createAudioResource<ResourceMetadata>(stdout, {
@@ -1653,7 +1661,7 @@ export class AudioWrapper extends EventEmitter {
             outputBytes: 0,
         };
         let tornDown = false;
-        const teardown = (reason: string) => {
+        const teardown = (reason: string, drainAfterAudioEnd = false) => {
             if (tornDown) {
                 return;
             }
@@ -1684,14 +1692,9 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            try {
-                ffmpeg.stderr?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            this.terminateProcess(ffmpeg);
-            this.terminateProcess(ytdlp);
+            // Both stderr readers remain flowing and bounded until child close.
+            this.terminateProcess(ffmpeg, drainAfterAudioEnd);
+            this.terminateProcess(ytdlp, drainAfterAudioEnd);
             void this.cleanupRunDirectory(runDir);
         };
 
@@ -1814,14 +1817,13 @@ export class AudioWrapper extends EventEmitter {
         const stdout = ffmpeg.stdout as Readable;
         stdout.on('data', (data: Buffer) => { metadata.outputBytes! += data.length; });
         const stream = startSeconds > 0 ? this.createSkipStream(stdout, startSeconds) : stdout;
-        const teardownOnStreamFinish = () => teardown('audio stream closed');
-        stdout.once('close', teardownOnStreamFinish);
-        stdout.once('end', teardownOnStreamFinish);
-        stdout.once('error', teardownOnStreamFinish);
+        stdout.once('close', () => teardown('audio stream closed'));
+        stdout.once('end', () => teardown('audio stream ended', true));
+        stdout.once('error', () => teardown('audio stream error'));
         if (stream !== stdout) {
-            stream.once('close', teardownOnStreamFinish);
-            stream.once('end', teardownOnStreamFinish);
-            stream.once('error', teardownOnStreamFinish);
+            stream.once('close', () => teardown('audio stream closed'));
+            stream.once('end', () => teardown('audio stream ended', true));
+            stream.once('error', () => teardown('audio stream error'));
         }
 
         const resource = createAudioResource<ResourceMetadata>(stream, {
