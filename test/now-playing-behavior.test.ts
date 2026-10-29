@@ -81,6 +81,9 @@ function resetManager(): void {
     nowPlayingManager.retryAttempts.clear();
     nowPlayingManager.pendingUpdates.clear();
     nowPlayingManager.nowPlayingDeletes.clear();
+    nowPlayingManager.renders = new WeakMap();
+    nowPlayingManager.renderDirty = new WeakSet();
+    nowPlayingManager.generations = new WeakMap();
     nowPlayingManager.retryBaseDelayMs = 1_000;
     nowPlayingManager.retryMaxDelayMs = 30_000;
     nowPlayingManager.retryJitterMs = 250;
@@ -263,11 +266,183 @@ test('stop during slow message creation removes the late message and leaves no t
     queue.currentTrack = null;
     queue.isStopping = true;
     const deletion = nowPlayingManager.deleteNowPlaying(queue);
+    const coalescedDeletion = nowPlayingManager.deleteNowPlaying(queue);
     release({ delete: async () => { deletes += 1; } });
-    await Promise.all([creation, deletion]);
+    await Promise.all([creation, deletion, coalescedDeletion]);
     assert.equal(deletes, 1);
     assert.equal(queue.nowPlayingMessage, null);
     assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), false);
+});
+
+test('starting an update interval does not reset a pending Discord retry', async () => {
+    const queue = createQueue('guild-start-with-retry', async () => {
+        throw new Error('temporary initial edit failure');
+    });
+    await nowPlayingManager.onTrackStart(queue);
+
+    assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), true);
+    assert.equal(nowPlayingManager.retryTimers.has(queue.guildId), true);
+    assert.equal(nowPlayingManager.retryAttempts.get(queue.guildId), 1);
+});
+
+test('a track ending during locale lookup never sends a stale card', async () => {
+    let releaseLocale!: () => void;
+    let enteredLocale = false;
+    let sends = 0;
+    const localeGate = new Promise<void>((resolve) => { releaseLocale = resolve; });
+    const queue = createQueue('guild-ended-during-locale', async () => undefined);
+    queue.nowPlayingMessage = null;
+    queue.textChannel.send = (async () => { sends += 1; }) as never;
+    const originalGetSettings = guildSettingsManager.getSettings;
+    guildSettingsManager.getSettings = async (guildId: string) => {
+        enteredLocale = true;
+        await localeGate;
+        return guildSettingsManager.getDefaults(guildId);
+    };
+
+    try {
+        const creation = nowPlayingManager.onTrackStart(queue);
+        await waitFor(() => enteredLocale);
+        queue.currentTrack = null;
+        nowPlayingManager.onTrackEnd(queue);
+        releaseLocale();
+        await creation;
+        assert.equal(sends, 0);
+        assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), false);
+    } finally {
+        releaseLocale();
+        guildSettingsManager.getSettings = originalGetSettings;
+    }
+});
+
+test('simultaneous Now Playing creations send one card without overlapping requests', async () => {
+    let releaseSend!: (message: unknown) => void;
+    let sends = 0;
+    let edits = 0;
+    const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+    const queue = createQueue('guild-double-create', async () => undefined);
+    queue.nowPlayingMessage = null;
+    queue.textChannel.send = (async () => { sends += 1; return sendGate; }) as never;
+    const creations = [nowPlayingManager.createOrUpdateNowPlaying(queue)];
+    await waitFor(() => sends === 1);
+    creations.push(...Array.from({ length: 9 }, () => nowPlayingManager.createOrUpdateNowPlaying(queue)));
+    const message = { edit: async () => { edits += 1; }, delete: async () => undefined };
+    releaseSend(message);
+    await Promise.all(creations);
+    assert.equal(sends, 1);
+    assert.equal(edits, 1, 'les demandes simultanées fusionnent leur rafraîchissement');
+    assert.equal(queue.nowPlayingMessage, message);
+});
+
+test('a slow previous-track send is deleted and the next track gets its own card', async () => {
+    let releaseOldSend!: (message: unknown) => void;
+    let sends = 0;
+    let oldDeletes = 0;
+    let nextDeletes = 0;
+    const sendGate = new Promise((resolve) => { releaseOldSend = resolve; });
+    const queue = createQueue('guild-track-transition-send', async () => undefined);
+    const nextMessage = {
+        edit: async () => undefined,
+        delete: async () => { nextDeletes += 1; },
+    };
+    queue.nowPlayingMessage = null;
+    queue.textChannel.send = (async () => {
+        sends += 1;
+        return sends === 1 ? sendGate : nextMessage;
+    }) as never;
+
+    const oldCreation = nowPlayingManager.onTrackStart(queue);
+    await waitFor(() => sends === 1);
+    queue.currentTrack = null;
+    nowPlayingManager.onTrackEnd(queue);
+    const cleanup = nowPlayingManager.deleteNowPlaying(queue);
+    queue.currentTrack = currentTrack('next-track');
+    const nextCreation = nowPlayingManager.onTrackStart(queue);
+    releaseOldSend({ delete: async () => { oldDeletes += 1; } });
+    await Promise.all([oldCreation, cleanup, nextCreation]);
+
+    assert.equal(sends, 2);
+    assert.equal(oldDeletes, 1);
+    assert.equal(nextDeletes, 0, 'le nettoyage ancien ne doit pas capturer la carte suivante après await');
+    assert.equal(queue.nowPlayingMessage, nextMessage);
+    assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), true);
+});
+
+test('a deleted queue cleans its late send without starting an update interval', async () => {
+    let releaseSend!: (message: unknown) => void;
+    let sends = 0;
+    let deletes = 0;
+    const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+    const queue = createQueue('guild-deleted-during-send', async () => undefined);
+    queue.nowPlayingMessage = null;
+    queue.textChannel.send = (async () => { sends += 1; return sendGate; }) as never;
+    const creation = nowPlayingManager.onTrackStart(queue);
+    await waitFor(() => sends === 1);
+    queueManager.queues.delete(queue.guildId);
+    const cleanup = nowPlayingManager.deleteNowPlaying(queue);
+    releaseSend({ delete: async () => { deletes += 1; } });
+    await Promise.all([creation, cleanup]);
+
+    assert.equal(deletes, 1);
+    assert.equal(queue.nowPlayingMessage, null);
+    assert.equal(nowPlayingManager.updateIntervals.has(queue.guildId), false);
+});
+
+test('a replaced queue keeps its new card, interval, and retry when the old send completes', async () => {
+    let releaseSend!: (message: unknown) => void;
+    let sends = 0;
+    let deletes = 0;
+    let replacementDeletes = 0;
+    const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+    const oldQueue = createQueue('guild-replaced-during-send', async () => undefined);
+    oldQueue.nowPlayingMessage = null;
+    oldQueue.textChannel.send = (async () => { sends += 1; return sendGate; }) as never;
+    const oldCreation = nowPlayingManager.onTrackStart(oldQueue);
+    await waitFor(() => sends === 1);
+    const replacement = createQueue(oldQueue.guildId, async () => undefined, async () => { replacementDeletes += 1; });
+    await nowPlayingManager.onTrackStart(replacement);
+    const replacementMessage = replacement.nowPlayingMessage;
+    const interval = nowPlayingManager.updateIntervals.get(replacement.guildId);
+    nowPlayingManager.scheduleRetry(replacement, new Error('replacement transient failure'));
+    const retry = nowPlayingManager.retryTimers.get(replacement.guildId);
+    const oldCleanup = nowPlayingManager.deleteNowPlaying(oldQueue);
+    releaseSend({ delete: async () => { deletes += 1; } });
+    await Promise.all([oldCreation, oldCleanup]);
+
+    assert.equal(deletes, 1);
+    assert.equal(replacementDeletes, 0);
+    assert.equal(oldQueue.nowPlayingMessage, null);
+    assert.equal(replacement.nowPlayingMessage, replacementMessage);
+    assert.equal(nowPlayingManager.updateIntervals.get(replacement.guildId), interval);
+    assert.equal(nowPlayingManager.retryTimers.get(replacement.guildId), retry);
+});
+
+test('an old edit failure cannot clear or delete a newer track card', async () => {
+    let rejectOldEdit!: (error: unknown) => void;
+    let oldEdits = 0;
+    let newEdits = 0;
+    let newDeletes = 0;
+    const editGate = new Promise((_resolve, reject) => { rejectOldEdit = reject; });
+    const queue = createQueue('guild-stale-edit-failure', async () => {
+        oldEdits += 1;
+        await editGate;
+    });
+    const oldUpdate = nowPlayingManager.updateNowPlaying(queue);
+    await waitFor(() => oldEdits === 1);
+    nowPlayingManager.onTrackEnd(queue);
+    queue.currentTrack = currentTrack('replacement-track');
+    const replacementMessage = {
+        edit: async () => { newEdits += 1; },
+        delete: async () => { newDeletes += 1; },
+    };
+    queue.nowPlayingMessage = replacementMessage as never;
+    const nextUpdate = nowPlayingManager.onTrackStart(queue);
+    rejectOldEdit({ code: 10008 });
+    await Promise.all([oldUpdate, nextUpdate]);
+
+    assert.equal(newEdits, 1);
+    assert.equal(newDeletes, 0);
+    assert.equal(queue.nowPlayingMessage, replacementMessage);
 });
 
 function makeStopButton(guildId: string, events: string[]) {

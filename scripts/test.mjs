@@ -17,6 +17,7 @@ for (const name of ['PATH', 'Path', 'SystemRoot', 'TEMP', 'TMP', 'HOME', 'USERPR
 Object.assign(env, {
     NODE_ENV: 'test', DISCORD_TOKEN: 'offline-test', DISCORD_CLIENT_ID: '123456789012345678',
     DATA_DIR: isolatedDir, LOG_LEVEL: 'NONE', YTDLP_AUTO_DOWNLOAD: 'false', DOTENV_CONFIG_QUIET: 'true',
+    TMPDIR: isolatedDir, TMP: isolatedDir, TEMP: isolatedDir,
 });
 try {
     const result = spawnSync(process.execPath, [

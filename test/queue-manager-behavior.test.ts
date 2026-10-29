@@ -47,6 +47,30 @@ class FakeAudioPlayer extends EventEmitter {
     unpause(): boolean { return true; }
 }
 
+class FakeVoiceConnection extends EventEmitter {
+    state = { status: 'ready' };
+    rejoinAttempts = 0;
+    destroyCalls = 0;
+    subscribeCalls = 0;
+
+    transition(status: string): void {
+        const oldState = this.state;
+        this.state = { status };
+        this.emit('stateChange', oldState, this.state);
+        this.emit(status, oldState, this.state);
+    }
+
+    subscribe(): object {
+        this.subscribeCalls += 1;
+        return {};
+    }
+
+    destroy(): void {
+        this.destroyCalls += 1;
+        this.transition('destroyed');
+    }
+}
+
 function track(id: string): Track {
     return {
         id,
@@ -677,5 +701,470 @@ test('a reconnect resume completed after /stop cannot reinstall stale playback',
         manager.joinChannel = originalJoinChannel;
         wrapper.createResource = originalCreateResource;
         wrapper.teardownResource = originalTeardownResource;
+    }
+});
+
+for (const mode of ['stayConnected', 'stayConnectedAlways'] as const) {
+    test(`an empty queue preserves and recovers its ${mode} voice connection`, async () => {
+        const manager = modules.queueModule.queueManager as any;
+        const settings = modules.guildSettingsManager as any;
+        const originalSettings = settings.getSettings;
+        const originalJoin = manager.joinChannel;
+        const queue = createQueue(`guild-empty-${mode}`, new FakeAudioPlayer(false));
+        const connection = new FakeVoiceConnection();
+        const replacement = new FakeVoiceConnection();
+        queue.connection = connection;
+        let joins = 0;
+        settings.getSettings = async (guildId: string) => ({
+            ...await originalSettings(guildId),
+            stayConnected: mode === 'stayConnected',
+            stayConnectedAlways: mode === 'stayConnectedAlways',
+        });
+        manager.joinChannel = async () => {
+            joins += 1;
+            queue.connection = replacement;
+            return replacement;
+        };
+
+        try {
+            assert.deepEqual(await manager.playNext(queue.guildId), { status: 'queue_empty' });
+            assert.equal(queue.shouldKeepConnection, true);
+            assert.equal(manager.getQueue(queue.guildId), queue);
+            assert.equal(await manager.reconnectWithBackoff(queue, 0), true);
+            assert.equal(joins, 1, 'la connexion doit être rétablie même sans piste');
+            assert.equal(connection.destroyCalls, 1);
+            assert.equal(queue.connection, replacement);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.deleteQueue(queue.guildId, true);
+            settings.getSettings = originalSettings;
+            manager.joinChannel = originalJoin;
+        }
+    });
+}
+
+test('an empty queue still disconnects when both stay-connected options are disabled', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-empty-disconnect', new FakeAudioPlayer(false));
+    const connection = new FakeVoiceConnection();
+    queue.connection = connection;
+    settings.getSettings = async (guildId: string) => ({
+        ...await originalSettings(guildId),
+        stayConnected: false,
+        stayConnectedAlways: false,
+    });
+
+    try {
+        assert.deepEqual(await manager.playNext(queue.guildId), { status: 'queue_empty' });
+        assert.equal(manager.getQueue(queue.guildId), undefined);
+        assert.equal(connection.destroyCalls, 1);
+    } finally {
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('Stop keeps idle voice recovery enabled without restarting playback', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-stop-keeps-voice', new FakeAudioPlayer(false));
+    queue.currentTrack = track('stop-keeps-voice');
+    queue.isPlaying = true;
+    const replacement = new FakeVoiceConnection();
+    let joins = 0;
+    manager.joinChannel = async () => {
+        joins += 1;
+        queue.connection = replacement;
+        return replacement;
+    };
+
+    try {
+        assert.equal(manager.stop(queue.guildId), true);
+        assert.equal(queue.isManualDisconnect, false);
+        assert.equal(queue.shouldKeepConnection, true);
+        assert.equal(await manager.reconnectWithBackoff(queue, 0), true);
+        assert.equal(joins, 1);
+        assert.equal(queue.currentTrack, null);
+        assert.deepEqual(queue.tracks, []);
+        assert.equal(queue.isPlaying, false);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('a member returning during the settings read prevents stale empty-channel disconnection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-return-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    let members = 0;
+    queue.voiceChannel.members.filter = () => ({ size: members });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        members = 1;
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-channel evaluation cannot delete a replacement queue', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-queue-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    queue.voiceChannel.members.filter = () => ({ size: 0 });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        manager.deleteQueue(queue.guildId, true);
+        const replacement = createQueue(queue.guildId, new FakeAudioPlayer(false));
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), replacement);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-channel evaluation cannot act on a voice channel changed during the settings read', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-channel-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    queue.voiceChannel.members.filter = () => ({ size: 0 });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        queue.voiceChannel = { ...queue.voiceChannel, id: 'replacement-channel' };
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-queue settings read cannot delete a replacement session', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-empty-queue-replacement', new FakeAudioPlayer(false));
+    const savedSettings = { ...await originalSettings(queue.guildId), stayConnected: false, stayConnectedAlways: false };
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const empty = manager.playNext(queue.guildId);
+        await new Promise((resolve) => setImmediate(resolve));
+        manager.deleteQueue(queue.guildId, true);
+        const replacement = createQueue(queue.guildId, new FakeAudioPlayer(false));
+        resolveSettings(savedSettings);
+        await empty;
+        assert.equal(manager.getQueue(queue.guildId), replacement);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('a manual leave during the reconnect settings read prevents any new voice join', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-reconnect-leave-settings', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    let resolveSettings!: (value: unknown) => void;
+    let joins = 0;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+    manager.joinChannel = async () => { joins += 1; return new FakeVoiceConnection(); };
+
+    try {
+        const reconnect = manager.reconnectWithBackoff(queue, 0);
+        manager.deleteQueue(queue.guildId, true);
+        resolveSettings(savedSettings);
+        assert.equal(await reconnect, false);
+        assert.equal(joins, 0);
+        assert.equal(manager.getQueue(queue.guildId), undefined);
+    } finally {
+        settings.getSettings = originalSettings;
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('concurrent voice recoveries contain the same unexpected join rejection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-reconnect-rejection', new FakeAudioPlayer(false));
+    let joins = 0;
+    manager.joinChannel = async () => {
+        joins += 1;
+        throw new Error('synthetic voice join failure');
+    };
+
+    try {
+        assert.deepEqual(await Promise.all([
+            manager.reconnectWithBackoff(queue, 0),
+            manager.reconnectWithBackoff(queue, 0),
+        ]), [false, false]);
+        assert.equal(joins, 1);
+        assert.equal(queue.isReconnecting, false);
+        assert.equal(manager.reconnectAttemptsInFlight.has(queue.guildId), false);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('Discord can recover Ready after the former 900ms deadline without destroying its connection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-discord-delayed-ready', new FakeAudioPlayer(false));
+    const connection = new FakeVoiceConnection();
+    connection.state = { status: 'disconnected' };
+    queue.connection = connection;
+    manager.attachConnectionListeners(queue, connection);
+    let joins = 0;
+    manager.joinChannel = async () => { joins += 1; return null; };
+    const readyTimer = setTimeout(() => connection.transition('ready'), 1_050);
+
+    try {
+        assert.ok(manager.voiceRecoveryWaitMs >= 5_000);
+        const disconnected = connection.listeners('disconnected')[0] as () => Promise<void>;
+        await disconnected();
+        assert.equal(joins, 0);
+        assert.equal(connection.destroyCalls, 0);
+        assert.equal(connection.subscribeCalls, 1);
+        assert.equal(queue.connection, connection);
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        clearTimeout(readyTimer);
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('opt-in saved-queue recovery still takes precedence over automatic reconnect', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-saved-queue-recovery', new FakeAudioPlayer(false));
+    queue.currentTrack = track('saved-queue-recovery');
+    let joins = 0;
+    settings.getSettings = async (guildId: string) => ({ ...await originalSettings(guildId), queueRecoveryEnabled: true });
+    manager.joinChannel = async () => { joins += 1; return new FakeVoiceConnection(); };
+
+    try {
+        assert.equal(await manager.reconnectWithBackoff(queue, 0), false);
+        assert.equal(joins, 0);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('an immediate natural stream end reports one failure and advances without retrying the track', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalPlayNext = manager.playNext;
+    const queue = createQueue('guild-early-stream-end', new FakeAudioPlayer(false));
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const selectedTrack = track('early-stream-end');
+    const endedResource = { ...resource(selectedTrack.id), playbackDuration: 120 };
+    queue.currentTrack = selectedTrack;
+    queue.isPlaying = true;
+    manager.activeResources.set(queue.guildId, endedResource);
+    const failures: string[] = [];
+    const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+        if (failedTrack === selectedTrack) failures.push(code);
+    };
+    manager.on('trackFailed', listener);
+    let nextCalls = 0;
+    manager.playNext = async () => { nextCalls += 1; return { status: 'queue_empty' }; };
+
+    try {
+        queue.player.emit('idle', { status: 'playing', resource: endedResource });
+        queue.player.emit('idle', { status: 'playing', resource: endedResource });
+        assert.deepEqual(failures, ['stream_ended_early']);
+        assert.equal(nextCalls, 1, 'la piste interrompue ne doit pas être relancée en boucle');
+        assert.equal(queue.currentTrack, null);
+        assert.equal(manager.activeResources.has(queue.guildId), false);
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+        manager.playNext = originalPlayNext;
+    }
+});
+
+for (const scenario of [
+    { name: 'ordinary playback', duration: 180, startSeconds: 0, playedMs: 3_000 },
+    { name: 'seek close to the end', duration: 180, startSeconds: 179, playedMs: 120 },
+    { name: 'a genuinely short track', duration: 5, startSeconds: 0, playedMs: 120 },
+    { name: 'an unknown live duration', duration: 0, startSeconds: 0, playedMs: 120 },
+    { name: 'missing playback position metadata', duration: 180, startSeconds: undefined, playedMs: 120 },
+]) {
+    test(`natural end is not misclassified for ${scenario.name}`, () => {
+        const manager = modules.queueModule.queueManager as any;
+        const originalPlayNext = manager.playNext;
+        const queue = createQueue(`guild-end-${scenario.name}`, new FakeAudioPlayer(false));
+        queue.player = null;
+        manager.ensurePlayer(queue);
+        const selectedTrack = { ...track(scenario.name), duration: scenario.duration };
+        const endedResource = {
+            ...resource(selectedTrack.id),
+            metadata: { trackId: selectedTrack.id, createdAt: Date.now(), startSeconds: scenario.startSeconds },
+            playbackDuration: scenario.playedMs,
+        };
+        queue.currentTrack = selectedTrack;
+        queue.isPlaying = true;
+        manager.activeResources.set(queue.guildId, endedResource);
+        const failures: string[] = [];
+        const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+            if (failedTrack === selectedTrack) failures.push(code);
+        };
+        manager.on('trackFailed', listener);
+        manager.playNext = async () => ({ status: 'queue_empty' });
+
+        try {
+            queue.player.emit('idle', { status: 'playing', resource: endedResource });
+            assert.deepEqual(failures, []);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.off('trackFailed', listener);
+            manager.deleteQueue(queue.guildId, true);
+            manager.playNext = originalPlayNext;
+        }
+    });
+}
+
+for (const action of ['stop', 'skip'] as const) {
+    test(`${action} cannot report an early-stream failure from the retired resource`, () => {
+        const manager = modules.queueModule.queueManager as any;
+        const originalPlayNext = manager.playNext;
+        const queue = createQueue(`guild-manual-${action}-early`, new FakeAudioPlayer(false));
+        queue.player = null;
+        manager.ensurePlayer(queue);
+        const selectedTrack = track(`manual-${action}-early`);
+        const endedResource = { ...resource(selectedTrack.id), playbackDuration: 120 };
+        queue.currentTrack = selectedTrack;
+        queue.isPlaying = true;
+        manager.activeResources.set(queue.guildId, endedResource);
+        const failures: string[] = [];
+        const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+            if (failedTrack === selectedTrack) failures.push(code);
+        };
+        manager.on('trackFailed', listener);
+        manager.playNext = async () => ({ status: 'queue_empty' });
+
+        try {
+            assert.equal(manager[action](queue.guildId), true);
+            queue.player.emit('idle', { status: 'playing', resource: endedResource });
+            assert.deepEqual(failures, []);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.off('trackFailed', listener);
+            manager.deleteQueue(queue.guildId, true);
+            manager.playNext = originalPlayNext;
+        }
+    });
+}
+
+test('an old resource ending immediately cannot fail the replacement track', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const queue = createQueue('guild-early-retired-resource', new FakeAudioPlayer(false));
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const selectedTrack = track('replacement-after-early');
+    const retired = { ...resource('old-track', 100), playbackDuration: 120 };
+    const replacement = resource(selectedTrack.id, 200);
+    manager.activeResources.set(queue.guildId, retired);
+    manager.teardownActiveResource(queue.guildId);
+    manager.activeResources.set(queue.guildId, replacement);
+    queue.currentTrack = selectedTrack;
+    queue.isPlaying = true;
+    const failures: string[] = [];
+    const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+        if (failedTrack === selectedTrack) failures.push(code);
+    };
+    manager.on('trackFailed', listener);
+
+    try {
+        queue.player.emit('idle', { status: 'playing', resource: retired });
+        assert.deepEqual(failures, []);
+        assert.equal(queue.currentTrack, selectedTrack);
+        assert.equal(manager.activeResources.get(queue.guildId), replacement);
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+    }
+});
+
+test('two confirmed plays of the same track can both end within the debounce window', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalPlayNext = manager.playNext;
+    const player = new FakeAudioPlayer(false);
+    const queue = createQueue('guild-consecutive-same-track-end', player);
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const onIdle = queue.player.listeners('idle')[0] as (state: unknown) => void;
+    queue.player = player;
+    const firstTrack = track('same-track-early-end');
+    const secondTrack = track(firstTrack.id);
+    const firstResource = { ...resource(firstTrack.id, 100), playbackDuration: 120 };
+    const secondResource = { ...resource(secondTrack.id, 200), playbackDuration: 120 };
+    const failures: Track[] = [];
+    const listener = (failedQueue: unknown, failedTrack: Track) => {
+        if (failedQueue === queue) failures.push(failedTrack);
+    };
+    manager.on('trackFailed', listener);
+    let nextCalls = 0;
+    manager.playNext = async () => { nextCalls += 1; return { status: 'queue_empty' }; };
+
+    try {
+        queue.currentTrack = firstTrack;
+        queue.isPlaying = true;
+        manager.activeResources.set(queue.guildId, firstResource);
+        onIdle({ status: 'playing', resource: firstResource });
+        assert.deepEqual(failures, [firstTrack]);
+
+        queue.tracks.push(secondTrack);
+        manager.activeResources.set(queue.guildId, secondResource);
+        manager.pendingPlaybackStarts.set(queue.guildId, { queue, track: secondTrack, resource: secondResource });
+        player.state = { status: 'playing', resource: secondResource };
+        assert.equal(manager.promotePendingStart(queue, secondResource), true);
+        queue.isPlaying = true;
+
+        onIdle({ status: 'playing', resource: firstResource });
+        assert.equal(queue.currentTrack, secondTrack, 'un ancien Idle reste ignoré après la nouvelle confirmation');
+        onIdle({ status: 'playing', resource: secondResource });
+        onIdle({ status: 'playing', resource: secondResource });
+
+        assert.deepEqual(failures, [firstTrack, secondTrack]);
+        assert.equal(queue.currentTrack, null, 'le second Idle ne doit pas laisser la file bloquée');
+        assert.equal(nextCalls, 2, 'une seule progression par lecture confirmée');
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+        manager.playNext = originalPlayNext;
     }
 });
