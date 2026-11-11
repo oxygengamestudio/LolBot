@@ -34,7 +34,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
     if (!(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) return;
 
-    if (queue.isPaused) {
+    if (queue.playback === 'paused') {
         await replyEphemeral(interaction, `⏸️ ${t(locale, 'pause.alreadyPaused')}`);
         return;
     }

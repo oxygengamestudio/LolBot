@@ -9,12 +9,18 @@ import { config } from '../config.js';
 import type { Track } from '../types/index.js';
 import { logger } from '../utils/Logger.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
+import {
+    getSafeChildEnv,
+    getYtdlpRuntimeArgs,
+    resolveFfmpegPath,
+    resolveYtdlpPath,
+    terminateChildProcess,
+} from '../utils/mediaProcess.js';
 
 const log = logger.createModuleLogger('MediaCache');
 const MANIFEST_VERSION = 1;
 const MAX_PROCESS_OUTPUT_BYTES = 64 * 1024;
 const MAX_CACHE_TRACK_OUTPUT_BYTES = 256 * 1024 * 1024;
-const PROCESS_KILL_GRACE_MS = 2_000;
 
 interface MediaIdentity {
     provider: string;
@@ -92,8 +98,8 @@ export class MediaCacheManager {
         this.maxBytes = Math.max(1, config.audio.cacheMaxMb) * 1024 * 1024;
         this.maxAgeMs = Math.max(1, config.audio.cacheMaxAgeHours) * 60 * 60 * 1000;
         this.maxConcurrentDownloads = Math.max(1, config.audio.cacheDownloadConcurrency);
-        this.ytdlpPath = this.resolveYtdlpPath();
-        this.ffmpegPath = this.resolveFfmpegPath();
+        this.ytdlpPath = resolveYtdlpPath();
+        this.ffmpegPath = resolveFfmpegPath();
         this.ready = this.initialize().catch((error) => {
             log.error('Impossible d\'initialiser le cache audio persistant', error);
         });
@@ -235,54 +241,6 @@ export class MediaCacheManager {
                 container: extension,
             });
         }
-    }
-
-    private parseExtraArgs(rawArgs: string | undefined): string[] {
-        if (!rawArgs) return [];
-        const matches = rawArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
-        if (!matches) return [];
-        return matches.map((arg) => arg.replace(/^['"]|['"]$/g, ''));
-    }
-
-    private getUnsafeYtdlpExtraArgs(): string[] {
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
-        if (extraArgs.length === 0) {
-            return [];
-        }
-        if (config.audio.allowUnsafeYtdlpExtraArgs) {
-            return extraArgs;
-        }
-        if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
-            this.warnedUnsafeYtdlpExtraArgsIgnored = true;
-            log.warn('YTDLP_EXTRA_ARGS ignoré. Activez YTDLP_ALLOW_UNSAFE_EXTRA_ARGS uniquement dans un environnement maîtrisé.');
-        }
-        return [];
-    }
-
-    private getYtdlpExtraArgs(includeCookies = true): string[] {
-        const args: string[] = [];
-        const cookiesFromBrowser = includeCookies ? process.env.YTDLP_COOKIES_FROM_BROWSER : undefined;
-        const cookies = includeCookies ? process.env.YTDLP_COOKIES : undefined;
-        if (cookiesFromBrowser) {
-            args.push('--cookies-from-browser', cookiesFromBrowser);
-        } else if (cookies) {
-            args.push('--cookies', cookies);
-        }
-        args.push(...this.getUnsafeYtdlpExtraArgs());
-        return args;
-    }
-
-    private resolveYtdlpPath(): string {
-        if (process.env.YTDLP_PATH) {
-            return process.env.YTDLP_PATH;
-        }
-        const fileName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-        const localPath = join(config.paths.data, 'bin', fileName);
-        return existsSync(localPath) ? localPath : 'yt-dlp';
-    }
-
-    private resolveFfmpegPath(): string {
-        return process.env.FFMPEG_PATH ?? 'ffmpeg';
     }
 
     async getTrackPath(trackOrId: Track | string): Promise<string | null> {
@@ -618,7 +576,7 @@ export class MediaCacheManager {
         for (const includeCookies of [true, false]) {
             for (const format of selectors) {
                 const output = await this.runYtdlpText([
-                    ...this.getYtdlpExtraArgs(includeCookies), '--no-warnings', '--no-playlist',
+                    ...getYtdlpRuntimeArgs(includeCookies), '--no-warnings', '--no-playlist',
                     '-f', format, '--get-url', track?.canonicalUrl || track?.url || `https://www.youtube.com/watch?v=${identity.sourceId}`,
                 ], signal);
                 if (output) {
@@ -657,7 +615,7 @@ export class MediaCacheManager {
             let stderr = '';
             let settled = false;
             let terminalError: string | undefined;
-            const child = spawn(this.ytdlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+            const child = spawn(this.ytdlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: getSafeChildEnv() });
             const finish = (result: string | null, error?: string) => {
                 if (settled) return;
                 settled = true;
@@ -669,7 +627,7 @@ export class MediaCacheManager {
             const failAndTerminate = (error: string) => {
                 if (settled || terminalError) return;
                 terminalError = error;
-                this.terminateProcess(child);
+                terminateChildProcess(child);
                 child.stdout?.resume();
                 child.stderr?.resume();
             };
@@ -720,7 +678,7 @@ export class MediaCacheManager {
             let stderr = '';
             let settled = false;
             let terminalError: string | undefined;
-            const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+            const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env: getSafeChildEnv() });
             const finish = (success: boolean, error?: string) => {
                 if (settled) return;
                 settled = true;
@@ -731,7 +689,7 @@ export class MediaCacheManager {
             const failAndTerminate = (error: string) => {
                 if (settled || terminalError) return;
                 terminalError = error;
-                this.terminateProcess(child);
+                terminateChildProcess(child);
                 child.stderr?.resume();
             };
             child.stderr?.on('data', (data: Buffer) => {
@@ -785,7 +743,7 @@ export class MediaCacheManager {
             let terminalError: string | undefined;
             let timeout: NodeJS.Timeout | undefined;
             let onAbort: (() => void) | undefined;
-            const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+            const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: getSafeChildEnv() });
             const output = createWriteStream(outputPath, { flags: 'wx', mode: 0o600 });
             const limiter = new Transform({
                 transform: (chunk: Buffer, _encoding, callback) => {
@@ -813,7 +771,7 @@ export class MediaCacheManager {
             const fail = (error: string) => {
                 if (settled || terminalError) return;
                 terminalError = error;
-                this.terminateProcess(child);
+                terminateChildProcess(child);
                 limiter.destroy();
                 output.destroy();
             };
@@ -863,22 +821,6 @@ export class MediaCacheManager {
                 maybeFinish();
             });
         });
-    }
-
-    private terminateProcess(child: ChildProcess): void {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        try {
-            child.kill('SIGTERM');
-        } catch {
-            return;
-        }
-        const forceKill = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-                try { child.kill('SIGKILL'); } catch { /* already closed */ }
-            }
-        }, PROCESS_KILL_GRACE_MS);
-        forceKill.unref?.();
-        child.once('close', () => clearTimeout(forceKill));
     }
 
     private async withDownloadSlot<T>(operation: () => Promise<T>): Promise<T> {

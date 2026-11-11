@@ -16,6 +16,7 @@
 import { youtubeService } from '../services/YouTubeService.js';
 import { soundCloudService } from '../services/SoundCloudService.js';
 import { queueManager } from '../services/QueueManager.js';
+import { canBeginPlayback } from '../services/GuildPlayback.js';
 import { canUseBot, canJoinVoiceChannel, isBotOwner } from '../utils/permissions.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
 import { config } from '../config.js';
@@ -484,7 +485,7 @@ async function addPlaylistToQueue(
         return;
     }
 
-    const shouldStart = !queue.currentTrack && !queue.isPlaying;
+    const shouldStart = canBeginPlayback(queue);
     if (shouldStart && addedCount > 0) {
         log.debug('Queue etait vide, demarrage de la lecture');
         const playNextStart = Date.now();
@@ -522,6 +523,13 @@ async function addVideoUrlToQueue(
     locale: 'en' | 'fr'
 ): Promise<void> {
     log.debug('URL de video simple');
+    const videoId = youtubeService.extractVideoId(url);
+    if (videoId) {
+        queueManager.prewarmSource(interaction.guildId!, {
+            id: videoId,
+            url: `https://www.youtube.com/watch?v=${videoId}`,
+        });
+    }
     const track = await youtubeService.createTrackFromUrl(
         url,
         member.displayName,
@@ -697,7 +705,7 @@ async function addTrackToQueue(
         return;
     }
 
-    const shouldStart = !queue.currentTrack && !queue.isPlaying;
+    const shouldStart = canBeginPlayback(queue);
     if (shouldStart) {
         log.debug('Queue etait vide, demarrage de la lecture');
         const playNextStart = Date.now();

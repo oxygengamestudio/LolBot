@@ -195,7 +195,7 @@ export class QueueRecoveryManager {
             queue.volume = (await guildSettingsManager.getSettings(guildId)).volume;
             await this.dismiss(guildId);
             if (!connection || !(await this.authorized(interaction, offer.snapshot, channel)) ||
-                revision !== (this.revisions.get(guildId) ?? 0) || queue.isStopping ||
+                revision !== (this.revisions.get(guildId) ?? 0) || queue.playback === 'stopping' ||
                 queueManager.getQueue(guildId) !== queue || queue.currentTrack || queue.tracks.length) {
                 if (queueManager.getQueue(guildId) === queue && !queue.currentTrack && !queue.tracks.length) queueManager.deleteQueue(guildId, true);
                 await interaction.editReply(unavailable);

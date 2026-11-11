@@ -13,37 +13,19 @@ import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
 import { mediaCacheManager } from './MediaCacheManager.js';
 import { sponsorBlockService } from './SponsorBlockService.js';
 import { BoundedTtlCache } from '../utils/BoundedTtlCache.js';
+import { CrossfadeMixer, PcmDeck, PCM_BYTES_PER_SECOND } from './CrossfadeMixer.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
+import {
+    PROCESS_KILL_GRACE_MS,
+    getSafeChildEnv,
+    getYtdlpRuntimeArgs,
+    hasYtdlpCookieConfig,
+    resolveFfmpegPath,
+    resolveYtdlpPath,
+    terminateChildProcess,
+} from '../utils/mediaProcess.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
-
-const SAFE_CHILD_ENV_KEYS = [
-    'APPDATA',
-    'ComSpec',
-    'HOME',
-    'HTTP_PROXY',
-    'HTTPS_PROXY',
-    'LANG',
-    'LC_ALL',
-    'LC_CTYPE',
-    'LOCALAPPDATA',
-    'NODE_EXTRA_CA_CERTS',
-    'NO_PROXY',
-    'PATH',
-    'PATHEXT',
-    'SSL_CERT_DIR',
-    'SSL_CERT_FILE',
-    'SystemRoot',
-    'TZ',
-    'USERPROFILE',
-    'WINDIR',
-    'XDG_CACHE_HOME',
-    'XDG_CONFIG_HOME',
-    'XDG_RUNTIME_DIR',
-    'http_proxy',
-    'https_proxy',
-    'no_proxy',
-] as const;
 
 const REDACTED_YTDLP_FLAGS = new Set([
     '--add-header',
@@ -80,6 +62,8 @@ interface ResourceMetadata {
     pipelineCloseReason?: string;
     processExitCode?: number | null;
     failureCategory?: string;
+    /** Présent quand la ressource peut enchaîner la piste suivante en fondu. */
+    mixer?: CrossfadeMixer;
 }
 
 interface WarmResourceEntry {
@@ -119,11 +103,21 @@ export class AudioWrapper extends EventEmitter {
     private readonly discordOpusBitrateKbps = 96;
     private readonly streamReadyWaitMs = 1_000;
     private readonly directStreamReadyWaitMs = 1_000;
+    /** Durée du fondu demandée par guilde ; 0 = pipeline habituel sans mixeur. */
+    private crossfadeSecondsByGuild: Map<string, number> = new Map();
+    /** Avance lue en plus du fondu : le temps de lancer la source de la piste suivante. */
+    private readonly crossfadePrepareSeconds = 4;
+    /**
+     * Attente maximale d'une résolution d'URL déjà en vol avant de basculer sur le
+     * streaming yt-dlp. Ce repli relance la même extraction depuis zéro : tant que
+     * le préchauffage aboutit, l'attendre est toujours plus rapide que l'abandonner.
+     */
+    private readonly warmUrlWaitMs = 5_000;
+    private readonly preferredWarmUrlWaitMs = 8_000;
     private readonly maxProcessOutputBytes = 64 * 1024;
     private readonly maxMetadataOutputBytes = 2 * 1024 * 1024;
-    private readonly processKillGraceMs = 2_000;
+    private readonly processKillGraceMs = PROCESS_KILL_GRACE_MS;
     private readonly warmResourceTtlMs = 90_000;
-    private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
         super();
@@ -138,19 +132,8 @@ export class AudioWrapper extends EventEmitter {
      * Vérifie que FFmpeg et yt-dlp sont disponibles
      */
     private async checkDependencies(): Promise<boolean> {
-        const envFfmpeg = process.env.FFMPEG_PATH;
-        const envYtdlp = process.env.YTDLP_PATH;
-
-        if (envFfmpeg) {
-            this.ffmpegPath = envFfmpeg;
-        }
-
-        const localYtdlpPath = this.getLocalYtdlpPath();
-        if (envYtdlp) {
-            this.ytdlpPath = envYtdlp;
-        } else if (existsSync(localYtdlpPath)) {
-            this.ytdlpPath = localYtdlpPath;
-        }
+        this.ffmpegPath = resolveFfmpegPath();
+        this.ytdlpPath = resolveYtdlpPath();
 
         this.ffmpegAvailable = await this.checkBinary('FFmpeg', this.ffmpegPath, ['-version']);
         this.ytdlpAvailable = await this.checkBinary('yt-dlp', this.ytdlpPath, ['--version']);
@@ -164,11 +147,6 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return this.ffmpegAvailable && this.ytdlpAvailable;
-    }
-
-    private getLocalYtdlpPath(): string {
-        const fileName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-        return join(config.paths.data, 'bin', fileName);
     }
 
     private async checkBinary(label: string, binaryPath: string, args: string[]): Promise<boolean> {
@@ -231,13 +209,6 @@ export class AudioWrapper extends EventEmitter {
         });
     }
 
-    private parseExtraArgs(rawArgs: string | undefined): string[] {
-        if (!rawArgs) return [];
-        const matches = rawArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
-        if (!matches) return [];
-        return matches.map((arg) => arg.replace(/^['"]|['"]$/g, ''));
-    }
-
     private getScopedTrackKey(guildId: string, trackId: string): string {
         return `${guildId}:${trackId}`;
     }
@@ -263,21 +234,7 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private getSpawnEnv(tempDir: string = config.paths.cache): NodeJS.ProcessEnv {
-        const safeEnv: NodeJS.ProcessEnv = {};
-
-        for (const key of SAFE_CHILD_ENV_KEYS) {
-            const value = process.env[key];
-            if (value) {
-                safeEnv[key] = value;
-            }
-        }
-
-        safeEnv.TMPDIR = tempDir;
-        safeEnv.TMP = tempDir;
-        safeEnv.TEMP = tempDir;
-        safeEnv.TEMPDIR = tempDir;
-
-        return safeEnv;
+        return getSafeChildEnv(tempDir);
     }
 
     private terminateProcess(child: ChildProcess, drainAfterAudioEnd = false): void {
@@ -296,22 +253,7 @@ export class AudioWrapper extends EventEmitter {
             child.once('close', onClose);
             return;
         }
-        try {
-            child.kill('SIGTERM');
-        } catch {
-            return;
-        }
-        const forceKill = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-                try {
-                    child.kill('SIGKILL');
-                } catch {
-                    // Le processus est déjà fermé.
-                }
-            }
-        }, this.processKillGraceMs);
-        forceKill.unref?.();
-        child.once('close', () => clearTimeout(forceKill));
+        terminateChildProcess(child, this.processKillGraceMs);
     }
 
     private appendBoundedOutput(current: string, chunk: Buffer | string): string {
@@ -389,53 +331,11 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private hasCookieEnv(): boolean {
-        if (process.env.YTDLP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES) {
-            return true;
-        }
-        const extraArgs = this.getUnsafeYtdlpExtraArgs();
-        return extraArgs.some((arg) =>
-            arg === '--cookies' ||
-            arg === '--cookies-from-browser' ||
-            arg.startsWith('--cookies=') ||
-            arg.startsWith('--cookies-from-browser=')
-        );
+        return hasYtdlpCookieConfig();
     }
 
     private getYtdlpExtraArgs(includeCookies: boolean = true): string[] {
-        const args: string[] = [];
-        const cookiesFromBrowser = includeCookies ? process.env.YTDLP_COOKIES_FROM_BROWSER : undefined;
-        const cookies = includeCookies ? process.env.YTDLP_COOKIES : undefined;
-        const extraArgs = this.getUnsafeYtdlpExtraArgs();
-
-        if (cookiesFromBrowser) {
-            args.push('--cookies-from-browser', cookiesFromBrowser);
-        } else if (cookies) {
-            args.push('--cookies', cookies);
-        }
-
-        if (extraArgs.length > 0) {
-            args.push(...extraArgs);
-        }
-
-        return args;
-    }
-
-    private getUnsafeYtdlpExtraArgs(): string[] {
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
-        if (extraArgs.length === 0) {
-            return [];
-        }
-
-        if (config.audio.allowUnsafeYtdlpExtraArgs) {
-            return extraArgs;
-        }
-
-        if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
-            this.warnedUnsafeYtdlpExtraArgsIgnored = true;
-            log.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only if you fully trust the server environment.');
-        }
-
-        return [];
+        return getYtdlpRuntimeArgs(includeCookies);
     }
 
     private sanitizeYtdlpArgsForLogs(args: string[]): string {
@@ -607,9 +507,11 @@ export class AudioWrapper extends EventEmitter {
         track: Track,
         startSeconds: number = 0,
         sponsorBlockEnabled = false,
-        targetVolume = 100
+        targetVolume = 100,
+        crossfadeSeconds = 0
     ): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
+        this.crossfadeSecondsByGuild.set(guildId, Math.max(0, crossfadeSeconds));
         log.trace('Track ID:', track.id);
 
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
@@ -674,7 +576,11 @@ export class AudioWrapper extends EventEmitter {
             }
 
             const shouldPreferDirectUrl = track.sourceType === 'url' || effectiveStartSeconds > startSeconds + 3;
-            const warmDirectUrl = await this.waitForWarmDirectUrl(guildId, track, shouldPreferDirectUrl ? 8_000 : 1_500);
+            const warmDirectUrl = await this.waitForWarmDirectUrl(
+                guildId,
+                track,
+                shouldPreferDirectUrl ? this.preferredWarmUrlWaitMs : this.warmUrlWaitMs
+            );
             if (warmDirectUrl) {
                 const directResource = await this.createResourceWithDirectUrl(
                     guildId,
@@ -1142,7 +1048,11 @@ export class AudioWrapper extends EventEmitter {
         targetVolume = 100
     ): Promise<AudioResource | null> {
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
-        const nativeOpusType = this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
+        const crossfadeSeconds = this.crossfadeSecondsByGuild.get(guildId) ?? 0;
+        // Un fondu se mixe en PCM : le passe-plat Opus est réservé au pipeline sans fondu.
+        const nativeOpusType = crossfadeSeconds > 0
+            ? null
+            : this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
         if (nativeOpusType) {
             const nativeResource = await this.createNativeOpusResource(track, directUrl, nativeOpusType, startSeconds);
             if (nativeResource) {
@@ -1152,7 +1062,7 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const runDir = await this.createRunDirectory(guildId);
-        const useOpusCopy = this.canCopyDirectOpus(directUrl, filters, startSeconds, targetVolume);
+        const useOpusCopy = crossfadeSeconds <= 0 && this.canCopyDirectOpus(directUrl, filters, startSeconds, targetVolume);
         const metadata: ResourceMetadata = {
             trackId: track.id,
             teardown: () => teardown('direct resource teardown requested'),
@@ -1161,26 +1071,11 @@ export class AudioWrapper extends EventEmitter {
             sourceMode: 'direct-ffmpeg',
             outputBytes: 0,
         };
-        const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
-            ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
-            : [];
-        const outputArgs = useOpusCopy
-            ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg']
-            : [
-                ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
-                '-f', 's16le',
-                '-ar', '48000',
-                '-ac', '2',
-            ];
-        const ffmpegArgs = [
-            '-loglevel', 'warning',
-            ...inputReconnectArgs,
-            ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
-            '-i', directUrl,
-            '-vn',
-            ...outputArgs,
-            'pipe:1',
-        ];
+        const ffmpegArgs = this.buildDirectFfmpegArgs(
+            directUrl,
+            startSeconds,
+            useOpusCopy ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg'] : this.buildPcmOutputArgs(filters)
+        );
 
         const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -1265,7 +1160,7 @@ export class AudioWrapper extends EventEmitter {
         stdout.once('end', () => teardown('direct audio stream ended', true));
         stdout.once('error', () => teardown('direct audio stream error'));
 
-        const resource = createAudioResource<ResourceMetadata>(stdout, {
+        const resource = createAudioResource<ResourceMetadata>(this.withCrossfade(stdout, metadata, crossfadeSeconds), {
             inputType: useOpusCopy ? StreamType.OggOpus : StreamType.Raw,
             inlineVolume: !useOpusCopy,
             metadata: Object.assign(metadata, { fullyClosed }),
@@ -1285,6 +1180,181 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return resource;
+    }
+
+    private buildPcmOutputArgs(filters: string[]): string[] {
+        return [
+            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+        ];
+    }
+
+    private buildDirectFfmpegArgs(input: string, startSeconds: number, outputArgs: string[]): string[] {
+        const inputReconnectArgs = /^https?:\/\//i.test(input)
+            ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
+            : [];
+        return [
+            '-loglevel', 'warning',
+            ...inputReconnectArgs,
+            ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
+            '-i', input,
+            '-vn',
+            ...outputArgs,
+            'pipe:1',
+        ];
+    }
+
+    /**
+     * En mode fondu, place un mixeur entre FFmpeg et l'encodeur. Il se comporte
+     * comme un simple passe-plat tant qu'aucune piste suivante ne lui est attachée.
+     */
+    private withCrossfade(stream: Readable, metadata: ResourceMetadata, crossfadeSeconds: number): Readable {
+        if (crossfadeSeconds <= 0) {
+            return stream;
+        }
+        const mixer = new CrossfadeMixer(stream, crossfadeSeconds + this.crossfadePrepareSeconds);
+        const teardownSource = metadata.teardown;
+        metadata.mixer = mixer;
+        // Après un fondu, la source d'origine est déjà fermée : c'est le mixeur qui
+        // détient la source en cours, donc c'est lui qu'il faut détruire.
+        metadata.teardown = () => {
+            mixer.destroy();
+            teardownSource();
+        };
+        return mixer;
+    }
+
+    private getMixer(resource: AudioResource | null | undefined): CrossfadeMixer | null {
+        return (resource?.metadata as Partial<ResourceMetadata> | undefined)?.mixer ?? null;
+    }
+
+    /**
+     * Appelle `onWindow` chaque fois que la fin de la piste en cours devient connue.
+     * Renvoie `false` si cette ressource ne peut pas enchaîner en fondu.
+     */
+    watchCrossfadeWindow(resource: AudioResource, onWindow: () => void): boolean {
+        const mixer = this.getMixer(resource);
+        if (!mixer) {
+            return false;
+        }
+        mixer.on('tail', onWindow);
+        return true;
+    }
+
+    /** La piste en cours approche de sa fin et aucune suite n'est encore attachée. */
+    isCrossfadeWindowOpen(resource: AudioResource): boolean {
+        return this.getMixer(resource)?.awaitingNext ?? false;
+    }
+
+    /** Abandonne une suite préparée dont le fondu n'a pas commencé. */
+    cancelCrossfade(resource: AudioResource): void {
+        this.getMixer(resource)?.detachNext();
+    }
+
+    /**
+     * Prépare la piste suivante et l'attache au mixeur de la ressource en cours.
+     * `accept` est appelé à l'instant où le fondu commence ; à partir de là, la
+     * ressource porte `track`. Renvoie `false` si aucun fondu n'est possible :
+     * la transition habituelle s'applique alors à la fin de la piste.
+     */
+    async crossfadeInto(
+        guildId: string,
+        resource: AudioResource,
+        track: Track,
+        sponsorBlockEnabled: boolean,
+        fadeSeconds: number,
+        accept: () => boolean
+    ): Promise<boolean> {
+        const mixer = this.getMixer(resource);
+        if (!mixer || fadeSeconds <= 0 || track.isLive) {
+            return false;
+        }
+
+        const next = await this.createNextDeck(guildId, track, sponsorBlockEnabled).catch((error) => {
+            log.debug('Préparation du fondu impossible', error);
+            return null;
+        });
+        if (!next) {
+            return false;
+        }
+
+        const metadata = resource.metadata as ResourceMetadata;
+        return mixer.attachNext(next.deck, fadeSeconds, () => {
+            if (!accept()) {
+                return false;
+            }
+            metadata.trackId = track.id;
+            metadata.startSeconds = next.startSeconds;
+            this.lastSourceModeByGuild.set(guildId, 'direct');
+            return true;
+        });
+    }
+
+    /**
+     * Lance le décodage de la piste suivante vers un tampon PCM. Limité aux
+     * sources déjà résolues (fichier en cache ou URL directe préchauffée) : une
+     * extraction yt-dlp à ce stade arriverait après la fin de la piste.
+     */
+    private async createNextDeck(
+        guildId: string,
+        track: Track,
+        sponsorBlockEnabled: boolean
+    ): Promise<{ deck: PcmDeck; startSeconds: number } | null> {
+        const sponsorSegments = await this.getSponsorSegmentsFast(
+            track.id,
+            this.shouldUseSponsorBlock(track, sponsorBlockEnabled)
+        );
+        this.applySponsorAdjustedDuration(track, sponsorSegments);
+        const startSeconds = this.getSponsorAdjustedStart(0, sponsorSegments);
+
+        const lease = await mediaCacheManager.acquireTrackPath(track);
+        const warmUrl = this.cache.get(this.getScopedTrackKey(guildId, track.id))?.streamUrl;
+        const input = lease?.path ?? (warmUrl && this.isLikelyDirectStreamUrl(warmUrl) ? warmUrl : null);
+        if (!input) {
+            return null;
+        }
+
+        const runDir = await this.createRunDirectory(guildId);
+        const ffmpeg = spawn(
+            this.ffmpegPath,
+            this.buildDirectFfmpegArgs(
+                input,
+                startSeconds,
+                this.buildPcmOutputArgs(this.buildAudioFilters(startSeconds, sponsorSegments))
+            ),
+            { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: this.getSpawnEnv(runDir), cwd: runDir }
+        );
+
+        let released = false;
+        const release = (): void => {
+            if (released) return;
+            released = true;
+            lease?.release();
+            this.terminateProcess(ffmpeg);
+            void this.cleanupRunDirectory(runDir);
+        };
+        ffmpeg.stderr?.resume();
+        ffmpeg.once('error', release);
+        ffmpeg.once('close', release);
+
+        const stdout = ffmpeg.stdout as Readable | null;
+        if (!stdout) {
+            release();
+            return null;
+        }
+        stdout.once('close', release);
+        stdout.once('error', release);
+
+        // Le tampon est branché dans le même tour de boucle que le lancement : aucun octet n'est perdu.
+        const deck = new PcmDeck(stdout, PCM_BYTES_PER_SECOND * 2);
+        if (!(await deck.waitForData(this.directStreamReadyWaitMs * 3))) {
+            deck.destroy();
+            release();
+            return null;
+        }
+        return { deck, startSeconds };
     }
 
     private async createNativeOpusResource(
@@ -1826,7 +1896,8 @@ export class AudioWrapper extends EventEmitter {
             stream.once('error', () => teardown('audio stream error'));
         }
 
-        const resource = createAudioResource<ResourceMetadata>(stream, {
+        const playbackStream = this.withCrossfade(stream, metadata, this.crossfadeSecondsByGuild.get(guildId) ?? 0);
+        const resource = createAudioResource<ResourceMetadata>(playbackStream, {
             inputType: StreamType.Raw, // PCM s16le
             inlineVolume: true,
             metadata,
@@ -1879,7 +1950,7 @@ export class AudioWrapper extends EventEmitter {
         return dropper;
     }
 
-    async warmTrack(guildId: string, track: Track): Promise<void> {
+    async warmTrack(guildId: string, track: Pick<Track, 'id' | 'url' | 'title'>): Promise<void> {
         const cacheKey = this.getScopedTrackKey(guildId, track.id);
         const existing = this.warmTracks.get(cacheKey);
         if (existing) {

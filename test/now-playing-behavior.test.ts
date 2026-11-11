@@ -44,9 +44,8 @@ function createQueue(
         player: null,
         tracks: [],
         currentTrack: currentTrack(guildId),
-        isPlaying: true,
-        isPaused: false,
-        isStopping: false,
+        playback: 'playing',
+        pauseReason: null,
         volume: 100,
         nowPlayingMessage: { edit, delete: deleteMessage },
         lyricsMessages: [],
@@ -54,7 +53,6 @@ function createQueue(
         startedAt: Date.now() - 10_000,
         pausedAt: null,
         totalPausedTime: 0,
-        autoPausedByEmptyChannel: false,
         isReconnecting: false,
         reconnectAttempts: 0,
         shouldKeepConnection: true,
@@ -264,7 +262,7 @@ test('stop during slow message creation removes the late message and leaves no t
     const creation = nowPlayingManager.onTrackStart(queue);
     await waitFor(() => sends === 1);
     queue.currentTrack = null;
-    queue.isStopping = true;
+    queue.playback = 'stopping';
     const deletion = nowPlayingManager.deleteNowPlaying(queue);
     const coalescedDeletion = nowPlayingManager.deleteNowPlaying(queue);
     release({ delete: async () => { deletes += 1; } });

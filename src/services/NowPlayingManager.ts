@@ -73,7 +73,7 @@ class NowPlayingManager {
 
     private isRenderCurrent(queue: GuildQueue, generation: number, track: Track): boolean {
         return queueManager.getQueue(queue.guildId) === queue && queue.currentTrack === track &&
-            !queue.isStopping && generation === (this.generations.get(queue) ?? 0);
+            queue.playback !== 'stopping' && generation === (this.generations.get(queue) ?? 0);
     }
 
     private invalidateRender(queue: GuildQueue): void {
@@ -87,7 +87,7 @@ class NowPlayingManager {
     }
 
     async createOrUpdateNowPlaying(queue: GuildQueue): Promise<void> {
-        if (!queue.currentTrack || queue.isStopping || queueManager.getQueue(queue.guildId) !== queue) return;
+        if (!queue.currentTrack || queue.playback === 'stopping' || queueManager.getQueue(queue.guildId) !== queue) return;
         const pending = this.renders.get(queue);
         if (pending) {
             this.renderDirty.add(queue);
@@ -98,7 +98,7 @@ class NowPlayingManager {
                 this.renderDirty.delete(queue);
                 await this.renderNowPlaying(queue, this.generations.get(queue) ?? 0);
             } while (this.renderDirty.has(queue) && !this.retryTimers.has(queue.guildId) &&
-                queueManager.getQueue(queue.guildId) === queue && queue.currentTrack && !queue.isStopping);
+                queueManager.getQueue(queue.guildId) === queue && queue.currentTrack && queue.playback !== 'stopping');
         });
         this.renders.set(queue, work);
         try { await work; }
@@ -207,8 +207,8 @@ class NowPlayingManager {
         const currentTimeString = this.formatTime(currentTime);
         const totalTimeString = this.formatTime(track.duration);
         const progressLine = `\`${currentTimeString}\` ${progress} \`${totalTimeString}\``;
-        const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
-        const statusLabel = queue.isPaused
+        const color = queue.playback === 'paused' ? this.COLORS.paused : this.COLORS.playing;
+        const statusLabel = queue.playback === 'paused'
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
@@ -226,7 +226,7 @@ class NowPlayingManager {
             `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
             `🔊 ${queue.volume}%`,
             '',
-            queue.isPaused
+            queue.playback === 'paused'
                 ? t(locale, 'nowPlaying.footer.paused')
                 : t(locale, 'nowPlaying.footer.playing'),
         ].filter((line): line is string => line !== null).join('\n');
@@ -269,10 +269,10 @@ class NowPlayingManager {
 
     private createButtons(queue: GuildQueue, locale: 'en' | 'fr'): ActionRowBuilder<ButtonBuilder> {
         const playPauseButton = new ButtonBuilder()
-            .setCustomId(queue.isPaused ? 'np_resume' : 'np_pause')
-            .setEmoji(queue.isPaused ? '▶️' : '⏸️')
-            .setLabel(queue.isPaused ? t(locale, 'nowPlaying.button.resume') : t(locale, 'nowPlaying.button.pause'))
-            .setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Secondary);
+            .setCustomId(queue.playback === 'paused' ? 'np_resume' : 'np_pause')
+            .setEmoji(queue.playback === 'paused' ? '▶️' : '⏸️')
+            .setLabel(queue.playback === 'paused' ? t(locale, 'nowPlaying.button.resume') : t(locale, 'nowPlaying.button.pause'))
+            .setStyle(queue.playback === 'paused' ? ButtonStyle.Success : ButtonStyle.Secondary);
 
         const skipButton = new ButtonBuilder()
             .setCustomId('np_skip')
@@ -363,7 +363,7 @@ class NowPlayingManager {
         log.debug('Demarrage de l\'intervalle de mise a jour');
         const interval = setInterval(() => {
             const currentQueue = queueManager.getQueue(queue.guildId);
-            if (currentQueue === queue && currentQueue.isPlaying && !currentQueue.isPaused) {
+            if (currentQueue === queue && currentQueue.playback === 'playing') {
                 this.scheduleUpdate(currentQueue);
             }
         }, config.audio.updateInterval);

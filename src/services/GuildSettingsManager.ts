@@ -8,6 +8,8 @@ import type { GuildSettings, RolePermissionMode, VoiceChannelMode } from '../typ
 
 const log = logger.createModuleLogger('GuildSettings');
 
+export const MAX_CROSSFADE_SECONDS = 12;
+
 type StoredGuildSettings = Partial<GuildSettings> & {
     _meta?: {
         localeConfigured?: boolean;
@@ -50,6 +52,7 @@ export class GuildSettingsManager {
             stayConnected: false,
             stayConnectedAlways: false,
             pauseOnEmptyChannelWhenAlwaysConnected: false,
+            crossfadeSeconds: 0,
             crossfadeEnabled: false,
             preferredVoiceChannel: null,
             voiceChannelMode: 'allow_all',
@@ -93,6 +96,9 @@ export class GuildSettingsManager {
         const volume = Number.isFinite(settings.volume)
             ? Math.max(0, Math.min(200, Math.floor(settings.volume as number)))
             : defaults.volume;
+        const crossfadeSeconds = Number.isFinite(settings.crossfadeSeconds)
+            ? Math.max(0, Math.min(MAX_CROSSFADE_SECONDS, Math.floor(settings.crossfadeSeconds as number)))
+            : defaults.crossfadeSeconds;
 
         return {
             guildId,
@@ -108,8 +114,9 @@ export class GuildSettingsManager {
                 typeof settings.pauseOnEmptyChannelWhenAlwaysConnected === 'boolean'
                     ? settings.pauseOnEmptyChannelWhenAlwaysConnected
                     : defaults.pauseOnEmptyChannelWhenAlwaysConnected,
-            // Keep the upstream migration away from the legacy crossfade pipeline.
-            crossfadeEnabled: false,
+            // Un ancien `crossfadeEnabled: true` sans durée venait du pipeline retiré : il reste désactivé.
+            crossfadeSeconds,
+            crossfadeEnabled: crossfadeSeconds > 0,
             sponsorBlockEnabled:
                 typeof settings.sponsorBlockEnabled === 'boolean'
                     ? settings.sponsorBlockEnabled

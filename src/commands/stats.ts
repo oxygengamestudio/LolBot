@@ -7,6 +7,7 @@ import { logger } from '../utils/Logger.js';
 import { safeContent } from '../utils/text.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
 import { guildSettingsManager } from '../services/GuildSettingsManager.js';
+import { botVersion } from '../utils/version.js';
 import { queueRecoveryManager } from '../services/QueueRecoveryManager.js';
 
 const log = logger.createModuleLogger('StatsCmd');
@@ -70,7 +71,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
             warmup: telemetry.warmHit ? `hit (${telemetry.warmupMs ?? 0}ms)` : `${telemetry.warmupMs ?? 'n/a'}ms`,
             resourceMs: telemetry.resourceMs ?? 'n/a',
             sourceMode,
-            crossfade: 'off (gapless)',
+            crossfade: settings.crossfadeSeconds > 0 ? `${settings.crossfadeSeconds}s` : 'off (gapless)',
         })
         : 'n/a';
 
@@ -78,7 +79,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         .setColor(0x5865F2)
         .setTitle(t(locale, 'stats.title'))
         .addFields(
-            { name: 'Diagnostic', value: `FFmpeg: ${diagnostics.ffmpeg ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')} | yt-dlp: ${diagnostics.ytdlp ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')}\nNode ${process.version} | build ${build}\n${locale === 'fr' ? 'Reglages en attente' : 'Pending settings'}: ${guildSettingsManager.pendingWrites}`, inline: false },
+            { name: 'Diagnostic', value: `FFmpeg: ${diagnostics.ffmpeg ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')} | yt-dlp: ${diagnostics.ytdlp ? 'OK' : (locale === 'fr' ? 'indisponible' : 'unavailable')}\nLolBot v${botVersion} | Node ${process.version} | build ${build}\n${locale === 'fr' ? 'Reglages en attente' : 'Pending settings'}: ${guildSettingsManager.pendingWrites}`, inline: false },
             { name: locale === 'fr' ? 'File et reprise' : 'Queue and recovery', value: `${queue?.tracks.length ?? 0} ${locale === 'fr' ? 'pistes en attente' : 'upcoming tracks'}\n${locale === 'fr' ? 'Reprise' : 'Recovery'}: ${settings.queueRecoveryEnabled ? 'ON' : 'OFF'}${queueRecoveryManager.hasOffer(guildId) ? ' (confirmation)' : ''}`, inline: true },
             { name: t(locale, 'stats.voiceConnection'), value: `Etat: ${connectionStatus}`, inline: true },
             { name: t(locale, 'stats.ping'), value: formatPing(wsPing, udpPing), inline: true },

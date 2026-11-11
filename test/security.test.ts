@@ -64,7 +64,7 @@ beforeEach(() => {
     queue = { guildId: 'guild', voiceChannel: voice, textChannel: text,
         currentTrack: { id: 'current', title: 'Current', duration: 100, requestedById: 'member' },
         tracks: [{ id: 'next', title: 'Next', duration: 90, requestedBy: 'Member', requestedById: 'member' }],
-        lyricsMessages: [{ id: 'lyrics' }], isPaused: false };
+        lyricsMessages: [{ id: 'lyrics' }], playback: 'playing', pauseReason: null };
     views.views.clear();
     views.activeByUser.clear();
 });
@@ -497,7 +497,7 @@ for (const interruption of ['stop', 'shutdown']) {
         t.mock.method(queues, 'getAllQueues', () => new Map([['guild', queue]]));
         t.mock.method(queues, 'joinChannel', async () => {
             if (interruption === 'shutdown') await manager.shutdown();
-            else { queue.isStopping = true; manager.capture(queue); }
+            else { queue.playback = 'stopping'; manager.capture(queue); }
             return {};
         });
         t.mock.method(queues, 'deleteQueue', () => {});

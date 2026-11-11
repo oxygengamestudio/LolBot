@@ -314,7 +314,7 @@ class QueueViewManager {
         if (queue.currentTrack) {
             const currentTime = queueManager.getCurrentTime(queue.guildId);
             const timeString = `${this.formatTime(currentTime)} / ${this.formatTime(queue.currentTrack.duration)}`;
-            const statusIcon = queue.isPaused ? '⏸️' : '▶️';
+            const statusIcon = queue.playback === 'paused' ? '⏸️' : '▶️';
             embed.addFields({
                 name: statusIcon,
                 value: `**${safeContent(this.truncateString(queue.currentTrack.title, 80))}** • \`${timeString}\` • 👤 <@${queue.currentTrack.requestedById}>`,

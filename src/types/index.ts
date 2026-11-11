@@ -53,6 +53,9 @@ export interface PlaylistInfo {
     tracks: Track[];
 }
 
+export type PlaybackStatus = 'idle' | 'starting' | 'playing' | 'paused' | 'stopping';
+export type PauseReason = 'user' | 'empty_channel';
+
 export interface GuildQueue {
     guildId: string;
     textChannel: TextChannel;
@@ -61,9 +64,10 @@ export interface GuildQueue {
     player: AudioPlayer | null;
     tracks: Track[];
     currentTrack: Track | null;
-    isPlaying: boolean;
-    isPaused: boolean;
-    isStopping: boolean;
+    /** État de lecture unique ; ne se modifie que via QueueManager (voir GuildPlayback.ts). */
+    playback: PlaybackStatus;
+    /** Renseigné uniquement quand `playback === 'paused'`. */
+    pauseReason: PauseReason | null;
     volume: number;
     nowPlayingMessage: Message | null;
     lyricsMessages: Message[];
@@ -71,7 +75,6 @@ export interface GuildQueue {
     startedAt: number | null;
     pausedAt: number | null;
     totalPausedTime: number;
-    autoPausedByEmptyChannel: boolean;
     isReconnecting: boolean;
     reconnectAttempts: number;
     shouldKeepConnection: boolean;
@@ -127,6 +130,9 @@ export interface GuildSettings {
     stayConnected: boolean;
     stayConnectedAlways: boolean;
     pauseOnEmptyChannelWhenAlwaysConnected: boolean;
+    /** Durée du fondu enchaîné en secondes ; 0 = désactivé (transition gapless). */
+    crossfadeSeconds: number;
+    /** Dérivé de `crossfadeSeconds`. Conservé pour les réglages déjà enregistrés. */
     crossfadeEnabled: boolean;
     sponsorBlockEnabled: boolean;
     queueRecoveryEnabled: boolean;

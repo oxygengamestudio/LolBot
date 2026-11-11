@@ -22,7 +22,7 @@ import { queueManager } from './services/QueueManager.js';
 import { nowPlayingManager } from './services/NowPlayingManager.js';
 import { queueRecoveryManager } from './services/QueueRecoveryManager.js';
 import { queueViewManager } from './services/QueueViewManager.js';
-import { guildSettingsManager } from './services/GuildSettingsManager.js';
+import { guildSettingsManager, MAX_CROSSFADE_SECONDS } from './services/GuildSettingsManager.js';
 import { handleLyricsDelete } from './utils/lyrics.js';
 import { canJoinVoiceChannel, canManageSettings } from './utils/permissions.js';
 import {
@@ -660,6 +660,12 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
             await interaction.update(buildSettingsMessage(updated));
             return;
         }
+        case SETTINGS_BUTTON_IDS.crossfade: {
+            if (interaction.message?.id) {
+                await interaction.showModal(buildSettingsModal('crossfade', settings, interaction.message.id));
+            }
+            return;
+        }
         case SETTINGS_BUTTON_IDS.sponsor: {
             const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
                 sponsorBlockEnabled: !settings.sponsorBlockEnabled,
@@ -697,21 +703,29 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
     const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     const parsed = parseSettingsModalId(interaction.customId);
-    if (!parsed || parsed.kind !== 'volume') return;
+    if (!parsed) return;
 
     const raw = interaction.fields.getTextInputValue('value').trim();
-    const value = Number.parseInt(raw, 10);
-    if (!Number.isFinite(value) || value < 0 || value > 200) {
+    const value = /^\d{1,3}$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+    const isCrossfade = parsed.kind === 'crossfade';
+    const maxValue = isCrossfade ? MAX_CROSSFADE_SECONDS : 200;
+    if (!Number.isFinite(value) || value < 0 || value > maxValue) {
         await interaction.reply({
-            content: `❌ ${t(locale, 'error.invalidVolume')}`,
+            content: `❌ ${t(locale, isCrossfade ? 'error.invalidCrossfade' : 'error.invalidVolume')}`,
             flags: MessageFlags.Ephemeral,
             allowedMentions: { parse: [] },
         });
         return;
     }
 
-    const updated = await guildSettingsManager.updateSettings(interaction.guildId, { volume: value });
-    queueManager.setVolume(interaction.guildId, value);
+    // Le fondu s'applique à partir de la prochaine piste : la lecture en cours n'est pas interrompue.
+    const updated = await guildSettingsManager.updateSettings(
+        interaction.guildId,
+        isCrossfade ? { crossfadeSeconds: value } : { volume: value }
+    );
+    if (!isCrossfade) {
+        queueManager.setVolume(interaction.guildId, value);
+    }
     await updateSettingsMessage(interaction, parsed.messageId, updated);
     await interaction.reply({
         content: `✅ ${t(updated.locale, 'common.updated')}`,
