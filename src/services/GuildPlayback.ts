@@ -89,6 +89,8 @@ export interface GuildRuntime {
     crossfadeNext: Track | null;
     /** Piste arrivée par fondu : si son flux s'arrête trop tôt, elle est reprise une fois. */
     crossfadedTrack: Track | null;
+    /** Piste déjà relancée une fois après une coupure de flux : pas de seconde reprise. */
+    recoveredTrack: Track | null;
     lastTrackEnd: { trackId: string | null; at: number } | null;
 
     transitionNonce: number;
@@ -112,6 +114,7 @@ export function createGuildRuntime(): GuildRuntime {
         warmedTrackId: null,
         crossfadeNext: null,
         crossfadedTrack: null,
+        recoveredTrack: null,
         lastTrackEnd: null,
         transitionNonce: 0,
         transitionLock: null,
