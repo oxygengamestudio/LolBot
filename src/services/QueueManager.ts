@@ -56,6 +56,8 @@ class QueueManager extends EventEmitter {
     private readonly playbackStartTimeoutMs = 15_000;
     private readonly voiceRecoveryWaitMs = 5_000;
     private readonly bufferingTimeoutMs = 10_000;
+    private readonly crossfadePrepareAttempts = 4;
+    private readonly crossfadeRetryDelayMs = 1_500;
     private readonly retiredResourceRetentionMs = 10_000;
     private readonly voiceDebugLogs = ['1', 'true', 'yes', 'on'].includes(
         (process.env.VOICE_DEBUG_LOGS ?? '').toLowerCase()
@@ -2066,16 +2068,26 @@ class QueueManager extends EventEmitter {
             queue.tracks[0] === nextTrack;
 
         const settings = await guildSettingsManager.getSettings(guildId);
-        const attached = settings.crossfadeSeconds > 0 && stillWanted()
-            ? await audioWrapper.crossfadeInto(
+        let attached = false;
+        // Une piste ajoutée dans les dernières secondes n'a pas encore de source résolue :
+        // on réessaie brièvement tant que la piste en cours n'est pas terminée.
+        for (let attempt = 0; attempt < this.crossfadePrepareAttempts; attempt += 1) {
+            if (settings.crossfadeSeconds <= 0 || !stillWanted()) {
+                break;
+            }
+            attached = await audioWrapper.crossfadeInto(
                 guildId,
                 resource,
                 nextTrack,
                 settings.sponsorBlockEnabled,
                 settings.crossfadeSeconds,
                 () => stillWanted() && this.completeCrossfade(queue, nextTrack)
-            )
-            : false;
+            );
+            if (attached || !stillWanted() || !audioWrapper.isCrossfadeWindowOpen(resource)) {
+                break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, this.crossfadeRetryDelayMs));
+        }
 
         if (queue.currentTrack === nextTrack) {
             return; // Le fondu a déjà commencé.
