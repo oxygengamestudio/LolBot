@@ -47,6 +47,30 @@ class FakeAudioPlayer extends EventEmitter {
     unpause(): boolean { return true; }
 }
 
+class FakeVoiceConnection extends EventEmitter {
+    state = { status: 'ready' };
+    rejoinAttempts = 0;
+    destroyCalls = 0;
+    subscribeCalls = 0;
+
+    transition(status: string): void {
+        const oldState = this.state;
+        this.state = { status };
+        this.emit('stateChange', oldState, this.state);
+        this.emit(status, oldState, this.state);
+    }
+
+    subscribe(): object {
+        this.subscribeCalls += 1;
+        return {};
+    }
+
+    destroy(): void {
+        this.destroyCalls += 1;
+        this.transition('destroyed');
+    }
+}
+
 function track(id: string): Track {
     return {
         id,
@@ -173,8 +197,10 @@ before(async () => {
 
 after(async () => {
     const manager = modules.queueModule.queueManager as any;
-    for (const timer of manager.bufferingWatchdogs.values()) clearTimeout(timer);
-    for (const timer of manager.retiredResources.values()) clearTimeout(timer);
+    for (const runtime of manager.runtimes.values()) {
+        if (runtime.bufferingWatchdog) clearTimeout(runtime.bufferingWatchdog);
+        for (const timer of runtime.retiredResources.values()) clearTimeout(timer);
+    }
     manager.queues.clear();
     restore?.();
     await rm(testDataDir, { recursive: true, force: true });
@@ -201,7 +227,7 @@ test('playNext resolves as started only after the player reaches Playing', async
     player.transition('playing', selectedResource);
     const result = await start;
     assert.deepEqual(result, { status: 'started', track: selectedTrack });
-    assert.equal(manager.activeResources.get(queue.guildId), selectedResource);
+    assert.equal(manager.runtime(queue.guildId).activeResource, selectedResource);
 });
 
 test('playNext consumes a prepared warmup instead of cancelling it between tracks', async () => {
@@ -288,7 +314,7 @@ test('a seek completed after /leave destroys its stale resource without reinstal
     const selectedTrack = track('seek-before-leave');
     const staleSeekResource = resource(selectedTrack.id, 40);
     queue.currentTrack = selectedTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
 
     let seekStarted = false;
     let resolveSeek!: (value: unknown) => void;
@@ -313,7 +339,7 @@ test('a seek completed after /leave destroys its stale resource without reinstal
         assert.equal(await seek, false);
         assert.ok(tornDown.includes(staleSeekResource));
         assert.equal(manager.getQueue(queue.guildId), undefined);
-        assert.notEqual(manager.activeResources.get(queue.guildId), staleSeekResource);
+        assert.notEqual(manager.runtime(queue.guildId).activeResource, staleSeekResource);
         assert.equal(player.state.status, 'idle');
     } finally {
         wrapper.createResource = originalCreateResource;
@@ -330,13 +356,13 @@ test('a current seek still installs the requested resource and preserves the act
     const selectedTrack = track('seek-current');
     const selectedResource = resource(selectedTrack.id, 41);
     queue.currentTrack = selectedTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     wrapper.createResource = async () => selectedResource as never;
 
     try {
         assert.equal(await manager.seekTo(queue.guildId, 30), true);
         assert.equal(queue.currentTrack, selectedTrack);
-        assert.equal(manager.activeResources.get(queue.guildId), selectedResource);
+        assert.equal(manager.runtime(queue.guildId).activeResource, selectedResource);
         assert.equal(player.state.status, 'playing');
     } finally {
         manager.deleteQueue(queue.guildId, true);
@@ -356,7 +382,7 @@ test('a seek watchdog tears down a resource that never reaches Playing', async (
     const selectedResource = resource(selectedTrack.id, 42);
     const tornDown: unknown[] = [];
     queue.currentTrack = selectedTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     manager.playbackStartTimeoutMs = 20;
     wrapper.createResource = async () => selectedResource as never;
     wrapper.teardownResource = (value: unknown) => { tornDown.push(value); };
@@ -364,7 +390,7 @@ test('a seek watchdog tears down a resource that never reaches Playing', async (
     try {
         assert.equal(await manager.seekTo(queue.guildId, 30), false);
         assert.ok(tornDown.includes(selectedResource));
-        assert.notEqual(manager.activeResources.get(queue.guildId), selectedResource);
+        assert.notEqual(manager.runtime(queue.guildId).activeResource, selectedResource);
     } finally {
         manager.deleteQueue(queue.guildId, true);
         manager.playbackStartTimeoutMs = originalTimeout;
@@ -380,7 +406,7 @@ test('seek refuses to supersede an active voice reconnection', async () => {
     const player = new FakeAudioPlayer(true);
     const queue = createQueue('guild-seek-reconnecting', player);
     queue.currentTrack = track('seek-reconnecting');
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     queue.isReconnecting = true;
     let resourceCalls = 0;
     wrapper.createResource = async () => {
@@ -416,7 +442,7 @@ test('/stop invalidates a start awaiting Playing and leaves no track behind', as
         assert.equal(result.status, 'failed');
         assert.equal(queue.currentTrack, null);
         assert.deepEqual(queue.tracks, []);
-        assert.equal(queue.isPlaying, false);
+        assert.match(queue.playback, /^(stopping|idle)$/);
     } finally {
         manager.playbackStartTimeoutMs = originalTimeout;
     }
@@ -451,8 +477,8 @@ test('two guilds can confirm playback concurrently without sharing state', async
     assert.equal(queueA.currentTrack, trackA);
     assert.equal(queueB.currentTrack, trackB);
     assert.notEqual(
-        manager.activeResources.get(queueA.guildId),
-        manager.activeResources.get(queueB.guildId)
+        manager.runtime(queueA.guildId).activeResource,
+        manager.runtime(queueB.guildId).activeResource
     );
 });
 
@@ -481,7 +507,7 @@ for (const guildCount of [10, 25]) {
         assert.ok(results.every((result) => result.status === 'started'));
         for (const fixture of fixtures) {
             assert.equal(fixture.queue.currentTrack, fixture.selectedTrack);
-            assert.equal(manager.activeResources.get(fixture.queue.guildId), fixture.selectedResource);
+            assert.equal(manager.runtime(fixture.queue.guildId).activeResource, fixture.selectedResource);
         }
         assert.equal(new Set(fixtures.map((fixture) => fixture.queue.currentTrack?.id)).size, guildCount);
     });
@@ -496,10 +522,10 @@ test('a ready next source is handed to the player within the 40ms gapless budget
     const previousResource = resource(previousTrack.id);
     const nextResource = resource(nextTrack.id, Date.now() + 1);
     queue.currentTrack = previousTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     queue.startedAt = Date.now() - 1000;
     queue.tracks.push(nextTrack);
-    manager.activeResources.set(queue.guildId, previousResource);
+    manager.runtime(queue.guildId).activeResource = previousResource;
     modules.audioWrapper.createResource = async () => nextResource as never;
 
     let playCalledAt = 0;
@@ -527,7 +553,7 @@ test('events from a retired resource are identifiable and do not match the repla
     const retired = resource('same-track', 100);
     const replacement = resource('same-track', 200);
 
-    manager.activeResources.set(guildId, retired);
+    manager.runtime(guildId).activeResource = retired;
     manager.teardownActiveResource(guildId);
 
     assert.equal(manager.shouldIgnorePlayerResourceError(guildId, retired), true);
@@ -548,7 +574,7 @@ test('a buffering watchdog attempts bounded recovery at the current position', a
     queue.currentTrack = selectedTrack;
     queue.startedAt = Date.now() - 7_000;
     player.state = { status: 'buffering', resource: selectedResource };
-    manager.activeResources.set(queue.guildId, selectedResource);
+    manager.runtime(queue.guildId).activeResource = selectedResource;
     const recoveredOffsets: number[] = [];
     let ended = 0;
     manager.resumeCurrentTrack = async (_queue: unknown, offset: number) => {
@@ -585,10 +611,10 @@ test('a buffering recovery completed after /stop destroys its stale resource wit
     const selectedResource = resource(selectedTrack.id, 10);
     const staleRecoveryResource = resource(selectedTrack.id, 20);
     queue.currentTrack = selectedTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     queue.startedAt = Date.now() - 4_000;
     player.state = { status: 'buffering', resource: selectedResource };
-    manager.activeResources.set(queue.guildId, selectedResource);
+    manager.runtime(queue.guildId).activeResource = selectedResource;
 
     let recoveryStarted = false;
     let resolveRecovery!: (value: unknown) => void;
@@ -612,7 +638,7 @@ test('a buffering recovery completed after /stop destroys its stale resource wit
         await new Promise((resolve) => setTimeout(resolve, 15));
 
         assert.ok(tornDown.includes(staleRecoveryResource), 'la ressource produite par l’ancienne session doit être détruite');
-        assert.notEqual(manager.activeResources.get(queue.guildId), staleRecoveryResource);
+        assert.notEqual(manager.runtime(queue.guildId).activeResource, staleRecoveryResource);
         assert.equal(queue.currentTrack, null);
         assert.equal(player.state.status, 'idle');
     } finally {
@@ -635,9 +661,9 @@ test('a reconnect resume completed after /stop cannot reinstall stale playback',
     const selectedTrack = track('reconnect-stop-race');
     const staleRecoveryResource = resource(selectedTrack.id, 30);
     queue.currentTrack = selectedTrack;
-    queue.isPlaying = true;
+    queue.playback = 'playing';
     queue.startedAt = Date.now() - 8_000;
-    manager.activeResources.delete(queue.guildId);
+    manager.runtime(queue.guildId).activeResource = null;
 
     const recoveredConnection = {
         state: { status: 'ready' },
@@ -671,11 +697,782 @@ test('a reconnect resume completed after /stop cannot reinstall stale playback',
 
         assert.equal(await reconnect, false);
         assert.ok(tornDown.includes(staleRecoveryResource));
-        assert.notEqual(manager.activeResources.get(queue.guildId), staleRecoveryResource);
+        assert.notEqual(manager.runtime(queue.guildId).activeResource, staleRecoveryResource);
         assert.equal(queue.currentTrack, null);
     } finally {
         manager.joinChannel = originalJoinChannel;
         wrapper.createResource = originalCreateResource;
         wrapper.teardownResource = originalTeardownResource;
+    }
+});
+
+for (const mode of ['stayConnected', 'stayConnectedAlways'] as const) {
+    test(`an empty queue preserves and recovers its ${mode} voice connection`, async () => {
+        const manager = modules.queueModule.queueManager as any;
+        const settings = modules.guildSettingsManager as any;
+        const originalSettings = settings.getSettings;
+        const originalJoin = manager.joinChannel;
+        const queue = createQueue(`guild-empty-${mode}`, new FakeAudioPlayer(false));
+        const connection = new FakeVoiceConnection();
+        const replacement = new FakeVoiceConnection();
+        queue.connection = connection;
+        let joins = 0;
+        settings.getSettings = async (guildId: string) => ({
+            ...await originalSettings(guildId),
+            stayConnected: mode === 'stayConnected',
+            stayConnectedAlways: mode === 'stayConnectedAlways',
+        });
+        manager.joinChannel = async () => {
+            joins += 1;
+            queue.connection = replacement;
+            return replacement;
+        };
+
+        try {
+            assert.deepEqual(await manager.playNext(queue.guildId), { status: 'queue_empty' });
+            assert.equal(queue.shouldKeepConnection, true);
+            assert.equal(manager.getQueue(queue.guildId), queue);
+            assert.equal(await manager.reconnectWithBackoff(queue, 0), true);
+            assert.equal(joins, 1, 'la connexion doit être rétablie même sans piste');
+            assert.equal(connection.destroyCalls, 1);
+            assert.equal(queue.connection, replacement);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.deleteQueue(queue.guildId, true);
+            settings.getSettings = originalSettings;
+            manager.joinChannel = originalJoin;
+        }
+    });
+}
+
+test('an empty queue still disconnects when both stay-connected options are disabled', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-empty-disconnect', new FakeAudioPlayer(false));
+    const connection = new FakeVoiceConnection();
+    queue.connection = connection;
+    settings.getSettings = async (guildId: string) => ({
+        ...await originalSettings(guildId),
+        stayConnected: false,
+        stayConnectedAlways: false,
+    });
+
+    try {
+        assert.deepEqual(await manager.playNext(queue.guildId), { status: 'queue_empty' });
+        assert.equal(manager.getQueue(queue.guildId), undefined);
+        assert.equal(connection.destroyCalls, 1);
+    } finally {
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('Stop keeps idle voice recovery enabled without restarting playback', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-stop-keeps-voice', new FakeAudioPlayer(false));
+    queue.currentTrack = track('stop-keeps-voice');
+    queue.playback = 'playing';
+    const replacement = new FakeVoiceConnection();
+    let joins = 0;
+    manager.joinChannel = async () => {
+        joins += 1;
+        queue.connection = replacement;
+        return replacement;
+    };
+
+    try {
+        assert.equal(manager.stop(queue.guildId), true);
+        assert.equal(queue.isManualDisconnect, false);
+        assert.equal(queue.shouldKeepConnection, true);
+        assert.equal(await manager.reconnectWithBackoff(queue, 0), true);
+        assert.equal(joins, 1);
+        assert.equal(queue.currentTrack, null);
+        assert.deepEqual(queue.tracks, []);
+        assert.match(queue.playback, /^(stopping|idle)$/);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('a member returning during the settings read prevents stale empty-channel disconnection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-return-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    let members = 0;
+    queue.voiceChannel.members.filter = () => ({ size: members });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        members = 1;
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-channel evaluation cannot delete a replacement queue', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-queue-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    queue.voiceChannel.members.filter = () => ({ size: 0 });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        manager.deleteQueue(queue.guildId, true);
+        const replacement = createQueue(queue.guildId, new FakeAudioPlayer(false));
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), replacement);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-channel evaluation cannot act on a voice channel changed during the settings read', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-member-channel-race', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    queue.voiceChannel.members.filter = () => ({ size: 0 });
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const evaluation = manager.evaluateVoiceChannel(queue.guildId);
+        queue.voiceChannel = { ...queue.voiceChannel, id: 'replacement-channel' };
+        resolveSettings(savedSettings);
+        await evaluation;
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('an empty-queue settings read cannot delete a replacement session', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const queue = createQueue('guild-empty-queue-replacement', new FakeAudioPlayer(false));
+    const savedSettings = { ...await originalSettings(queue.guildId), stayConnected: false, stayConnectedAlways: false };
+    let resolveSettings!: (value: unknown) => void;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+
+    try {
+        const empty = manager.playNext(queue.guildId);
+        await new Promise((resolve) => setImmediate(resolve));
+        manager.deleteQueue(queue.guildId, true);
+        const replacement = createQueue(queue.guildId, new FakeAudioPlayer(false));
+        resolveSettings(savedSettings);
+        await empty;
+        assert.equal(manager.getQueue(queue.guildId), replacement);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+    }
+});
+
+test('a manual leave during the reconnect settings read prevents any new voice join', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-reconnect-leave-settings', new FakeAudioPlayer(false));
+    const savedSettings = await originalSettings(queue.guildId);
+    let resolveSettings!: (value: unknown) => void;
+    let joins = 0;
+    settings.getSettings = () => new Promise((resolve) => { resolveSettings = resolve; });
+    manager.joinChannel = async () => { joins += 1; return new FakeVoiceConnection(); };
+
+    try {
+        const reconnect = manager.reconnectWithBackoff(queue, 0);
+        manager.deleteQueue(queue.guildId, true);
+        resolveSettings(savedSettings);
+        assert.equal(await reconnect, false);
+        assert.equal(joins, 0);
+        assert.equal(manager.getQueue(queue.guildId), undefined);
+    } finally {
+        settings.getSettings = originalSettings;
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('concurrent voice recoveries contain the same unexpected join rejection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-reconnect-rejection', new FakeAudioPlayer(false));
+    let joins = 0;
+    manager.joinChannel = async () => {
+        joins += 1;
+        throw new Error('synthetic voice join failure');
+    };
+
+    try {
+        assert.deepEqual(await Promise.all([
+            manager.reconnectWithBackoff(queue, 0),
+            manager.reconnectWithBackoff(queue, 0),
+        ]), [false, false]);
+        assert.equal(joins, 1);
+        assert.equal(queue.isReconnecting, false);
+        assert.equal(manager.runtime(queue.guildId).reconnectAttempt, null);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('Discord can recover Ready after the former 900ms deadline without destroying its connection', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-discord-delayed-ready', new FakeAudioPlayer(false));
+    const connection = new FakeVoiceConnection();
+    connection.state = { status: 'disconnected' };
+    queue.connection = connection;
+    manager.attachConnectionListeners(queue, connection);
+    let joins = 0;
+    manager.joinChannel = async () => { joins += 1; return null; };
+    const readyTimer = setTimeout(() => connection.transition('ready'), 1_050);
+
+    try {
+        assert.ok(manager.voiceRecoveryWaitMs >= 5_000);
+        const disconnected = connection.listeners('disconnected')[0] as () => Promise<void>;
+        await disconnected();
+        assert.equal(joins, 0);
+        assert.equal(connection.destroyCalls, 0);
+        assert.equal(connection.subscribeCalls, 1);
+        assert.equal(queue.connection, connection);
+        assert.equal(manager.getQueue(queue.guildId), queue);
+    } finally {
+        clearTimeout(readyTimer);
+        manager.deleteQueue(queue.guildId, true);
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('opt-in saved-queue recovery still takes precedence over automatic reconnect', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const settings = modules.guildSettingsManager as any;
+    const originalSettings = settings.getSettings;
+    const originalJoin = manager.joinChannel;
+    const queue = createQueue('guild-saved-queue-recovery', new FakeAudioPlayer(false));
+    queue.currentTrack = track('saved-queue-recovery');
+    let joins = 0;
+    settings.getSettings = async (guildId: string) => ({ ...await originalSettings(guildId), queueRecoveryEnabled: true });
+    manager.joinChannel = async () => { joins += 1; return new FakeVoiceConnection(); };
+
+    try {
+        assert.equal(await manager.reconnectWithBackoff(queue, 0), false);
+        assert.equal(joins, 0);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        settings.getSettings = originalSettings;
+        manager.joinChannel = originalJoin;
+    }
+});
+
+test('an immediate natural stream end reports one failure and advances without retrying the track', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalPlayNext = manager.playNext;
+    const queue = createQueue('guild-early-stream-end', new FakeAudioPlayer(false));
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const selectedTrack = track('early-stream-end');
+    const endedResource = { ...resource(selectedTrack.id), playbackDuration: 120 };
+    queue.currentTrack = selectedTrack;
+    queue.playback = 'playing';
+    manager.runtime(queue.guildId).activeResource = endedResource;
+    const failures: string[] = [];
+    const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+        if (failedTrack === selectedTrack) failures.push(code);
+    };
+    manager.on('trackFailed', listener);
+    let nextCalls = 0;
+    manager.playNext = async () => { nextCalls += 1; return { status: 'queue_empty' }; };
+
+    try {
+        queue.player.emit('idle', { status: 'playing', resource: endedResource });
+        queue.player.emit('idle', { status: 'playing', resource: endedResource });
+        assert.deepEqual(failures, ['stream_ended_early']);
+        assert.equal(nextCalls, 1, 'la piste interrompue ne doit pas être relancée en boucle');
+        assert.equal(queue.currentTrack, null);
+        assert.equal(manager.runtime(queue.guildId).activeResource, null);
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+        manager.playNext = originalPlayNext;
+    }
+});
+
+for (const scenario of [
+    { name: 'ordinary playback', duration: 180, startSeconds: 0, playedMs: 3_000 },
+    { name: 'seek close to the end', duration: 180, startSeconds: 179, playedMs: 120 },
+    { name: 'a genuinely short track', duration: 5, startSeconds: 0, playedMs: 120 },
+    { name: 'an unknown live duration', duration: 0, startSeconds: 0, playedMs: 120 },
+    { name: 'missing playback position metadata', duration: 180, startSeconds: undefined, playedMs: 120 },
+]) {
+    test(`natural end is not misclassified for ${scenario.name}`, () => {
+        const manager = modules.queueModule.queueManager as any;
+        const originalPlayNext = manager.playNext;
+        const queue = createQueue(`guild-end-${scenario.name}`, new FakeAudioPlayer(false));
+        queue.player = null;
+        manager.ensurePlayer(queue);
+        const selectedTrack = { ...track(scenario.name), duration: scenario.duration };
+        const endedResource = {
+            ...resource(selectedTrack.id),
+            metadata: { trackId: selectedTrack.id, createdAt: Date.now(), startSeconds: scenario.startSeconds },
+            playbackDuration: scenario.playedMs,
+        };
+        queue.currentTrack = selectedTrack;
+        queue.playback = 'playing';
+        manager.runtime(queue.guildId).activeResource = endedResource;
+        const failures: string[] = [];
+        const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+            if (failedTrack === selectedTrack) failures.push(code);
+        };
+        manager.on('trackFailed', listener);
+        manager.playNext = async () => ({ status: 'queue_empty' });
+
+        try {
+            queue.player.emit('idle', { status: 'playing', resource: endedResource });
+            assert.deepEqual(failures, []);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.off('trackFailed', listener);
+            manager.deleteQueue(queue.guildId, true);
+            manager.playNext = originalPlayNext;
+        }
+    });
+}
+
+for (const action of ['stop', 'skip'] as const) {
+    test(`${action} cannot report an early-stream failure from the retired resource`, () => {
+        const manager = modules.queueModule.queueManager as any;
+        const originalPlayNext = manager.playNext;
+        const queue = createQueue(`guild-manual-${action}-early`, new FakeAudioPlayer(false));
+        queue.player = null;
+        manager.ensurePlayer(queue);
+        const selectedTrack = track(`manual-${action}-early`);
+        const endedResource = { ...resource(selectedTrack.id), playbackDuration: 120 };
+        queue.currentTrack = selectedTrack;
+        queue.playback = 'playing';
+        manager.runtime(queue.guildId).activeResource = endedResource;
+        const failures: string[] = [];
+        const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+            if (failedTrack === selectedTrack) failures.push(code);
+        };
+        manager.on('trackFailed', listener);
+        manager.playNext = async () => ({ status: 'queue_empty' });
+
+        try {
+            assert.equal(manager[action](queue.guildId), true);
+            queue.player.emit('idle', { status: 'playing', resource: endedResource });
+            assert.deepEqual(failures, []);
+            assert.equal(queue.currentTrack, null);
+        } finally {
+            manager.off('trackFailed', listener);
+            manager.deleteQueue(queue.guildId, true);
+            manager.playNext = originalPlayNext;
+        }
+    });
+}
+
+test('an old resource ending immediately cannot fail the replacement track', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const queue = createQueue('guild-early-retired-resource', new FakeAudioPlayer(false));
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const selectedTrack = track('replacement-after-early');
+    const retired = { ...resource('old-track', 100), playbackDuration: 120 };
+    const replacement = resource(selectedTrack.id, 200);
+    manager.runtime(queue.guildId).activeResource = retired;
+    manager.teardownActiveResource(queue.guildId);
+    manager.runtime(queue.guildId).activeResource = replacement;
+    queue.currentTrack = selectedTrack;
+    queue.playback = 'playing';
+    const failures: string[] = [];
+    const listener = (_queue: unknown, failedTrack: Track, code: string) => {
+        if (failedTrack === selectedTrack) failures.push(code);
+    };
+    manager.on('trackFailed', listener);
+
+    try {
+        queue.player.emit('idle', { status: 'playing', resource: retired });
+        assert.deepEqual(failures, []);
+        assert.equal(queue.currentTrack, selectedTrack);
+        assert.equal(manager.runtime(queue.guildId).activeResource, replacement);
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+    }
+});
+
+test('two confirmed plays of the same track can both end within the debounce window', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const originalPlayNext = manager.playNext;
+    const player = new FakeAudioPlayer(false);
+    const queue = createQueue('guild-consecutive-same-track-end', player);
+    queue.player = null;
+    manager.ensurePlayer(queue);
+    const onIdle = queue.player.listeners('idle')[0] as (state: unknown) => void;
+    queue.player = player;
+    const firstTrack = track('same-track-early-end');
+    const secondTrack = track(firstTrack.id);
+    const firstResource = { ...resource(firstTrack.id, 100), playbackDuration: 120 };
+    const secondResource = { ...resource(secondTrack.id, 200), playbackDuration: 120 };
+    const failures: Track[] = [];
+    const listener = (failedQueue: unknown, failedTrack: Track) => {
+        if (failedQueue === queue) failures.push(failedTrack);
+    };
+    manager.on('trackFailed', listener);
+    let nextCalls = 0;
+    manager.playNext = async () => { nextCalls += 1; return { status: 'queue_empty' }; };
+
+    try {
+        queue.currentTrack = firstTrack;
+        queue.playback = 'playing';
+        manager.runtime(queue.guildId).activeResource = firstResource;
+        onIdle({ status: 'playing', resource: firstResource });
+        assert.deepEqual(failures, [firstTrack]);
+
+        queue.tracks.push(secondTrack);
+        manager.runtime(queue.guildId).activeResource = secondResource;
+        manager.runtime(queue.guildId).pendingStart = { queue, track: secondTrack, resource: secondResource };
+        player.state = { status: 'playing', resource: secondResource };
+        assert.equal(manager.promotePendingStart(queue, secondResource), true);
+        queue.playback = 'playing';
+
+        onIdle({ status: 'playing', resource: firstResource });
+        assert.equal(queue.currentTrack, secondTrack, 'un ancien Idle reste ignoré après la nouvelle confirmation');
+        onIdle({ status: 'playing', resource: secondResource });
+        onIdle({ status: 'playing', resource: secondResource });
+
+        assert.deepEqual(failures, [firstTrack, secondTrack]);
+        assert.equal(queue.currentTrack, null, 'le second Idle ne doit pas laisser la file bloquée');
+        assert.equal(nextCalls, 2, 'une seule progression par lecture confirmée');
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+        manager.playNext = originalPlayNext;
+    }
+});
+
+async function waitFor(condition: () => boolean, message: string, timeoutMs = 250): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(condition(), true, message);
+}
+
+test('a second /play during a start cannot launch a competing start', async () => {
+    const { canBeginPlayback } = await import('../src/services/GuildPlayback.js');
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const player = new FakeAudioPlayer(false);
+    const queue = createQueue('guild-double-play', player);
+    const firstTrack = track('double-first');
+    const secondTrack = track('double-second');
+    const firstResource = resource(firstTrack.id, 50);
+    queue.tracks.push(firstTrack);
+    let resolveResource: ((value: unknown) => void) | undefined;
+    wrapper.createResource = () => new Promise((resolve) => { resolveResource = resolve; });
+
+    try {
+        assert.equal(canBeginPlayback(queue), true);
+        const start = manager.playNext(queue.guildId);
+        await waitFor(() => resolveResource !== undefined, 'la résolution audio doit avoir commencé');
+        assert.equal(queue.playback, 'starting');
+
+        queue.tracks.push(secondTrack);
+        assert.equal(canBeginPlayback(queue), false, 'le second /play ne doit pas relancer playNext');
+
+        resolveResource!(firstResource);
+        await waitFor(
+            () => manager.runtime(queue.guildId).activeResource === firstResource,
+            'la ressource doit être remise au player'
+        );
+        player.transition('playing', firstResource);
+
+        assert.deepEqual(await start, { status: 'started', track: firstTrack });
+        assert.equal(queue.playback, 'playing');
+        assert.equal(queue.currentTrack, firstTrack);
+        assert.deepEqual(queue.tracks, [secondTrack]);
+        assert.equal(canBeginPlayback(queue), false);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+    }
+});
+
+test('skip during source resolution drops the loading track and starts the next one', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-skip-while-loading', player);
+    const loadingTrack = track('skip-loading');
+    const nextTrack = track('skip-next');
+    queue.tracks.push(loadingTrack, nextTrack);
+    let resolveLoading: ((value: unknown) => void) | undefined;
+    wrapper.createResource = (_guildId: string, selected: Track) => selected.id === loadingTrack.id
+        ? new Promise((resolve) => { resolveLoading = resolve; })
+        : Promise.resolve(resource(selected.id, 61));
+
+    try {
+        const start = manager.playNext(queue.guildId);
+        await waitFor(() => resolveLoading !== undefined, 'la résolution audio doit avoir commencé');
+        assert.equal(queue.playback, 'starting');
+
+        assert.equal(manager.skip(queue.guildId), true);
+        resolveLoading!(resource(loadingTrack.id, 60));
+        assert.equal((await start).code, 'cancelled');
+
+        await waitFor(() => queue.currentTrack === nextTrack, 'la piste suivante doit démarrer après le skip');
+        assert.equal(queue.playback, 'playing');
+        assert.deepEqual(queue.tracks, []);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+    }
+});
+
+test('a start that throws leaves the guild idle instead of stuck in starting', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const player = new FakeAudioPlayer(false);
+    const queue = createQueue('guild-start-throws', player);
+    const selectedTrack = track('start-throws');
+    queue.tracks.push(selectedTrack);
+    wrapper.createResource = async () => resource(selectedTrack.id, 70) as never;
+    player.play = () => { throw new Error('resource already ended'); };
+
+    try {
+        await assert.rejects(manager.playNext(queue.guildId), /resource already ended/);
+        assert.equal(queue.playback, 'idle');
+        assert.equal(manager.runtime(queue.guildId).activeResource, null);
+        assert.equal(manager.runtime(queue.guildId).pendingStart, null);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+    }
+});
+
+test('pause and resume move between playing and paused and track the pause reason', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const player = new FakeAudioPlayer(false);
+    const queue = createQueue('guild-pause-resume', player);
+    queue.currentTrack = track('pause-resume');
+    queue.playback = 'playing';
+    queue.startedAt = Date.now() - 5_000;
+
+    try {
+        assert.equal(manager.pause(queue.guildId), true);
+        assert.equal(queue.playback, 'paused');
+        assert.equal(queue.pauseReason, 'user');
+        assert.equal(manager.pause(queue.guildId), false, 'déjà en pause');
+
+        assert.equal(manager.resume(queue.guildId), true);
+        assert.equal(queue.playback, 'playing');
+        assert.equal(queue.pauseReason, null);
+        assert.equal(manager.resume(queue.guildId), false, 'pas en pause');
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+    }
+});
+
+test('a direct link prewarms its stream unless an upcoming track already owns the warmup', () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalWarmTrack = wrapper.warmTrack;
+    const warmed: Array<{ guildId: string; id: string; url: string }> = [];
+    wrapper.warmTrack = async (guildId: string, source: { id: string; url: string }) => {
+        warmed.push({ guildId, id: source.id, url: source.url });
+    };
+    const source = { id: 'prewarm-id', url: 'https://www.youtube.com/watch?v=prewarm-id' };
+
+    try {
+        manager.prewarmSource('guild-prewarm-no-queue', source);
+        assert.deepEqual(warmed, [{ guildId: 'guild-prewarm-no-queue', ...source }]);
+
+        const queue = createQueue('guild-prewarm-busy', new FakeAudioPlayer(false));
+        manager.prewarmSource(queue.guildId, source);
+        assert.equal(warmed.length, 2, 'une file sans piste à venir peut préchauffer');
+
+        queue.tracks.push(track('prewarm-upcoming'));
+        manager.prewarmSource(queue.guildId, source);
+        assert.equal(warmed.length, 2, 'la piste suivante garde le préchauffage de la guilde');
+        manager.deleteQueue(queue.guildId, true);
+    } finally {
+        wrapper.warmTrack = originalWarmTrack;
+    }
+});
+
+function installCrossfadeDoubles(seconds: number) {
+    const wrapper = modules.audioWrapper as any;
+    const settings = modules.guildSettingsManager as any;
+    const originals = {
+        watch: wrapper.watchCrossfadeWindow,
+        open: wrapper.isCrossfadeWindowOpen,
+        into: wrapper.crossfadeInto,
+        cancel: wrapper.cancelCrossfade,
+        getSettings: settings.getSettings,
+    };
+    const state = {
+        onWindow: undefined as (() => void) | undefined,
+        windowOpen: false,
+        cancels: 0,
+        prepared: [] as Array<{ track: Track; fadeSeconds: number; accept: () => boolean }>,
+        restore: () => {
+            wrapper.watchCrossfadeWindow = originals.watch;
+            wrapper.isCrossfadeWindowOpen = originals.open;
+            wrapper.crossfadeInto = originals.into;
+            wrapper.cancelCrossfade = originals.cancel;
+            settings.getSettings = originals.getSettings;
+        },
+    };
+    wrapper.watchCrossfadeWindow = (_resource: unknown, onWindow: () => void) => {
+        state.onWindow = onWindow;
+        return true;
+    };
+    wrapper.isCrossfadeWindowOpen = () => state.windowOpen;
+    wrapper.cancelCrossfade = () => { state.cancels += 1; };
+    wrapper.crossfadeInto = async (
+        _guildId: string, _resource: unknown, nextTrack: Track, _sponsor: boolean, fadeSeconds: number, accept: () => boolean
+    ) => {
+        state.prepared.push({ track: nextTrack, fadeSeconds, accept });
+        return true;
+    };
+    settings.getSettings = async (guildId: string) => ({
+        ...(await originals.getSettings(guildId)),
+        crossfadeSeconds: seconds,
+    });
+    return state;
+}
+
+test('a crossfade handover promotes the next track without stopping the player', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const crossfade = installCrossfadeDoubles(6);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-handover', player);
+    const firstTrack = track('fade-first');
+    const secondTrack = track('fade-second');
+    const firstResource = resource(firstTrack.id, 80);
+    queue.tracks.push(firstTrack, secondTrack);
+    const requestedFades: number[] = [];
+    wrapper.createResource = async (...args: unknown[]) => {
+        requestedFades.push(args[5] as number);
+        return firstResource as never;
+    };
+    const events: string[] = [];
+    const onEnd = (_queue: unknown, ended: Track) => events.push(`end:${ended.id}`);
+    const onStart = (started: { currentTrack: Track }) => events.push(`start:${started.currentTrack.id}`);
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        assert.deepEqual(requestedFades, [6], 'la ressource est créée en mode fondu');
+        manager.on('trackEnd', onEnd);
+        manager.on('trackStart', onStart);
+
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await waitFor(() => crossfade.prepared.length === 1, 'la piste suivante doit être préparée');
+        assert.equal(crossfade.prepared[0]!.track, secondTrack);
+        assert.equal(crossfade.prepared[0]!.fadeSeconds, 6);
+        assert.equal(queue.currentTrack, firstTrack, 'rien ne change avant le début du fondu');
+
+        crossfade.windowOpen = false;
+        assert.equal(crossfade.prepared[0]!.accept(), true);
+        assert.equal(queue.currentTrack, secondTrack);
+        assert.deepEqual(queue.tracks, []);
+        assert.equal(queue.playback, 'playing');
+        assert.deepEqual(events, ['end:fade-first', 'start:fade-second']);
+        assert.equal(player.state.status, 'playing', 'le lecteur ne passe jamais par idle');
+        assert.equal(manager.runtime(queue.guildId).activeResource, firstResource);
+        assert.equal(manager.getCurrentTime(queue.guildId), 0, 'la position repart de zéro');
+        assert.equal(crossfade.prepared[0]!.accept(), false, 'un fondu ne se déclenche qu’une fois');
+    } finally {
+        manager.off('trackEnd', onEnd);
+        manager.off('trackStart', onStart);
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
+    }
+});
+
+test('a prepared crossfade follows the queue: removing the next track cancels it and prepares the new one', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const crossfade = installCrossfadeDoubles(4);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-queue-edit', player);
+    const firstTrack = track('edit-first');
+    const removedTrack = track('edit-removed');
+    const thirdTrack = track('edit-third');
+    queue.tracks.push(firstTrack, removedTrack, thirdTrack);
+    wrapper.createResource = async () => resource(firstTrack.id, 81) as never;
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await waitFor(() => crossfade.prepared.length === 1, 'le fondu vers la piste suivante doit être préparé');
+
+        assert.equal(manager.removeTrackAt(queue.guildId, 0), removedTrack);
+        assert.equal(crossfade.cancels, 1, 'le fondu vers la piste retirée est annulé');
+        await waitFor(() => crossfade.prepared.length === 2, 'le fondu vers la nouvelle piste suivante doit être préparé');
+        assert.equal(crossfade.prepared[1]!.track, thirdTrack);
+
+        assert.equal(crossfade.prepared[0]!.accept(), false, 'la piste retirée ne peut plus démarrer');
+        assert.equal(queue.currentTrack, firstTrack);
+        assert.equal(crossfade.prepared[1]!.accept(), true);
+        assert.equal(queue.currentTrack, thirdTrack);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
+    }
+});
+
+test('crossfade stays off when the setting is zero', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const crossfade = installCrossfadeDoubles(0);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-off', player);
+    queue.tracks.push(track('off-first'), track('off-second'));
+    wrapper.createResource = async () => resource('off-first', 82) as never;
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.equal(crossfade.prepared.length, 0);
+        assert.equal(manager.runtime(queue.guildId).crossfadeNext, null);
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
     }
 });

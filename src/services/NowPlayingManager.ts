@@ -14,7 +14,7 @@ import { config } from '../config.js';
 import { resolveLocale, t } from '../utils/i18n.js';
 import { logger } from '../utils/Logger.js';
 import { guildSettingsManager } from './GuildSettingsManager.js';
-import type { GuildQueue } from '../types/index.js';
+import type { GuildQueue, Track } from '../types/index.js';
 import { safeContent } from '../utils/text.js';
 import { ensureCanUseBot, ensureSameVoiceChannel, replyEphemeral } from '../utils/commandHelpers.js';
 
@@ -26,6 +26,9 @@ class NowPlayingManager {
     private retryTimers: Map<string, NodeJS.Timeout> = new Map();
     private retryAttempts: Map<string, number> = new Map();
     private nowPlayingDeletes: Map<string, Promise<void>> = new Map();
+    private renders = new WeakMap<GuildQueue, Promise<void>>();
+    private renderDirty = new WeakSet<GuildQueue>();
+    private generations = new WeakMap<GuildQueue, number>();
     private updatesInFlight = 0;
     private readonly maxConcurrentUpdates = 2;
     private readonly maxRetryAttempts = 5;
@@ -47,34 +50,77 @@ class NowPlayingManager {
         queueManager.on('queueStopped', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueEmpty', (queue: GuildQueue) => this.deleteNowPlaying(queue));
         queueManager.on('queueDeleted', (guildId: string, queue?: GuildQueue) => {
-            this.stopUpdateInterval(guildId);
             if (queue) void this.deleteNowPlaying(queue);
+            else if (!queueManager.getQueue(guildId)) this.stopUpdateInterval(guildId);
         });
     }
 
     private async onTrackStart(queue: GuildQueue): Promise<void> {
         log.debug(`Track start: ${queue.currentTrack?.title}`);
+        const track = queue.currentTrack;
+        const generation = this.generations.get(queue) ?? 0;
         await this.createOrUpdateNowPlaying(queue);
-        this.startUpdateInterval(queue);
+        if (track && this.isRenderCurrent(queue, generation, track) && queue.nowPlayingMessage) {
+            this.startUpdateInterval(queue);
+        }
     }
 
-    private async onTrackEnd(_queue: GuildQueue): Promise<void> {
+    private onTrackEnd(queue: GuildQueue): void {
         log.debug('Track end');
+        this.invalidateRender(queue);
+        this.stopQueueUpdates(queue);
+    }
+
+    private isRenderCurrent(queue: GuildQueue, generation: number, track: Track): boolean {
+        return queueManager.getQueue(queue.guildId) === queue && queue.currentTrack === track &&
+            queue.playback !== 'stopping' && generation === (this.generations.get(queue) ?? 0);
+    }
+
+    private invalidateRender(queue: GuildQueue): void {
+        this.generations.set(queue, (this.generations.get(queue) ?? 0) + 1);
+        this.renderDirty.delete(queue);
+    }
+
+    private stopQueueUpdates(queue: GuildQueue): void {
+        const activeQueue = queueManager.getQueue(queue.guildId);
+        if (!activeQueue || activeQueue === queue) this.stopUpdateInterval(queue.guildId);
     }
 
     async createOrUpdateNowPlaying(queue: GuildQueue): Promise<void> {
-        if (!queue.currentTrack) {
+        if (!queue.currentTrack || queue.playback === 'stopping' || queueManager.getQueue(queue.guildId) !== queue) return;
+        const pending = this.renders.get(queue);
+        if (pending) {
+            this.renderDirty.add(queue);
+            return pending;
+        }
+        const work = Promise.resolve().then(async () => {
+            do {
+                this.renderDirty.delete(queue);
+                await this.renderNowPlaying(queue, this.generations.get(queue) ?? 0);
+            } while (this.renderDirty.has(queue) && !this.retryTimers.has(queue.guildId) &&
+                queueManager.getQueue(queue.guildId) === queue && queue.currentTrack && queue.playback !== 'stopping');
+        });
+        this.renders.set(queue, work);
+        try { await work; }
+        finally { this.renders.delete(queue); this.renderDirty.delete(queue); }
+    }
+
+    private async renderNowPlaying(queue: GuildQueue, generation: number): Promise<void> {
+        const track = queue.currentTrack;
+        if (!track || !this.isRenderCurrent(queue, generation, track)) {
             log.trace('Pas de track actuel, skip');
             return;
         }
 
-        const locale = await resolveLocale(queue.guildId);
-        const components = this.createNowPlayingComponents(queue, locale);
-
+        let messageAtStart = queue.nowPlayingMessage;
         try {
-            if (queue.nowPlayingMessage) {
+            const locale = await resolveLocale(queue.guildId);
+            if (!this.isRenderCurrent(queue, generation, track)) return;
+            const components = this.createNowPlayingComponents(queue, locale);
+            messageAtStart = queue.nowPlayingMessage;
+            if (messageAtStart) {
                 log.trace('Mise a jour du message Now Playing existant');
-                await queue.nowPlayingMessage.edit({
+                await messageAtStart.edit({
                     embeds: [],
                     components,
                     flags: MessageFlags.IsComponentsV2,
@@ -87,15 +133,20 @@ class NowPlayingManager {
                     flags: MessageFlags.IsComponentsV2,
                     allowedMentions: { parse: [] },
                 });
+                if (!this.isRenderCurrent(queue, generation, track)) {
+                    await message.delete().catch(() => undefined);
+                    return;
+                }
                 queue.nowPlayingMessage = message;
                 log.info('Message Now Playing cree');
             }
+            if (this.isRenderCurrent(queue, generation, track)) this.clearRetryState(queue.guildId);
         } catch (error) {
+            if (!this.isRenderCurrent(queue, generation, track)) return;
             log.error('Erreur lors de la mise a jour:', error);
-            if (this.getDiscordErrorCode(error) === '10008' && queue.nowPlayingMessage) {
-                await queue.nowPlayingMessage.delete().catch(() => undefined);
+            if (this.getDiscordErrorCode(error) === '10008' && messageAtStart && queue.nowPlayingMessage === messageAtStart) {
                 queue.nowPlayingMessage = null;
-                await this.createOrUpdateNowPlaying(queue);
+                this.renderDirty.add(queue);
                 return;
             }
             if (this.isPermanentDiscordError(error)) {
@@ -110,52 +161,33 @@ class NowPlayingManager {
 
     async updateNowPlaying(queue: GuildQueue): Promise<void> {
         if (!queue.nowPlayingMessage || !queue.currentTrack) return;
-
-        const locale = await resolveLocale(queue.guildId);
-        const components = this.createNowPlayingComponents(queue, locale);
-
-        try {
-            await queue.nowPlayingMessage.edit({
-                embeds: [],
-                components,
-                flags: MessageFlags.IsComponentsV2,
-                allowedMentions: { parse: [] },
-            });
-            this.clearRetryState(queue.guildId);
-        } catch (error) {
-            if (this.isPermanentDiscordError(error)) {
-                this.abandonNowPlayingUpdates(queue, error);
-                return;
-            }
-            this.scheduleRetry(queue, error);
-        }
+        await this.createOrUpdateNowPlaying(queue);
     }
 
     async deleteNowPlaying(queue: GuildQueue): Promise<void> {
         log.debug('Suppression du message Now Playing');
-        this.stopUpdateInterval(queue.guildId);
-
-        const messageAtEntry = queue.nowPlayingMessage;
+        this.stopQueueUpdates(queue);
+        this.invalidateRender(queue);
+        // Detach the exact message before awaiting Discord or an in-flight send.
+        // A later track may publish its own card while this cleanup is pending.
+        const message = queue.nowPlayingMessage;
+        queue.nowPlayingMessage = null;
+        const pendingRender = this.renders.get(queue);
         const pendingDelete = this.nowPlayingDeletes.get(queue.guildId);
-        if (pendingDelete) {
-            await pendingDelete;
-            if (messageAtEntry && queue.nowPlayingMessage === messageAtEntry) {
-                await this.deleteNowPlaying(queue);
-            }
+        if (!message && !pendingRender) {
+            if (pendingDelete) await pendingDelete;
             return;
         }
 
-        const message = messageAtEntry;
-        queue.nowPlayingMessage = null;
-        if (!message) return;
-
         const deletion = (async () => {
-            try {
-                await message.delete();
-                log.info('Message Now Playing supprime');
-            } catch {
-                log.trace('Message deja supprime');
-            }
+            await Promise.all([
+                pendingDelete,
+                pendingRender,
+                message ? message.delete().then(
+                    () => { log.info('Message Now Playing supprime'); },
+                    () => { log.trace('Message deja supprime'); }
+                ) : undefined,
+            ]);
         })();
         this.nowPlayingDeletes.set(queue.guildId, deletion);
 
@@ -175,8 +207,8 @@ class NowPlayingManager {
         const currentTimeString = this.formatTime(currentTime);
         const totalTimeString = this.formatTime(track.duration);
         const progressLine = `\`${currentTimeString}\` ${progress} \`${totalTimeString}\``;
-        const color = queue.isPaused ? this.COLORS.paused : this.COLORS.playing;
-        const statusLabel = queue.isPaused
+        const color = queue.playback === 'paused' ? this.COLORS.paused : this.COLORS.playing;
+        const statusLabel = queue.playback === 'paused'
             ? `⏸️ ${t(locale, 'nowPlaying.status.paused')}`
             : `▶️ ${t(locale, 'nowPlaying.status.playing')}`;
         const squareCover = this.getSquareThumbnail(track.thumbnail);
@@ -194,7 +226,7 @@ class NowPlayingManager {
             `📋 ${t(locale, 'nowPlaying.queueCount', { count: queue.tracks.length })}`,
             `🔊 ${queue.volume}%`,
             '',
-            queue.isPaused
+            queue.playback === 'paused'
                 ? t(locale, 'nowPlaying.footer.paused')
                 : t(locale, 'nowPlaying.footer.playing'),
         ].filter((line): line is string => line !== null).join('\n');
@@ -237,10 +269,10 @@ class NowPlayingManager {
 
     private createButtons(queue: GuildQueue, locale: 'en' | 'fr'): ActionRowBuilder<ButtonBuilder> {
         const playPauseButton = new ButtonBuilder()
-            .setCustomId(queue.isPaused ? 'np_resume' : 'np_pause')
-            .setEmoji(queue.isPaused ? '▶️' : '⏸️')
-            .setLabel(queue.isPaused ? t(locale, 'nowPlaying.button.resume') : t(locale, 'nowPlaying.button.pause'))
-            .setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Secondary);
+            .setCustomId(queue.playback === 'paused' ? 'np_resume' : 'np_pause')
+            .setEmoji(queue.playback === 'paused' ? '▶️' : '⏸️')
+            .setLabel(queue.playback === 'paused' ? t(locale, 'nowPlaying.button.resume') : t(locale, 'nowPlaying.button.pause'))
+            .setStyle(queue.playback === 'paused' ? ButtonStyle.Success : ButtonStyle.Secondary);
 
         const skipButton = new ButtonBuilder()
             .setCustomId('np_skip')
@@ -325,12 +357,13 @@ class NowPlayingManager {
     }
 
     private startUpdateInterval(queue: GuildQueue): void {
-        this.stopUpdateInterval(queue.guildId);
+        const previousInterval = this.updateIntervals.get(queue.guildId);
+        if (previousInterval) clearInterval(previousInterval);
 
         log.debug('Demarrage de l\'intervalle de mise a jour');
         const interval = setInterval(() => {
             const currentQueue = queueManager.getQueue(queue.guildId);
-            if (currentQueue && currentQueue.isPlaying && !currentQueue.isPaused) {
+            if (currentQueue === queue && currentQueue.playback === 'playing') {
                 this.scheduleUpdate(currentQueue);
             }
         }, config.audio.updateInterval);

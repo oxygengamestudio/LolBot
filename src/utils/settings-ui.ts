@@ -23,6 +23,8 @@ export const SETTINGS_BUTTON_IDS = {
     always: 'settings_always',
     pauseOnEmpty: 'settings_pause_on_empty',
     sponsor: 'settings_sponsor',
+    crossfade: 'settings_crossfade',
+    recovery: 'settings_recovery',
     preferred: 'settings_preferred',
     voice: 'settings_voice',
     roles: 'settings_roles',
@@ -42,7 +44,7 @@ export const SETTINGS_SELECT_IDS = {
     rolesNext: 'settings_roles_next',
 } as const;
 
-export type SettingsModalKind = 'volume';
+export type SettingsModalKind = 'volume' | 'crossfade';
 
 type SettingsSelectId = (typeof SETTINGS_SELECT_IDS)[keyof typeof SETTINGS_SELECT_IDS];
 
@@ -59,12 +61,13 @@ export function buildSettingsMessage(settings: GuildSettings): {
 } {
     const locale = settings.locale;
     const lines = [
+        `${locale === 'fr' ? 'Reprise sur confirmation' : 'Recovery on confirmation'}: ${booleanLabel(locale, settings.queueRecoveryEnabled)}`,
         `🔊 ${t(locale, 'settings.volume')}: ${settings.volume}%`,
         `🌐 ${t(locale, 'settings.language')}: ${localeLabel(locale)}`,
         `📌 ${t(locale, 'settings.stayConnected')}: ${booleanLabel(locale, settings.stayConnected)}`,
         `🔗 ${t(locale, 'settings.alwaysConnected')}: ${booleanLabel(locale, settings.stayConnectedAlways)}`,
         `⏸️ ${t(locale, 'settings.pauseOnEmpty')}: ${booleanLabel(locale, settings.pauseOnEmptyChannelWhenAlwaysConnected)}`,
-        `⏭️ Transition gapless: ${t(locale, 'settings.value.enabled')}`,
+        `🎚️ ${t(locale, 'settings.crossfade')}: ${settings.crossfadeSeconds > 0 ? `${settings.crossfadeSeconds} s` : t(locale, 'settings.crossfade.off')}`,
         `🎶 SponsorBlock: ${booleanLabel(locale, settings.sponsorBlockEnabled)}`,
         `🎙️ ${t(locale, 'settings.preferredChannel')}: ${settings.preferredVoiceChannel ? `<#${settings.preferredVoiceChannel}>` : t(locale, 'settings.channel.none')}`,
         `🚪 ${t(locale, 'settings.voiceChannels')}: ${formatModeLabel(locale, settings.voiceChannelMode, settings.allowedVoiceChannels.length, settings.blockedVoiceChannels.length)}`,
@@ -107,10 +110,18 @@ export function buildSettingsMessage(settings: GuildSettings): {
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.roles)
             .setEmoji('👥')
-            .setStyle(modeButtonStyle(settings.rolePermissionMode))
+            .setStyle(modeButtonStyle(settings.rolePermissionMode)),
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.crossfade)
+            .setEmoji('🎚️')
+            .setStyle(settings.crossfadeSeconds > 0 ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
 
     const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(SETTINGS_BUTTON_IDS.recovery)
+            .setLabel(locale === 'fr' ? 'Reprise' : 'Recovery')
+            .setStyle(settings.queueRecoveryEnabled ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder()
             .setCustomId(SETTINGS_BUTTON_IDS.pauseOnEmpty)
             .setEmoji('⏸️')
@@ -132,13 +143,14 @@ export function buildSettingsModal(
     const locale = settings.locale;
     const modal = new ModalBuilder().setCustomId(`${MODAL_PREFIX}:${kind}:${messageId}`);
 
-    modal.setTitle(t(locale, 'settings.volumeModalTitle'));
+    const isCrossfade = kind === 'crossfade';
+    modal.setTitle(t(locale, isCrossfade ? 'settings.crossfadeModalTitle' : 'settings.volumeModalTitle'));
     const input = new TextInputBuilder()
         .setCustomId('value')
-        .setLabel(t(locale, 'settings.volumeModalLabel'))
+        .setLabel(t(locale, isCrossfade ? 'settings.crossfadeModalLabel' : 'settings.volumeModalLabel'))
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
-        .setValue(String(settings.volume));
+        .setValue(String(isCrossfade ? settings.crossfadeSeconds : settings.volume));
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
     return modal;
 }
@@ -162,7 +174,7 @@ export function parseSettingsModalId(customId: string): { kind: SettingsModalKin
     const kind = parts[1] as SettingsModalKind;
     const messageId = parts[2];
     if (!messageId) return null;
-    if (!['volume'].includes(kind)) return null;
+    if (!['volume', 'crossfade'].includes(kind)) return null;
     return { kind, messageId };
 }
 

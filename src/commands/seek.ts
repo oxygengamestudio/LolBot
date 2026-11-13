@@ -1,14 +1,7 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, GuildMember } from 'discord.js';
 import { queueManager } from '../services/QueueManager.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
-import {
-    ensureCanUseBot,
-    ensureSameVoiceChannel,
-    ensureVoiceMembership,
-    getInteractionLocale,
-    replyEphemeral,
-    scheduleDeleteReply,
-} from '../utils/commandHelpers.js';
+import { ensureCanUseBot, ensureCanControlPlayback, getInteractionLocale, replyEphemeral, scheduleDeleteReply } from '../utils/commandHelpers.js';
 
 export const data = new SlashCommandBuilder()
     .setName('seek')
@@ -35,9 +28,6 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     if (!(await ensureCanUseBot(interaction, member))) {
         return;
     }
-    if (!(await ensureVoiceMembership(interaction, member))) {
-        return;
-    }
 
     const seconds = interaction.options.getInteger('seconds', true);
     const guildId = interaction.guildId!;
@@ -47,12 +37,13 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         await replyEphemeral(interaction, `❌ ${t(locale, 'error.noTrack')}`);
         return;
     }
-    if (!(await ensureSameVoiceChannel(interaction, member, queue.voiceChannel.id))) {
-        return;
-    }
 
     if (!Number.isFinite(queue.currentTrack.duration) || queue.currentTrack.duration <= 0) {
         await replyEphemeral(interaction, `❌ ${t(locale, 'seek.unavailable')}`);
+        return;
+    }
+
+    if (!(await ensureCanControlPlayback(interaction, member, queue.voiceChannel.id))) {
         return;
     }
 

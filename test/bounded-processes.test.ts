@@ -51,7 +51,9 @@ test('a stuck yt-dlp receives SIGTERM and is force-killed after the grace period
         assert.equal(await manager.runYtdlpText(['-e', script]), null);
         const childPid = Number(await readFile(pidPath, 'utf8'));
         assert.equal(await processExists(childPid), false);
-        assert.ok(Date.now() - startedAt >= 2_150, 'le permit reste détenu jusqu’au SIGKILL effectif');
+        // Windows terminates the process immediately on SIGTERM; POSIX honors the handler.
+        assert.ok(Date.now() - startedAt >= (process.platform === 'win32' ? 300 : 2_150),
+            'le permit reste détenu jusqu’à la terminaison effective');
         assert.ok(Date.now() - startedAt < 4_500, 'l’arrêt forcé reste borné');
     } finally {
         config.audio.ytDlpTimeoutMs = originalTimeout;

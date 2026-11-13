@@ -1,5 +1,5 @@
-import http from 'http';
-import https from 'https';
+import { BoundedTtlCache } from '../utils/BoundedTtlCache.js';
+import { httpRequest } from '../utils/httpClient.js';
 import { logger } from '../utils/Logger.js';
 
 const log = logger.createModuleLogger('SponsorBlock');
@@ -20,27 +20,25 @@ export class SponsorBlockService {
         'https://api.sponsor.ajay.app/api/skipSegments',
         'https://sponsor.ajay.app/api/skipSegments',
     ];
-    private cache: Map<string, { segments: Segment[]; fetchedAt: number }> = new Map();
-    private readonly cacheTtlMs = 30 * 60 * 1000;
+    private cache = new BoundedTtlCache<string, Segment[]>(500, 30 * 60 * 1000);
+    private pending = new Map<string, Promise<Segment[]>>();
     private readonly requestTimeoutMs = 10_000;
 
     async getSegments(videoId: string, enabled: boolean): Promise<Segment[]> {
-        if (!enabled) {
+        if (!enabled || !/^[\w-]{11}$/.test(videoId)) {
             return [];
         }
 
         const cached = this.cache.get(videoId);
-        if (cached && Date.now() - cached.fetchedAt < this.cacheTtlMs) {
-            return cached.segments;
-        }
-
-        const segments = await this.fetchSegments(videoId);
-        this.cache.set(videoId, {
-            segments,
-            fetchedAt: Date.now(),
-        });
-
-        return segments;
+        if (cached) return cached;
+        if (this.pending.has(videoId)) return this.pending.get(videoId)!;
+        if (this.pending.size >= 8) return [];
+        const promise = this.fetchSegments(videoId).then(segments => {
+            this.cache.set(videoId, segments);
+            return segments;
+        }).finally(() => this.pending.delete(videoId));
+        this.pending.set(videoId, promise);
+        return promise;
     }
 
     private async fetchSegments(videoId: string): Promise<Segment[]> {
@@ -76,7 +74,7 @@ export class SponsorBlockService {
 
                         const start = Number(segment[0]);
                         const end = Number(segment[1]);
-                        if (start < end && Number.isFinite(start) && Number.isFinite(end)) {
+                        if (start >= 0 && start < end && Number.isFinite(start) && Number.isFinite(end)) {
                             return { start, end };
                         }
 
@@ -116,41 +114,11 @@ export class SponsorBlockService {
         return true;
     }
 
-    private requestText(url: string): Promise<string | null> {
-        return new Promise((resolve) => {
-            const parsed = new URL(url);
-            const protocol = parsed.protocol === 'https:' ? https : http;
-            const request = protocol.get(
-                {
-                    protocol: parsed.protocol,
-                    hostname: parsed.hostname,
-                    path: `${parsed.pathname}${parsed.search}`,
-                    headers: {
-                        'User-Agent': 'LolBot SponsorBlockClient',
-                    },
-                },
-                (response) => {
-                    if (response.statusCode !== 200) {
-                        response.resume();
-                        resolve(null);
-                        return;
-                    }
-
-                    let data = '';
-                    response.setEncoding('utf8');
-                    response.on('data', (chunk) => {
-                        data += chunk;
-                    });
-                    response.on('end', () => resolve(data));
-                }
-            );
-
-            request.on('error', () => resolve(null));
-            request.setTimeout(this.requestTimeoutMs, () => {
-                request.destroy();
-                resolve(null);
-            });
-        });
+    private async requestText(url: string): Promise<string | null> {
+        const response = await httpRequest({ url, allowedDomains: ['api.sponsor.ajay.app', 'sponsor.ajay.app'],
+            timeoutMs: this.requestTimeoutMs, maxBytes: 512 * 1024, maxRedirects: 1,
+            headers: { 'User-Agent': 'LolBot SponsorBlockClient' } });
+        return String(response.body);
     }
 }
 

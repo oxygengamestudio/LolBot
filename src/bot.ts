@@ -20,8 +20,9 @@ import { config } from './config.js';
 import { commands } from './commands/index.js';
 import { queueManager } from './services/QueueManager.js';
 import { nowPlayingManager } from './services/NowPlayingManager.js';
+import { queueRecoveryManager } from './services/QueueRecoveryManager.js';
 import { queueViewManager } from './services/QueueViewManager.js';
-import { guildSettingsManager } from './services/GuildSettingsManager.js';
+import { guildSettingsManager, MAX_CROSSFADE_SECONDS } from './services/GuildSettingsManager.js';
 import { handleLyricsDelete } from './utils/lyrics.js';
 import { canJoinVoiceChannel, canManageSettings } from './utils/permissions.js';
 import {
@@ -48,7 +49,7 @@ import { resolveLocale, t } from './utils/i18n.js';
 import { safeContent } from './utils/text.js';
 import fs from 'fs';
 import { join } from 'path';
-import { handlePlaylistChoice, handleSelection as handlePlaySelection } from './commands/play.js';
+import { handlePlaylistChoice } from './commands/play.js';
 import type { StageChannel, VoiceChannel } from 'discord.js';
 import type { CommandDefinition, GuildSettings, RolePermissionMode, VoiceChannelMode } from './types/index.js';
 
@@ -298,6 +299,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     // Enregistrer les commandes au démarrage
     await registerCommands();
+    await queueRecoveryManager.start(client);
 
     // Définir le status initial
     updateIdleStatus();
@@ -317,6 +319,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
 // Événement: Interaction (commandes slash, boutons, autocomplete)
 client.on(Events.InteractionCreate, async (interaction) => {
+    if (isShuttingDown) return;
     log.trace(`Interaction reçue: ${interaction.type}`);
 
     try {
@@ -330,13 +333,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return;
         }
 
-        if (interaction.isStringSelectMenu() && interaction.customId.startsWith('play_select:')) {
-            await handlePlaySelection(interaction);
-            return;
-        }
 
         if (interaction.isButton() && interaction.customId.startsWith('play_playlist:')) {
             await handlePlaylistChoice(interaction);
+            return;
+        }
+
+        if (interaction.isButton() && interaction.customId.startsWith('recovery:')) {
+            await queueRecoveryManager.handleButton(interaction);
             return;
         }
 
@@ -656,11 +660,25 @@ async function handleSettingsButton(interaction: ButtonInteraction): Promise<voi
             await interaction.update(buildSettingsMessage(updated));
             return;
         }
+        case SETTINGS_BUTTON_IDS.crossfade: {
+            if (interaction.message?.id) {
+                await interaction.showModal(buildSettingsModal('crossfade', settings, interaction.message.id));
+            }
+            return;
+        }
         case SETTINGS_BUTTON_IDS.sponsor: {
             const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
                 sponsorBlockEnabled: !settings.sponsorBlockEnabled,
             });
             await interaction.update(buildSettingsMessage(updated));
+            return;
+        }
+        case SETTINGS_BUTTON_IDS.recovery: {
+            const updated = await guildSettingsManager.updateSettings(interaction.guildId, {
+                queueRecoveryEnabled: !settings.queueRecoveryEnabled,
+            });
+            await interaction.update(buildSettingsMessage(updated));
+            await queueRecoveryManager.settingsChanged(interaction.guildId);
             return;
         }
         default:
@@ -685,21 +703,29 @@ async function handleSettingsModal(interaction: ModalSubmitInteraction): Promise
     const locale = await resolveLocale(interaction.guildId, interaction.locale);
 
     const parsed = parseSettingsModalId(interaction.customId);
-    if (!parsed || parsed.kind !== 'volume') return;
+    if (!parsed) return;
 
     const raw = interaction.fields.getTextInputValue('value').trim();
-    const value = Number.parseInt(raw, 10);
-    if (!Number.isFinite(value) || value < 0 || value > 200) {
+    const value = /^\d{1,3}$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+    const isCrossfade = parsed.kind === 'crossfade';
+    const maxValue = isCrossfade ? MAX_CROSSFADE_SECONDS : 200;
+    if (!Number.isFinite(value) || value < 0 || value > maxValue) {
         await interaction.reply({
-            content: `❌ ${t(locale, 'error.invalidVolume')}`,
+            content: `❌ ${t(locale, isCrossfade ? 'error.invalidCrossfade' : 'error.invalidVolume')}`,
             flags: MessageFlags.Ephemeral,
             allowedMentions: { parse: [] },
         });
         return;
     }
 
-    const updated = await guildSettingsManager.updateSettings(interaction.guildId, { volume: value });
-    queueManager.setVolume(interaction.guildId, value);
+    // Le fondu s'applique à partir de la prochaine piste : la lecture en cours n'est pas interrompue.
+    const updated = await guildSettingsManager.updateSettings(
+        interaction.guildId,
+        isCrossfade ? { crossfadeSeconds: value } : { volume: value }
+    );
+    if (!isCrossfade) {
+        queueManager.setVolume(interaction.guildId, value);
+    }
     await updateSettingsMessage(interaction, parsed.messageId, updated);
     await interaction.reply({
         content: `✅ ${t(updated.locale, 'common.updated')}`,
@@ -1142,6 +1168,11 @@ async function gracefulShutdown(reason: NodeJS.Signals | 'unhandledRejection' | 
     }
     settingsPromptStates.clear();
     settingsPromptByUser.clear();
+
+    await queueRecoveryManager.shutdown().catch(error => {
+        log.error('Queue recovery flush failed:', error);
+        exitCode = exitCode || 1;
+    });
 
     const guildIds = Array.from(queueManager.getAllQueues().keys());
     for (const guildId of guildIds) {

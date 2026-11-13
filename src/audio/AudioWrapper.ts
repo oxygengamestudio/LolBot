@@ -12,37 +12,20 @@ import { logger } from '../utils/Logger.js';
 import { sanitizeUrlForLogs } from '../utils/networkSafety.js';
 import { mediaCacheManager } from './MediaCacheManager.js';
 import { sponsorBlockService } from './SponsorBlockService.js';
+import { BoundedTtlCache } from '../utils/BoundedTtlCache.js';
+import { CrossfadeMixer, PcmDeck, PCM_BYTES_PER_SECOND } from './CrossfadeMixer.js';
 import { runtimeTelemetry } from '../services/RuntimeTelemetry.js';
+import {
+    PROCESS_KILL_GRACE_MS,
+    getSafeChildEnv,
+    getYtdlpRuntimeArgs,
+    hasYtdlpCookieConfig,
+    resolveFfmpegPath,
+    resolveYtdlpPath,
+    terminateChildProcess,
+} from '../utils/mediaProcess.js';
 
 const log = logger.createModuleLogger('AudioWrapper');
-
-const SAFE_CHILD_ENV_KEYS = [
-    'APPDATA',
-    'ComSpec',
-    'HOME',
-    'HTTP_PROXY',
-    'HTTPS_PROXY',
-    'LANG',
-    'LC_ALL',
-    'LC_CTYPE',
-    'LOCALAPPDATA',
-    'NODE_EXTRA_CA_CERTS',
-    'NO_PROXY',
-    'PATH',
-    'PATHEXT',
-    'SSL_CERT_DIR',
-    'SSL_CERT_FILE',
-    'SystemRoot',
-    'TZ',
-    'USERPROFILE',
-    'WINDIR',
-    'XDG_CACHE_HOME',
-    'XDG_CONFIG_HOME',
-    'XDG_RUNTIME_DIR',
-    'http_proxy',
-    'https_proxy',
-    'no_proxy',
-] as const;
 
 const REDACTED_YTDLP_FLAGS = new Set([
     '--add-header',
@@ -74,6 +57,13 @@ interface ResourceMetadata {
     fullyClosed?: Promise<void>;
     createdAt: number;
     startSeconds: number;
+    sourceMode?: 'direct-ffmpeg' | 'native-opus' | 'ytdlp';
+    outputBytes?: number;
+    pipelineCloseReason?: string;
+    processExitCode?: number | null;
+    failureCategory?: string;
+    /** Présent quand la ressource peut enchaîner la piste suivante en fondu. */
+    mixer?: CrossfadeMixer;
 }
 
 interface WarmResourceEntry {
@@ -94,7 +84,8 @@ interface SponsorSegment {
 
 export class AudioWrapper extends EventEmitter {
     private cache: Map<string, CacheEntry> = new Map();
-    private bitrateCache: Map<string, { bitrate: number | null; timestamp: number }> = new Map();
+    private bitrateCache = new BoundedTtlCache<string, number | null>(500, 60 * 60 * 1000);
+    private bitratePending = new Map<string, Promise<number | null>>();
     private preloadingGuilds: Set<string> = new Set();
     private ffmpegPath: string = 'ffmpeg';
     private ytdlpPath: string = 'yt-dlp';
@@ -112,12 +103,21 @@ export class AudioWrapper extends EventEmitter {
     private readonly discordOpusBitrateKbps = 96;
     private readonly streamReadyWaitMs = 1_000;
     private readonly directStreamReadyWaitMs = 1_000;
+    /** Durée du fondu demandée par guilde ; 0 = pipeline habituel sans mixeur. */
+    private crossfadeSecondsByGuild: Map<string, number> = new Map();
+    /** Avance lue en plus du fondu : le temps de lancer la source de la piste suivante. */
+    private readonly crossfadePrepareSeconds = 4;
+    /**
+     * Attente maximale d'une résolution d'URL déjà en vol avant de basculer sur le
+     * streaming yt-dlp. Ce repli relance la même extraction depuis zéro : tant que
+     * le préchauffage aboutit, l'attendre est toujours plus rapide que l'abandonner.
+     */
+    private readonly warmUrlWaitMs = 5_000;
+    private readonly preferredWarmUrlWaitMs = 8_000;
     private readonly maxProcessOutputBytes = 64 * 1024;
     private readonly maxMetadataOutputBytes = 2 * 1024 * 1024;
-    private readonly processKillGraceMs = 2_000;
+    private readonly processKillGraceMs = PROCESS_KILL_GRACE_MS;
     private readonly warmResourceTtlMs = 90_000;
-    private readonly bitrateCacheTtlMs = 60 * 60 * 1000;
-    private warnedUnsafeYtdlpExtraArgsIgnored = false;
 
     constructor() {
         super();
@@ -132,19 +132,8 @@ export class AudioWrapper extends EventEmitter {
      * Vérifie que FFmpeg et yt-dlp sont disponibles
      */
     private async checkDependencies(): Promise<boolean> {
-        const envFfmpeg = process.env.FFMPEG_PATH;
-        const envYtdlp = process.env.YTDLP_PATH;
-
-        if (envFfmpeg) {
-            this.ffmpegPath = envFfmpeg;
-        }
-
-        const localYtdlpPath = this.getLocalYtdlpPath();
-        if (envYtdlp) {
-            this.ytdlpPath = envYtdlp;
-        } else if (existsSync(localYtdlpPath)) {
-            this.ytdlpPath = localYtdlpPath;
-        }
+        this.ffmpegPath = resolveFfmpegPath();
+        this.ytdlpPath = resolveYtdlpPath();
 
         this.ffmpegAvailable = await this.checkBinary('FFmpeg', this.ffmpegPath, ['-version']);
         this.ytdlpAvailable = await this.checkBinary('yt-dlp', this.ytdlpPath, ['--version']);
@@ -158,11 +147,6 @@ export class AudioWrapper extends EventEmitter {
         }
 
         return this.ffmpegAvailable && this.ytdlpAvailable;
-    }
-
-    private getLocalYtdlpPath(): string {
-        const fileName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
-        return join(config.paths.data, 'bin', fileName);
     }
 
     private async checkBinary(label: string, binaryPath: string, args: string[]): Promise<boolean> {
@@ -225,13 +209,6 @@ export class AudioWrapper extends EventEmitter {
         });
     }
 
-    private parseExtraArgs(rawArgs: string | undefined): string[] {
-        if (!rawArgs) return [];
-        const matches = rawArgs.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
-        if (!matches) return [];
-        return matches.map((arg) => arg.replace(/^['"]|['"]$/g, ''));
-    }
-
     private getScopedTrackKey(guildId: string, trackId: string): string {
         return `${guildId}:${trackId}`;
     }
@@ -257,43 +234,26 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private getSpawnEnv(tempDir: string = config.paths.cache): NodeJS.ProcessEnv {
-        const safeEnv: NodeJS.ProcessEnv = {};
-
-        for (const key of SAFE_CHILD_ENV_KEYS) {
-            const value = process.env[key];
-            if (value) {
-                safeEnv[key] = value;
-            }
-        }
-
-        safeEnv.TMPDIR = tempDir;
-        safeEnv.TMP = tempDir;
-        safeEnv.TEMP = tempDir;
-        safeEnv.TEMPDIR = tempDir;
-
-        return safeEnv;
+        return getSafeChildEnv(tempDir);
     }
 
-    private terminateProcess(child: ChildProcess): void {
+    private terminateProcess(child: ChildProcess, drainAfterAudioEnd = false): void {
         if (child.exitCode !== null || child.signalCode !== null) {
             return;
         }
-        try {
-            child.kill('SIGTERM');
-        } catch {
+        if (drainAfterAudioEnd) {
+            // stdout and stderr are independent pipes: audio EOF can precede the
+            // final error. Give the child a short, bounded chance to flush/exit.
+            const drainTimer = setTimeout(() => {
+                child.removeListener('close', onClose);
+                this.terminateProcess(child);
+            }, 250);
+            const onClose = () => clearTimeout(drainTimer);
+            drainTimer.unref?.();
+            child.once('close', onClose);
             return;
         }
-        const forceKill = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-                try {
-                    child.kill('SIGKILL');
-                } catch {
-                    // Le processus est déjà fermé.
-                }
-            }
-        }, this.processKillGraceMs);
-        forceKill.unref?.();
-        child.once('close', () => clearTimeout(forceKill));
+        terminateChildProcess(child, this.processKillGraceMs);
     }
 
     private appendBoundedOutput(current: string, chunk: Buffer | string): string {
@@ -371,53 +331,11 @@ export class AudioWrapper extends EventEmitter {
     }
 
     private hasCookieEnv(): boolean {
-        if (process.env.YTDLP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES) {
-            return true;
-        }
-        const extraArgs = this.getUnsafeYtdlpExtraArgs();
-        return extraArgs.some((arg) =>
-            arg === '--cookies' ||
-            arg === '--cookies-from-browser' ||
-            arg.startsWith('--cookies=') ||
-            arg.startsWith('--cookies-from-browser=')
-        );
+        return hasYtdlpCookieConfig();
     }
 
     private getYtdlpExtraArgs(includeCookies: boolean = true): string[] {
-        const args: string[] = [];
-        const cookiesFromBrowser = includeCookies ? process.env.YTDLP_COOKIES_FROM_BROWSER : undefined;
-        const cookies = includeCookies ? process.env.YTDLP_COOKIES : undefined;
-        const extraArgs = this.getUnsafeYtdlpExtraArgs();
-
-        if (cookiesFromBrowser) {
-            args.push('--cookies-from-browser', cookiesFromBrowser);
-        } else if (cookies) {
-            args.push('--cookies', cookies);
-        }
-
-        if (extraArgs.length > 0) {
-            args.push(...extraArgs);
-        }
-
-        return args;
-    }
-
-    private getUnsafeYtdlpExtraArgs(): string[] {
-        const extraArgs = this.parseExtraArgs(process.env.YTDLP_EXTRA_ARGS);
-        if (extraArgs.length === 0) {
-            return [];
-        }
-
-        if (config.audio.allowUnsafeYtdlpExtraArgs) {
-            return extraArgs;
-        }
-
-        if (!this.warnedUnsafeYtdlpExtraArgsIgnored) {
-            this.warnedUnsafeYtdlpExtraArgsIgnored = true;
-            log.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only if you fully trust the server environment.');
-        }
-
-        return [];
+        return getYtdlpRuntimeArgs(includeCookies);
     }
 
     private sanitizeYtdlpArgsForLogs(args: string[]): string {
@@ -441,7 +359,8 @@ export class AudioWrapper extends EventEmitter {
                 continue;
             }
 
-            sanitized.push(arg);
+            // Signed media URLs and arbitrary extra-argument URLs may carry credentials.
+            sanitized.push(arg.replace(/https?:\/\/\S+/gi, '[url redacted]'));
         }
 
         return sanitized.join(' ');
@@ -450,6 +369,21 @@ export class AudioWrapper extends EventEmitter {
     private isCookieCopyError(stderr: string): boolean {
         const lower = stderr.toLowerCase();
         return lower.includes('could not copy') && lower.includes('cookie');
+    }
+
+    private classifyMediaFailure(stderr: string): string {
+        const lower = stderr.toLowerCase();
+        if (this.isCookieCopyError(stderr)) return 'cookie_access_failed';
+        if (this.isAuthenticationRequiredError(stderr)) return 'authentication_required';
+        const httpStatus = lower.match(/(?:http(?: error)?|server returned|status(?: code)?)\s*[:=]?\s*(4\d\d|5\d\d)\b/);
+        if (httpStatus) return `http_${httpStatus[1]}`;
+        if (lower.includes('forbidden')) return 'http_403';
+        if (/timed? out|timeout/.test(lower)) return 'timeout';
+        if (/connection reset|connection refused|network is unreachable|name or service not known|resolve host/.test(lower)) return 'network_failed';
+        if (/certificate|tls|ssl/.test(lower)) return 'tls_failed';
+        if (/invalid data|invalid media|could not find codec|moov atom|end of file|no audio|does not contain any stream/.test(lower)) return 'invalid_media';
+        if (/unavailable|not available|has been removed|private video|geo.restrict/.test(lower)) return 'media_unavailable';
+        return stderr.trim() ? 'unclassified_error' : 'no_error_detail';
     }
 
     private isAuthenticationRequiredError(stderr: string): boolean {
@@ -503,22 +437,39 @@ export class AudioWrapper extends EventEmitter {
             const cleanup = () => {
                 if (stream) {
                     stream.removeListener('readable', onReady);
+                    stream.removeListener('end', onFfmpegClose);
+                    stream.removeListener('close', onFfmpegClose);
+                    stream.removeListener('error', onFfmpegClose);
                 }
                 ytdlp.removeListener('close', onYtdlpClose);
                 ffmpeg.removeListener('close', onFfmpegClose);
             };
 
             const onReady = () => {
+                if ((stream as Readable | undefined)?.destroyed) {
+                    onFfmpegClose();
+                    return;
+                }
+                if (!(stream as Readable | undefined)?.readableLength) {
+                    (stream as Readable | undefined)?.read?.(0); // Let EOF emit 'end' without consuming audio.
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('ready');
             };
-            const onYtdlpClose = () => {
+            const onYtdlpClose = (code: number | null) => {
+                // A successful producer can finish while FFmpeg still drains its input.
+                if (code === 0) return;
                 clearTimeout(timer);
                 cleanup();
                 finish('ytdlp-close');
             };
             const onFfmpegClose = () => {
+                if ((stream as Readable | undefined)?.readableLength && !(stream as Readable).destroyed) {
+                    onReady();
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('ffmpeg-close');
@@ -529,13 +480,18 @@ export class AudioWrapper extends EventEmitter {
                 finish('timeout');
             }, timeoutMs);
 
-            if (stream && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
+            if (stream && !(stream as Readable).destroyed && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
                 queueMicrotask(onReady);
                 return;
             }
 
             if (stream) {
-                stream.once('readable', onReady);
+                stream.on('readable', onReady);
+                stream.once('end', onFfmpegClose);
+                stream.once('close', onFfmpegClose);
+                stream.once('error', onFfmpegClose);
+                if ((stream as Readable).readableEnded || (stream as Readable).destroyed) queueMicrotask(onFfmpegClose);
+                else (stream as Readable).read?.(0);
             }
             ytdlp.once('close', onYtdlpClose);
             ffmpeg.once('close', onFfmpegClose);
@@ -551,9 +507,11 @@ export class AudioWrapper extends EventEmitter {
         track: Track,
         startSeconds: number = 0,
         sponsorBlockEnabled = false,
-        targetVolume = 100
+        targetVolume = 100,
+        crossfadeSeconds = 0
     ): Promise<AudioResource | null> {
         log.debug(`Création de ressource pour: ${track.title}`);
+        this.crossfadeSecondsByGuild.set(guildId, Math.max(0, crossfadeSeconds));
         log.trace('Track ID:', track.id);
 
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
@@ -618,7 +576,11 @@ export class AudioWrapper extends EventEmitter {
             }
 
             const shouldPreferDirectUrl = track.sourceType === 'url' || effectiveStartSeconds > startSeconds + 3;
-            const warmDirectUrl = await this.waitForWarmDirectUrl(guildId, track, shouldPreferDirectUrl ? 8_000 : 1_500);
+            const warmDirectUrl = await this.waitForWarmDirectUrl(
+                guildId,
+                track,
+                shouldPreferDirectUrl ? this.preferredWarmUrlWaitMs : this.warmUrlWaitMs
+            );
             if (warmDirectUrl) {
                 const directResource = await this.createResourceWithDirectUrl(
                     guildId,
@@ -805,18 +767,25 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const infoEstimate = this.bitrateCache.get(track.url);
-        if (infoEstimate && Date.now() - infoEstimate.timestamp < this.bitrateCacheTtlMs) {
-            return infoEstimate.bitrate;
-        }
+        return infoEstimate ?? null;
+    }
 
-        return null;
+    getDiagnostics() {
+        return { ffmpeg: this.ffmpegAvailable, ytdlp: this.ytdlpAvailable,
+            bitrateEntries: this.bitrateCache.size, warmups: this.warmupInFlight.size };
     }
 
     async getBestAudioBitrateKbps(url: string, guildId: string = 'global'): Promise<number | null> {
         const cached = this.bitrateCache.get(url);
-        if (cached && Date.now() - cached.timestamp < this.bitrateCacheTtlMs) {
-            return cached.bitrate;
-        }
+        if (cached !== undefined) return cached;
+        if (this.bitratePending.has(url)) return this.bitratePending.get(url)!;
+        if (this.bitratePending.size >= 4) return null;
+        const pending = this.lookupAudioBitrate(url, guildId).finally(() => this.bitratePending.delete(url));
+        this.bitratePending.set(url, pending);
+        return pending;
+    }
+
+    private async lookupAudioBitrate(url: string, guildId: string): Promise<number | null> {
 
         const dependenciesOk = await (this.dependenciesReady ?? this.checkDependencies());
         if (!dependenciesOk) {
@@ -827,7 +796,7 @@ export class AudioWrapper extends EventEmitter {
         const primary = await this.fetchYtdlpInfo(guildId, url, includeCookies);
         if (primary.info) {
             const bitrate = this.extractAudioBitrateKbps(primary.info);
-            this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+            this.bitrateCache.set(url, bitrate);
             return bitrate;
         }
 
@@ -835,12 +804,12 @@ export class AudioWrapper extends EventEmitter {
             const fallback = await this.fetchYtdlpInfo(guildId, url, false);
             if (fallback.info) {
                 const bitrate = this.extractAudioBitrateKbps(fallback.info);
-                this.bitrateCache.set(url, { bitrate, timestamp: Date.now() });
+                this.bitrateCache.set(url, bitrate);
                 return bitrate;
             }
         }
 
-        this.bitrateCache.set(url, { bitrate: null, timestamp: Date.now() });
+        this.bitrateCache.set(url, null);
         return null;
     }
 
@@ -983,7 +952,7 @@ export class AudioWrapper extends EventEmitter {
             }
 
             const host = parsed.hostname.toLowerCase();
-            if (host.includes('googlevideo.com')) {
+            if (host === 'googlevideo.com' || host.endsWith('.googlevideo.com')) {
                 return true;
             }
             if (host === 'sndcdn.com' || host.endsWith('.sndcdn.com')) {
@@ -1018,16 +987,31 @@ export class AudioWrapper extends EventEmitter {
             const cleanup = () => {
                 if (stream) {
                     stream.removeListener('readable', onReady);
+                    stream.removeListener('end', onClose);
+                    stream.removeListener('close', onClose);
+                    stream.removeListener('error', onClose);
                 }
                 processRef.removeListener('close', onClose);
             };
 
             const onReady = () => {
+                if ((stream as Readable | undefined)?.destroyed) {
+                    onClose();
+                    return;
+                }
+                if (!(stream as Readable | undefined)?.readableLength) {
+                    (stream as Readable | undefined)?.read?.(0);
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('ready');
             };
             const onClose = () => {
+                if ((stream as Readable | undefined)?.readableLength && !(stream as Readable).destroyed) {
+                    onReady();
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('close');
@@ -1038,13 +1022,18 @@ export class AudioWrapper extends EventEmitter {
                 finish('timeout');
             }, timeoutMs);
 
-            if (stream && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
+            if (stream && !(stream as Readable).destroyed && typeof (stream as Readable).readableLength === 'number' && (stream as Readable).readableLength > 0) {
                 queueMicrotask(onReady);
                 return;
             }
 
             if (stream) {
-                stream.once('readable', onReady);
+                stream.on('readable', onReady);
+                stream.once('end', onClose);
+                stream.once('close', onClose);
+                stream.once('error', onClose);
+                if ((stream as Readable).readableEnded || (stream as Readable).destroyed) queueMicrotask(onClose);
+                else (stream as Readable).read?.(0);
             }
             processRef.once('close', onClose);
         });
@@ -1059,7 +1048,11 @@ export class AudioWrapper extends EventEmitter {
         targetVolume = 100
     ): Promise<AudioResource | null> {
         const filters = this.buildAudioFilters(startSeconds, sponsorSegments);
-        const nativeOpusType = this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
+        const crossfadeSeconds = this.crossfadeSecondsByGuild.get(guildId) ?? 0;
+        // Un fondu se mixe en PCM : le passe-plat Opus est réservé au pipeline sans fondu.
+        const nativeOpusType = crossfadeSeconds > 0
+            ? null
+            : this.getNativeOpusStreamType(directUrl, filters, startSeconds, targetVolume);
         if (nativeOpusType) {
             const nativeResource = await this.createNativeOpusResource(track, directUrl, nativeOpusType, startSeconds);
             if (nativeResource) {
@@ -1069,27 +1062,20 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const runDir = await this.createRunDirectory(guildId);
-        const useOpusCopy = this.canCopyDirectOpus(directUrl, filters, startSeconds, targetVolume);
-        const inputReconnectArgs = /^https?:\/\//i.test(directUrl)
-            ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
-            : [];
-        const outputArgs = useOpusCopy
-            ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg']
-            : [
-                ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
-                '-f', 's16le',
-                '-ar', '48000',
-                '-ac', '2',
-            ];
-        const ffmpegArgs = [
-            '-loglevel', 'warning',
-            ...inputReconnectArgs,
-            ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
-            '-i', directUrl,
-            '-vn',
-            ...outputArgs,
-            'pipe:1',
-        ];
+        const useOpusCopy = crossfadeSeconds <= 0 && this.canCopyDirectOpus(directUrl, filters, startSeconds, targetVolume);
+        const metadata: ResourceMetadata = {
+            trackId: track.id,
+            teardown: () => teardown('direct resource teardown requested'),
+            createdAt: Date.now(),
+            startSeconds,
+            sourceMode: 'direct-ffmpeg',
+            outputBytes: 0,
+        };
+        const ffmpegArgs = this.buildDirectFfmpegArgs(
+            directUrl,
+            startSeconds,
+            useOpusCopy ? ['-map', '0:a:0', '-c:a', 'copy', '-f', 'ogg'] : this.buildPcmOutputArgs(filters)
+        );
 
         const ffmpeg = spawn(this.ffmpegPath, ffmpegArgs, {
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -1102,12 +1088,18 @@ export class AudioWrapper extends EventEmitter {
         const fullyClosed = new Promise<void>((resolve) => { markFullyClosed = resolve; });
 
         let tornDown = false;
-        const teardown = (reason: string) => {
+        const teardown = (reason: string, drainAfterAudioEnd = false) => {
             if (tornDown) {
                 return;
             }
             tornDown = true;
-            log.trace(`Teardown direct pipeline: ${reason}`);
+            metadata.pipelineCloseReason = reason;
+            log.debug('Fermeture pipeline FFmpeg direct', {
+                trackId: track.id,
+                reason,
+                elapsedMs: Date.now() - metadata.createdAt,
+                outputBytes: metadata.outputBytes,
+            });
 
             try {
                 ffmpeg.stdout?.destroy();
@@ -1115,13 +1107,9 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            try {
-                ffmpeg.stderr?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            this.terminateProcess(ffmpeg);
+            // Keep the bounded stderr reader alive until process close. Destroying
+            // it here loses diagnostics when Linux delivers stdout EOF first.
+            this.terminateProcess(ffmpeg, drainAfterAudioEnd);
             void this.cleanupRunDirectory(runDir);
         };
 
@@ -1130,15 +1118,30 @@ export class AudioWrapper extends EventEmitter {
             ffmpegErrors = this.appendBoundedOutput(ffmpegErrors, data);
         });
 
-        ffmpeg.on('error', () => {
+        ffmpeg.on('error', (error: NodeJS.ErrnoException) => {
             markFullyClosed();
+            metadata.failureCategory = 'process_start_failed';
+            log.warn('Echec du processus FFmpeg direct', {
+                trackId: track.id,
+                category: metadata.failureCategory,
+                code: /^[A-Z0-9_]+$/.test(error.code ?? '') ? error.code : 'unknown',
+            });
             teardown('ffmpeg process error (direct)');
         });
 
-        ffmpeg.on('close', (code) => {
+        ffmpeg.on('close', (code, signal) => {
             markFullyClosed();
-            if (code !== 0 && code !== null) {
-                log.trace(`FFmpeg direct fermé avec code ${code}`);
+            metadata.processExitCode = code;
+            if (code !== 0 && code !== null && metadata.pipelineCloseReason !== 'direct resource teardown requested') {
+                metadata.failureCategory = this.classifyMediaFailure(ffmpegErrors);
+                log.warn('FFmpeg direct termine en erreur', {
+                    trackId: track.id,
+                    code,
+                    signal,
+                    category: metadata.failureCategory,
+                    outputBytes: metadata.outputBytes,
+                    closeReason: metadata.pipelineCloseReason ?? 'process_exit',
+                });
             }
             teardown(`ffmpeg direct closed (${code ?? 'null'})`);
         });
@@ -1149,32 +1152,27 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const stdout = ffmpeg.stdout as Readable;
+        stdout.on('data', (data: Buffer) => {
+            // These are PCM/Ogg output bytes, not network traffic: do not inflate mediaKbps.
+            metadata.outputBytes! += data.length;
+        });
         stdout.once('close', () => teardown('direct audio stream closed'));
-        stdout.once('end', () => teardown('direct audio stream ended'));
+        stdout.once('end', () => teardown('direct audio stream ended', true));
         stdout.once('error', () => teardown('direct audio stream error'));
 
-        const resource = createAudioResource<ResourceMetadata>(stdout, {
+        const resource = createAudioResource<ResourceMetadata>(this.withCrossfade(stdout, metadata, crossfadeSeconds), {
             inputType: useOpusCopy ? StreamType.OggOpus : StreamType.Raw,
             inlineVolume: !useOpusCopy,
-            metadata: {
-                trackId: track.id,
-                teardown: () => teardown('direct resource teardown requested'),
-                fullyClosed,
-                createdAt: Date.now(),
-                startSeconds,
-            },
+            metadata: Object.assign(metadata, { fullyClosed }),
         });
 
         if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const ready = await this.waitForProcessStreamReady(stdout, ffmpeg, this.directStreamReadyWaitMs);
+        const ready = await this.waitForProcessStreamReady(resource.playStream, ffmpeg, this.directStreamReadyWaitMs);
         if (ready === 'close') {
             await fullyClosed;
-            if (ffmpegErrors) {
-                log.trace('FFmpeg direct errors:', ffmpegErrors.slice(-500));
-            }
             return null;
         }
         if (ready === 'timeout') {
@@ -1184,6 +1182,181 @@ export class AudioWrapper extends EventEmitter {
         return resource;
     }
 
+    private buildPcmOutputArgs(filters: string[]): string[] {
+        return [
+            ...(filters.length > 0 ? ['-af', filters.join(',')] : []),
+            '-f', 's16le',
+            '-ar', '48000',
+            '-ac', '2',
+        ];
+    }
+
+    private buildDirectFfmpegArgs(input: string, startSeconds: number, outputArgs: string[]): string[] {
+        const inputReconnectArgs = /^https?:\/\//i.test(input)
+            ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
+            : [];
+        return [
+            '-loglevel', 'warning',
+            ...inputReconnectArgs,
+            ...(startSeconds > 0 ? ['-ss', startSeconds.toString()] : []),
+            '-i', input,
+            '-vn',
+            ...outputArgs,
+            'pipe:1',
+        ];
+    }
+
+    /**
+     * En mode fondu, place un mixeur entre FFmpeg et l'encodeur. Il se comporte
+     * comme un simple passe-plat tant qu'aucune piste suivante ne lui est attachée.
+     */
+    private withCrossfade(stream: Readable, metadata: ResourceMetadata, crossfadeSeconds: number): Readable {
+        if (crossfadeSeconds <= 0) {
+            return stream;
+        }
+        const mixer = new CrossfadeMixer(stream, crossfadeSeconds + this.crossfadePrepareSeconds);
+        const teardownSource = metadata.teardown;
+        metadata.mixer = mixer;
+        // Après un fondu, la source d'origine est déjà fermée : c'est le mixeur qui
+        // détient la source en cours, donc c'est lui qu'il faut détruire.
+        metadata.teardown = () => {
+            mixer.destroy();
+            teardownSource();
+        };
+        return mixer;
+    }
+
+    private getMixer(resource: AudioResource | null | undefined): CrossfadeMixer | null {
+        return (resource?.metadata as Partial<ResourceMetadata> | undefined)?.mixer ?? null;
+    }
+
+    /**
+     * Appelle `onWindow` chaque fois que la fin de la piste en cours devient connue.
+     * Renvoie `false` si cette ressource ne peut pas enchaîner en fondu.
+     */
+    watchCrossfadeWindow(resource: AudioResource, onWindow: () => void): boolean {
+        const mixer = this.getMixer(resource);
+        if (!mixer) {
+            return false;
+        }
+        mixer.on('tail', onWindow);
+        return true;
+    }
+
+    /** La piste en cours approche de sa fin et aucune suite n'est encore attachée. */
+    isCrossfadeWindowOpen(resource: AudioResource): boolean {
+        return this.getMixer(resource)?.awaitingNext ?? false;
+    }
+
+    /** Abandonne une suite préparée dont le fondu n'a pas commencé. */
+    cancelCrossfade(resource: AudioResource): void {
+        this.getMixer(resource)?.detachNext();
+    }
+
+    /**
+     * Prépare la piste suivante et l'attache au mixeur de la ressource en cours.
+     * `accept` est appelé à l'instant où le fondu commence ; à partir de là, la
+     * ressource porte `track`. Renvoie `false` si aucun fondu n'est possible :
+     * la transition habituelle s'applique alors à la fin de la piste.
+     */
+    async crossfadeInto(
+        guildId: string,
+        resource: AudioResource,
+        track: Track,
+        sponsorBlockEnabled: boolean,
+        fadeSeconds: number,
+        accept: () => boolean
+    ): Promise<boolean> {
+        const mixer = this.getMixer(resource);
+        if (!mixer || fadeSeconds <= 0 || track.isLive) {
+            return false;
+        }
+
+        const next = await this.createNextDeck(guildId, track, sponsorBlockEnabled).catch((error) => {
+            log.debug('Préparation du fondu impossible', error);
+            return null;
+        });
+        if (!next) {
+            return false;
+        }
+
+        const metadata = resource.metadata as ResourceMetadata;
+        return mixer.attachNext(next.deck, fadeSeconds, () => {
+            if (!accept()) {
+                return false;
+            }
+            metadata.trackId = track.id;
+            metadata.startSeconds = next.startSeconds;
+            this.lastSourceModeByGuild.set(guildId, 'direct');
+            return true;
+        });
+    }
+
+    /**
+     * Lance le décodage de la piste suivante vers un tampon PCM. Limité aux
+     * sources déjà résolues (fichier en cache ou URL directe préchauffée) : une
+     * extraction yt-dlp à ce stade arriverait après la fin de la piste.
+     */
+    private async createNextDeck(
+        guildId: string,
+        track: Track,
+        sponsorBlockEnabled: boolean
+    ): Promise<{ deck: PcmDeck; startSeconds: number } | null> {
+        const sponsorSegments = await this.getSponsorSegmentsFast(
+            track.id,
+            this.shouldUseSponsorBlock(track, sponsorBlockEnabled)
+        );
+        this.applySponsorAdjustedDuration(track, sponsorSegments);
+        const startSeconds = this.getSponsorAdjustedStart(0, sponsorSegments);
+
+        const lease = await mediaCacheManager.acquireTrackPath(track);
+        const warmUrl = this.cache.get(this.getScopedTrackKey(guildId, track.id))?.streamUrl;
+        const input = lease?.path ?? (warmUrl && this.isLikelyDirectStreamUrl(warmUrl) ? warmUrl : null);
+        if (!input) {
+            return null;
+        }
+
+        const runDir = await this.createRunDirectory(guildId);
+        const ffmpeg = spawn(
+            this.ffmpegPath,
+            this.buildDirectFfmpegArgs(
+                input,
+                startSeconds,
+                this.buildPcmOutputArgs(this.buildAudioFilters(startSeconds, sponsorSegments))
+            ),
+            { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env: this.getSpawnEnv(runDir), cwd: runDir }
+        );
+
+        let released = false;
+        const release = (): void => {
+            if (released) return;
+            released = true;
+            lease?.release();
+            this.terminateProcess(ffmpeg);
+            void this.cleanupRunDirectory(runDir);
+        };
+        ffmpeg.stderr?.resume();
+        ffmpeg.once('error', release);
+        ffmpeg.once('close', release);
+
+        const stdout = ffmpeg.stdout as Readable | null;
+        if (!stdout) {
+            release();
+            return null;
+        }
+        stdout.once('close', release);
+        stdout.once('error', release);
+
+        // Le tampon est branché dans le même tour de boucle que le lancement : aucun octet n'est perdu.
+        const deck = new PcmDeck(stdout, PCM_BYTES_PER_SECOND * 2);
+        if (!(await deck.waitForData(this.directStreamReadyWaitMs * 3))) {
+            deck.destroy();
+            release();
+            return null;
+        }
+        return { deck, startSeconds };
+    }
+
     private async createNativeOpusResource(
         track: Track,
         directUrl: string,
@@ -1191,15 +1364,33 @@ export class AudioWrapper extends EventEmitter {
         startSeconds: number
     ): Promise<AudioResource | null> {
         const controller = new AbortController();
+        const metadata: ResourceMetadata = {
+            trackId: track.id,
+            teardown: () => teardown('native opus resource teardown requested'),
+            createdAt: Date.now(),
+            startSeconds,
+            sourceMode: 'native-opus',
+            outputBytes: 0,
+        };
         let stream: Readable | null = null;
+        let responseStream: Readable | null = null;
         let tornDown = false;
         const teardown = (reason: string) => {
             if (tornDown) {
                 return;
             }
             tornDown = true;
-            log.trace(`Teardown native opus stream: ${reason}`);
+            metadata.pipelineCloseReason = reason;
+            log.debug('Fermeture pipeline Opus natif', {
+                trackId: track.id,
+                reason,
+                elapsedMs: Date.now() - metadata.createdAt,
+                outputBytes: metadata.outputBytes,
+                category: metadata.failureCategory ?? 'none',
+            });
             controller.abort();
+            responseStream?.unpipe();
+            responseStream?.destroy();
             stream?.destroy();
         };
 
@@ -1215,10 +1406,12 @@ export class AudioWrapper extends EventEmitter {
                     },
                 }).finally(() => clearTimeout(connectionTimeout));
                 if (!response.ok || !response.body) {
+                    metadata.failureCategory = `http_${response.status}`;
+                    log.warn('Lecture Opus native refusee', { trackId: track.id, category: metadata.failureCategory });
                     teardown(`native opus http ${response.status}`);
                     return null;
                 }
-                const responseStream = Readable.fromWeb(response.body as any, {
+                responseStream = Readable.fromWeb(response.body as any, {
                     highWaterMark: 4 * 1024 * 1024,
                 });
                 const byteCounter = new Transform({
@@ -1227,27 +1420,38 @@ export class AudioWrapper extends EventEmitter {
                         callback(null, chunk);
                     },
                 });
-                stream = responseStream.pipe(byteCounter);
+                stream = byteCounter;
+                // pipe() does not forward source errors. Keep this listener even
+                // during abort/destroy so a network failure cannot escape to the bot.
+                responseStream.on('error', (error) => {
+                    if (!tornDown) byteCounter.destroy(error);
+                });
+                responseStream.once('close', () => {
+                    if (!tornDown && !responseStream?.readableEnded) {
+                        byteCounter.destroy(new Error('Network stream closed prematurely'));
+                    }
+                });
+                responseStream.pipe(byteCounter);
             } else {
                 stream = createReadStream(directUrl);
             }
 
+            stream.on('data', (data: Buffer) => { metadata.outputBytes! += data.length; });
             stream.once('close', () => teardown('native opus stream closed'));
             stream.once('end', () => teardown('native opus stream ended'));
-            stream.once('error', () => teardown('native opus stream error'));
+            stream.once('error', (error) => {
+                metadata.failureCategory = this.classifyMediaFailure(error.message);
+                log.warn('Erreur du flux Opus natif', { trackId: track.id, category: metadata.failureCategory });
+                teardown('native opus stream error');
+            });
 
             const resource = createAudioResource<ResourceMetadata>(stream, {
                 inputType,
                 inlineVolume: false,
-                metadata: {
-                    trackId: track.id,
-                    teardown: () => teardown('native opus resource teardown requested'),
-                    createdAt: Date.now(),
-                    startSeconds,
-                },
+                metadata,
             });
 
-            const ready = await this.waitForReadableStreamReady(stream, this.directStreamReadyWaitMs);
+            const ready = await this.waitForReadableStreamReady(resource.playStream, this.directStreamReadyWaitMs);
             if (ready === 'close') {
                 return null;
             }
@@ -1257,8 +1461,9 @@ export class AudioWrapper extends EventEmitter {
 
             return resource;
         } catch (error) {
+            metadata.failureCategory = this.classifyMediaFailure((error as Error)?.message ?? 'setup failed');
             teardown('native opus setup failed');
-            log.trace('Lecture native Opus indisponible', error);
+            log.debug('Lecture native Opus indisponible', { trackId: track.id, category: metadata.failureCategory });
             return null;
         }
     }
@@ -1282,11 +1487,23 @@ export class AudioWrapper extends EventEmitter {
             };
 
             const onReady = () => {
+                if (stream.destroyed) {
+                    onClose();
+                    return;
+                }
+                if (stream.readableLength === 0) {
+                    stream.read(0);
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('ready');
             };
             const onClose = () => {
+                if (stream.readableLength > 0 && !stream.destroyed) {
+                    onReady();
+                    return;
+                }
                 clearTimeout(timer);
                 cleanup();
                 finish('close');
@@ -1298,15 +1515,17 @@ export class AudioWrapper extends EventEmitter {
             }, timeoutMs);
             timer.unref?.();
 
-            if (stream.readableLength > 0) {
+            if (stream.readableLength > 0 && !stream.destroyed) {
                 queueMicrotask(onReady);
                 return;
             }
 
-            stream.once('readable', onReady);
+            stream.on('readable', onReady);
             stream.once('close', onClose);
             stream.once('end', onClose);
             stream.once('error', onClose);
+            if (stream.readableEnded || stream.destroyed) queueMicrotask(onClose);
+            else stream.read(0);
         });
     }
 
@@ -1437,7 +1656,7 @@ export class AudioWrapper extends EventEmitter {
             }
 
             if (primary.ytdlpErrors) {
-                log.error('yt-dlp errors:', primary.ytdlpErrors);
+                log.error('Echec yt-dlp', { trackId: track.id, category: this.classifyMediaFailure(primary.ytdlpErrors) });
             }
             return null;
         } catch (error) {
@@ -1503,13 +1722,27 @@ export class AudioWrapper extends EventEmitter {
             cwd: runDir,
         });
 
+        const metadata: ResourceMetadata = {
+            trackId: track.id,
+            teardown: () => teardown('resource teardown requested'),
+            createdAt: Date.now(),
+            startSeconds,
+            sourceMode: 'ytdlp',
+            outputBytes: 0,
+        };
         let tornDown = false;
-        const teardown = (reason: string) => {
+        const teardown = (reason: string, drainAfterAudioEnd = false) => {
             if (tornDown) {
                 return;
             }
             tornDown = true;
-            log.trace(`Teardown audio pipeline: ${reason}`);
+            metadata.pipelineCloseReason = reason;
+            log.debug('Fermeture pipeline yt-dlp/FFmpeg', {
+                trackId: track.id,
+                reason,
+                elapsedMs: Date.now() - metadata.createdAt,
+                outputBytes: metadata.outputBytes,
+            });
 
             try {
                 ytdlp.stdout?.unpipe(ffmpeg.stdin!);
@@ -1529,14 +1762,9 @@ export class AudioWrapper extends EventEmitter {
                 // Ignore
             }
 
-            try {
-                ffmpeg.stderr?.destroy();
-            } catch {
-                // Ignore
-            }
-
-            this.terminateProcess(ffmpeg);
-            this.terminateProcess(ytdlp);
+            // Both stderr readers remain flowing and bounded until child close.
+            this.terminateProcess(ffmpeg, drainAfterAudioEnd);
+            this.terminateProcess(ytdlp, drainAfterAudioEnd);
             void this.cleanupRunDirectory(runDir);
         };
 
@@ -1579,7 +1807,8 @@ export class AudioWrapper extends EventEmitter {
             } else if (code !== null) {
                 log.warn(`yt-dlp terminé avec code: ${code}`);
                 if (ytdlpErrors) {
-                    log.error('Erreurs yt-dlp:', ytdlpErrors);
+                    metadata.failureCategory = this.classifyMediaFailure(ytdlpErrors);
+                    log.error('Echec du flux yt-dlp', { trackId: track.id, category: metadata.failureCategory });
                     const hint = this.getYtdlpHint(ytdlpErrors);
                     if (hint) {
                         log.warn(hint);
@@ -1604,16 +1833,16 @@ export class AudioWrapper extends EventEmitter {
                 (pipeClosed && lower.includes('invalid argument'));
 
             if (suppressed) {
-                log.trace('[FFmpeg]', message.trim());
+                log.trace('[FFmpeg] Erreur de fermeture du pipe', { category: this.classifyMediaFailure(message) });
                 return;
             }
 
             if (message.includes('Stream') || message.includes('Output')) {
-                log.trace('[FFmpeg]', message.trim());
+                log.trace('[FFmpeg] Diagnostic de flux', { category: this.classifyMediaFailure(message) });
             }
 
             if (lower.includes('error') || lower.includes('failed')) {
-                log.error('[FFmpeg Error]', message.trim());
+                log.error('[FFmpeg Error]', { trackId: track.id, category: this.classifyMediaFailure(message) });
             }
         });
 
@@ -1626,6 +1855,7 @@ export class AudioWrapper extends EventEmitter {
             log.debug('FFmpeg démarré avec succès, PID:', ffmpeg.pid);
         });
         ffmpeg.on('close', (code) => {
+            metadata.processExitCode = code;
             if (code === 0) {
                 log.debug('FFmpeg termine normalement');
             } else if (code !== null) {
@@ -1634,7 +1864,13 @@ export class AudioWrapper extends EventEmitter {
                 } else {
                     log.warn(`FFmpeg termine avec code: ${code}`);
                     if (ffmpegErrors) {
-                        log.trace('Dernieres erreurs FFmpeg:', ffmpegErrors.slice(-500));
+                        metadata.failureCategory = this.classifyMediaFailure(ffmpegErrors);
+                        log.warn('Echec du transcodage FFmpeg', {
+                            trackId: track.id,
+                            category: metadata.failureCategory,
+                            outputBytes: metadata.outputBytes,
+                            closeReason: metadata.pipelineCloseReason ?? 'process_exit',
+                        });
                     }
                 }
             }
@@ -1649,33 +1885,29 @@ export class AudioWrapper extends EventEmitter {
         }
 
         const stdout = ffmpeg.stdout as Readable;
+        stdout.on('data', (data: Buffer) => { metadata.outputBytes! += data.length; });
         const stream = startSeconds > 0 ? this.createSkipStream(stdout, startSeconds) : stdout;
-        const teardownOnStreamFinish = () => teardown('audio stream closed');
-        stdout.once('close', teardownOnStreamFinish);
-        stdout.once('end', teardownOnStreamFinish);
-        stdout.once('error', teardownOnStreamFinish);
+        stdout.once('close', () => teardown('audio stream closed'));
+        stdout.once('end', () => teardown('audio stream ended', true));
+        stdout.once('error', () => teardown('audio stream error'));
         if (stream !== stdout) {
-            stream.once('close', teardownOnStreamFinish);
-            stream.once('end', teardownOnStreamFinish);
-            stream.once('error', teardownOnStreamFinish);
+            stream.once('close', () => teardown('audio stream closed'));
+            stream.once('end', () => teardown('audio stream ended', true));
+            stream.once('error', () => teardown('audio stream error'));
         }
 
-        const resource = createAudioResource<ResourceMetadata>(stream, {
+        const playbackStream = this.withCrossfade(stream, metadata, this.crossfadeSecondsByGuild.get(guildId) ?? 0);
+        const resource = createAudioResource<ResourceMetadata>(playbackStream, {
             inputType: StreamType.Raw, // PCM s16le
             inlineVolume: true,
-            metadata: {
-                trackId: track.id,
-                teardown: () => teardown('resource teardown requested'),
-                createdAt: Date.now(),
-                startSeconds,
-            },
+            metadata,
         });
 
         if (resource.encoder && typeof resource.encoder.setBitrate === 'function') {
             resource.encoder.setBitrate(this.discordOpusBitrateKbps * 1000);
         }
 
-        const readyState = await this.waitForStreamReady(stream, ytdlp, ffmpeg, this.streamReadyWaitMs);
+        const readyState = await this.waitForStreamReady(resource.playStream, ytdlp, ffmpeg, this.streamReadyWaitMs);
         if (readyState === 'ytdlp-close' || readyState === 'ffmpeg-close') {
             log.warn(`yt-dlp stream ended before start (${readyState})`);
             teardown(`stream ended before ready (${readyState})`);
@@ -1718,7 +1950,7 @@ export class AudioWrapper extends EventEmitter {
         return dropper;
     }
 
-    async warmTrack(guildId: string, track: Track): Promise<void> {
+    async warmTrack(guildId: string, track: Pick<Track, 'id' | 'url' | 'title'>): Promise<void> {
         const cacheKey = this.getScopedTrackKey(guildId, track.id);
         const existing = this.warmTracks.get(cacheKey);
         if (existing) {
@@ -1899,7 +2131,12 @@ export class AudioWrapper extends EventEmitter {
             signal?.addEventListener('abort', onAbort, { once: true });
 
             ytdlp.stdout?.on('data', (data) => {
-                stdout = this.appendBoundedOutput(stdout, data);
+                if (settled || requestedResult) return;
+                if (Buffer.byteLength(stdout, 'utf8') + Buffer.byteLength(data) > this.maxProcessOutputBytes) {
+                    terminateWith(null, 'yt-dlp get-url output exceeded limit');
+                    return;
+                }
+                stdout += data.toString();
                 const directUrl = this.findDirectStreamUrl(stdout);
                 if (directUrl) {
                     terminateWith(directUrl, stderr);
@@ -1924,15 +2161,18 @@ export class AudioWrapper extends EventEmitter {
                     return;
                 }
 
-                const directUrl = this.findDirectStreamUrl(stdout);
+                const directUrl = this.findDirectStreamUrl(stdout, true);
                 finish(directUrl ?? null, stderr);
             });
         });
     }
 
-    private findDirectStreamUrl(output: string): string | null {
-        return output
-            .split(/\r?\n/)
+    private findDirectStreamUrl(output: string, processEnded = false): string | null {
+        // A pipe chunk is not a line. Signed URLs can span chunks, including after
+        // a syntactically valid host/path: never terminate yt-dlp with a partial URL.
+        const lines = output.split(/\r?\n/);
+        if (!processEnded) lines.pop();
+        return lines
             .map((line) => line.trim())
             .find((line) => this.isLikelyDirectStreamUrl(line)) ?? null;
     }
@@ -2107,7 +2347,7 @@ export class AudioWrapper extends EventEmitter {
             ytdlp.on('close', (code) => {
                 if (code !== 0) {
                     if (stderr) {
-                        log.trace('yt-dlp info errors:', stderr.trim());
+                        log.trace('yt-dlp info errors:', { category: this.classifyMediaFailure(stderr) });
                     }
                     finish(null);
                     return;

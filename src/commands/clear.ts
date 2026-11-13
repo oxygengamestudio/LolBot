@@ -3,6 +3,7 @@ import type { Collection, Message } from 'discord.js';
 import { config } from '../config.js';
 import { logger } from '../utils/Logger.js';
 import { queueManager } from '../services/QueueManager.js';
+import { isPlaybackActive } from '../services/GuildPlayback.js';
 import { commandDescriptionLocalizations, t } from '../utils/i18n.js';
 import { ensureCanManageSettings, getInteractionLocale, replyEphemeral, scheduleDeleteReply } from '../utils/commandHelpers.js';
 
@@ -64,7 +65,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
         let protectedMessageId: string | undefined;
 
         const queue = queueManager.getQueue(interaction.guildId!);
-        if (queue?.isPlaying && queue.nowPlayingMessage && queue.nowPlayingMessage.channel?.id === channel.id) {
+        if (queue && isPlaybackActive(queue) && queue.nowPlayingMessage && queue.nowPlayingMessage.channel?.id === channel.id) {
             protectedMessageId = queue.nowPlayingMessage.id;
         }
 

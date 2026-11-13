@@ -1,7 +1,6 @@
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
-import { join } from 'path';
 import { config } from '../../config.js';
+import { getSafeChildEnv, getYtdlpRuntimeArgs, resolveYtdlpPath } from '../../utils/mediaProcess.js';
 
 type PermitWaiter = {
     resolve: (release: () => void) => void;
@@ -79,7 +78,6 @@ export function createAbortError(): Error {
 
 export class YtdlpRunner {
     private readonly semaphore = new AsyncSemaphore(4);
-    private warnedUnsafeExtraArgsIgnored = false;
 
     async runJson(args: string[], signal?: AbortSignal): Promise<unknown> {
         const payload = await this.runText(args, signal);
@@ -111,9 +109,10 @@ export class YtdlpRunner {
                 return;
             }
 
-            const ytdlp = spawn(this.getYtdlpPath(), [...this.getRuntimeArgs(), ...args], {
+            const ytdlp = spawn(resolveYtdlpPath(), [...getYtdlpRuntimeArgs(), ...args], {
                 stdio: ['ignore', 'pipe', 'pipe'],
                 windowsHide: true,
+                env: getSafeChildEnv(),
             });
 
             const timeoutMs = config.audio.ytDlpTimeoutMs;
@@ -206,34 +205,6 @@ export class YtdlpRunner {
         });
     }
 
-    private getYtdlpPath(): string {
-        if (process.env.YTDLP_PATH) return process.env.YTDLP_PATH;
-        const localPath = join(config.paths.data, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-        return existsSync(localPath) ? localPath : 'yt-dlp';
-    }
-
-    private getRuntimeArgs(): string[] {
-        const args: string[] = [];
-        if (process.env.YTDLP_COOKIES_FROM_BROWSER) {
-            args.push('--cookies-from-browser', process.env.YTDLP_COOKIES_FROM_BROWSER);
-        } else if (process.env.YTDLP_COOKIES) {
-            args.push('--cookies', process.env.YTDLP_COOKIES);
-        }
-
-        const raw = process.env.YTDLP_EXTRA_ARGS?.trim();
-        if (!raw) return args;
-        if (!config.audio.allowUnsafeYtdlpExtraArgs) {
-            if (!this.warnedUnsafeExtraArgsIgnored) {
-                this.warnedUnsafeExtraArgsIgnored = true;
-                console.warn('YTDLP_EXTRA_ARGS ignored. Set YTDLP_ALLOW_UNSAFE_EXTRA_ARGS=true only in a trusted environment.');
-            }
-            return args;
-        }
-
-        const matches = raw.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-        args.push(...matches.map((arg) => arg.replace(/^['"]|['"]$/g, '')));
-        return args;
-    }
 }
 
 export const ytdlpRunner = new YtdlpRunner();

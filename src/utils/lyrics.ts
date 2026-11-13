@@ -1,12 +1,12 @@
 ﻿import type {
     ButtonInteraction,
     ChatInputCommandInteraction,
-    GuildMember,
     ModalSubmitInteraction,
     Message,
+    GuildMember,
     TextBasedChannel,
 } from 'discord.js';
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import { geniusService } from '../services/GeniusService.js';
 import { queueManager } from '../services/QueueManager.js';
 import { nowPlayingManager } from '../services/NowPlayingManager.js';
@@ -16,7 +16,8 @@ import { resolveLocale, t } from './i18n.js';
 import { logger } from './Logger.js';
 import { safeContent } from './text.js';
 import type { Track } from '../types/index.js';
-import { ensureCanUseBot } from './commandHelpers.js';
+import { ensureCanUseBot, getFreshInteractionMember, replyEphemeral } from './commandHelpers.js';
+import { isBotOwner } from './permissions.js';
 
 const log = logger.createModuleLogger('Lyrics');
 
@@ -66,6 +67,7 @@ export async function sendLyrics(
     query: string,
     queue?: GuildQueue
 ): Promise<void> {
+    if (!interaction.inGuild() || !(await ensureCanUseBot(interaction, interaction.member as GuildMember))) return;
     const locale = await resolveLocale(interaction.guildId, interaction.locale);
     const guildId = interaction.guildId;
     const targetQueue = queue ?? (guildId ? queueManager.getQueue(guildId) : undefined);
@@ -82,10 +84,18 @@ export async function sendLyrics(
             return;
         }
 
+        const currentMember = await getFreshInteractionMember(interaction);
+        if (!currentMember || !(await ensureCanUseBot(interaction, currentMember))) return;
+
         const channel = targetQueue?.textChannel ?? interaction.channel;
         if (!channel || !isSendable(channel)) {
             await interaction.editReply({ content: t(locale, 'error.generic') });
             scheduleDelete(interaction);
+            return;
+        }
+
+        if (!canPublishLyrics(channel, currentMember)) {
+            await replyEphemeral(interaction, `❌ ${t(locale, 'error.noPermission')}`);
             return;
         }
 
@@ -120,6 +130,14 @@ export async function sendLyrics(
 
 function isSendable(channel: TextBasedChannel): channel is TextBasedChannel & { send: (...args: any[]) => Promise<Message> } {
     return typeof (channel as any).send === 'function';
+}
+
+function canPublishLyrics(channel: TextBasedChannel, member: GuildMember): boolean {
+    if (isBotOwner(member.user.id)) return true;
+    if (!('permissionsFor' in channel)) return false;
+    const permissions = channel.permissionsFor(member);
+    const sendPermission = channel.isThread() ? PermissionFlagsBits.SendMessagesInThreads : PermissionFlagsBits.SendMessages;
+    return permissions?.has([PermissionFlagsBits.ViewChannel, sendPermission]) ?? false;
 }
 
 async function sendLyricsMessages(
@@ -220,19 +238,17 @@ function createDeleteButton(): ActionRowBuilder<ButtonBuilder> {
 }
 
 export async function handleLyricsDelete(interaction: ButtonInteraction): Promise<void> {
-    if (!interaction.inCachedGuild()) {
-        return;
-    }
-
     const member = interaction.member as GuildMember;
-    if (!(await ensureCanUseBot(interaction, member))) {
-        return;
-    }
-
+    if (!interaction.inGuild() || !(await ensureCanUseBot(interaction, member))) return;
     const guildId = interaction.guildId;
     const queue = guildId ? queueManager.getQueue(guildId) : undefined;
 
-    if (queue) {
+    if (queue && !canPublishLyrics(queue.textChannel, interaction.member as GuildMember)) {
+        const locale = await resolveLocale(guildId, interaction.locale);
+        await replyEphemeral(interaction, `❌ ${t(locale, 'error.noPermission')}`);
+        return;
+    }
+    if (queue?.lyricsMessages.some(message => message.id === interaction.message.id)) {
         queueManager.clearLyrics(queue);
     }
 
