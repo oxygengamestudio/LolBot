@@ -47,6 +47,7 @@ import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/di
 import { loginDiscordWithRetry } from './utils/discordLogin.js';
 import { resolveLocale, t } from './utils/i18n.js';
 import { getInviteLink } from './utils/invite.js';
+import { clearStaleGuildCommands } from './utils/commandCleanup.js';
 import { safeContent } from './utils/text.js';
 import fs from 'fs';
 import { join } from 'path';
@@ -1099,14 +1100,22 @@ async function registerCommands(): Promise<void> {
             { body: commandsData }
         );
 
+        // D'anciennes commandes de serveur (enregistrées quand DISCORD_GUILD_ID était défini)
+        // restent sinon affichées en double à côté des commandes globales.
+        const guildIds = new Set(client.guilds.cache.keys());
         if (config.discord.guildId) {
-            log.debug(
-                `Nettoyage des commandes guild (${config.discord.guildId}) pour éviter les doublons...`
-            );
-            await rest.put(
-                Routes.applicationGuildCommands(config.discord.clientId, config.discord.guildId),
-                { body: [] }
-            );
+            guildIds.add(config.discord.guildId);
+        }
+        const cleanup = await clearStaleGuildCommands(
+            rest,
+            (guildId) => Routes.applicationGuildCommands(config.discord.clientId, guildId),
+            guildIds
+        );
+        if (cleanup.cleaned.length > 0) {
+            log.info(`Commandes de serveur périmées supprimées sur ${cleanup.cleaned.length} serveur(s)`);
+        }
+        if (cleanup.failed.length > 0) {
+            log.warn(`Commandes de serveur non vérifiables sur ${cleanup.failed.length} serveur(s)`);
         }
 
         log.info(
