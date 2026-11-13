@@ -105,6 +105,8 @@ export class AudioWrapper extends EventEmitter {
     private readonly directStreamReadyWaitMs = 1_000;
     /** Durée du fondu demandée par guilde ; 0 = pipeline habituel sans mixeur. */
     private crossfadeSecondsByGuild: Map<string, number> = new Map();
+    /** Pistes dont l'URL directe s'est fermée en cours de lecture : à lire via yt-dlp. */
+    private unreliableDirectStreams: Set<string> = new Set();
     /** Avance lue en plus du fondu : le temps de lancer la source de la piste suivante. */
     private readonly crossfadePrepareSeconds = 4;
     /**
@@ -562,6 +564,14 @@ export class AudioWrapper extends EventEmitter {
             }
 
             const cacheKey = this.getScopedTrackKey(guildId, track.id);
+            if (this.unreliableDirectStreams.has(cacheKey)) {
+                // L'URL directe de cette piste a déjà lâché en cours de lecture : yt-dlp télécharge
+                // par tranches et tient là où une lecture directe est coupée par le serveur.
+                log.info(`Flux direct écarté pour ${track.id}, lecture via yt-dlp`);
+                const fallback = await this.createResourceWithYtdlp(guildId, track, effectiveStartSeconds, sponsorSegments);
+                this.lastSourceModeByGuild.set(guildId, fallback ? 'ytdlp' : 'unknown');
+                return fallback;
+            }
             const cached = this.cache.get(cacheKey);
             if (cached?.streamUrl && this.isLikelyDirectStreamUrl(cached.streamUrl)) {
                 log.debug('Utilisation du stream audio pre-resolu en cache');
@@ -1317,9 +1327,8 @@ export class AudioWrapper extends EventEmitter {
     }
 
     /**
-     * Lance le décodage de la piste suivante vers un tampon PCM. Limité aux
-     * sources déjà résolues (fichier en cache ou URL directe préchauffée) : une
-     * extraction yt-dlp à ce stade arriverait après la fin de la piste.
+     * Lance le décodage de la piste suivante vers un tampon PCM, depuis son fichier
+     * du cache local. Sans fichier en cache, pas de fondu : transition habituelle.
      */
     private async createNextDeck(
         guildId: string,
@@ -1333,12 +1342,13 @@ export class AudioWrapper extends EventEmitter {
         this.applySponsorAdjustedDuration(track, sponsorSegments);
         const startSeconds = this.getSponsorAdjustedStart(0, sponsorSegments);
 
+        // Uniquement un fichier complet du cache local : une URL distante peut être coupée
+        // par le serveur en cours de route, ce qui tronquerait la piste après le fondu.
         const lease = await mediaCacheManager.acquireTrackPath(track);
-        const warmUrl = this.cache.get(this.getScopedTrackKey(guildId, track.id))?.streamUrl;
-        const input = lease?.path ?? (warmUrl && this.isLikelyDirectStreamUrl(warmUrl) ? warmUrl : null);
-        if (!input) {
+        if (!lease) {
             return null;
         }
+        const input = lease.path;
 
         const runDir = await this.createRunDirectory(guildId);
         const ffmpeg = spawn(
@@ -1355,7 +1365,7 @@ export class AudioWrapper extends EventEmitter {
         const release = (): void => {
             if (released) return;
             released = true;
-            lease?.release();
+            lease.release();
             this.terminateProcess(ffmpeg);
             void this.cleanupRunDirectory(runDir);
         };
@@ -1382,7 +1392,6 @@ export class AudioWrapper extends EventEmitter {
                     secondsDecoded: Math.round(secondsDecoded),
                     expectedSeconds: Math.round(expectedSeconds),
                     elapsedMs: Date.now() - startedAt,
-                    input: lease ? 'cache' : 'url',
                     category: this.classifyMediaFailure(ffmpegErrors),
                 });
             }
@@ -2576,8 +2585,14 @@ export class AudioWrapper extends EventEmitter {
     /**
      * Supprime une entrée du cache
      */
+    /** Écarte l'URL directe d'une piste pour ses prochaines lectures dans cette guilde. */
+    markDirectStreamUnreliable(guildId: string, trackId: string): void {
+        this.unreliableDirectStreams.add(this.getScopedTrackKey(guildId, trackId));
+    }
+
     clearFromCache(guildId: string, trackId: string): void {
         const cacheKey = this.getScopedTrackKey(guildId, trackId);
+        this.unreliableDirectStreams.delete(cacheKey);
         if (this.cache.delete(cacheKey)) {
             log.trace(`Supprimé du cache: ${cacheKey}`);
         }

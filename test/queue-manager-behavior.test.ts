@@ -985,7 +985,7 @@ test('opt-in saved-queue recovery still takes precedence over automatic reconnec
     }
 });
 
-test('an immediate natural stream end reports one failure and advances without retrying the track', async () => {
+test('a stream that ends early again after its one recovery reports one failure and advances', async () => {
     const manager = modules.queueModule.queueManager as any;
     const originalPlayNext = manager.playNext;
     const queue = createQueue('guild-early-stream-end', new FakeAudioPlayer(false));
@@ -996,6 +996,7 @@ test('an immediate natural stream end reports one failure and advances without r
     queue.currentTrack = selectedTrack;
     queue.playback = 'playing';
     manager.runtime(queue.guildId).activeResource = endedResource;
+    manager.runtime(queue.guildId).recoveredTrack = selectedTrack; // la reprise unique a déjà eu lieu
     const failures: string[] = [];
     const listener = (_queue: unknown, failedTrack: Track, code: string) => {
         if (failedTrack === selectedTrack) failures.push(code);
@@ -1146,6 +1147,8 @@ test('two confirmed plays of the same track can both end within the debounce win
         queue.currentTrack = firstTrack;
         queue.playback = 'playing';
         manager.runtime(queue.guildId).activeResource = firstResource;
+        // Ce test porte sur l'anti-rebond des fins de piste : la reprise unique est considérée faite.
+        manager.runtime(queue.guildId).recoveredTrack = firstTrack;
         onIdle({ status: 'playing', resource: firstResource });
         assert.deepEqual(failures, [firstTrack]);
 
@@ -1155,6 +1158,7 @@ test('two confirmed plays of the same track can both end within the debounce win
         player.state = { status: 'playing', resource: secondResource };
         assert.equal(manager.promotePendingStart(queue, secondResource), true);
         queue.playback = 'playing';
+        manager.runtime(queue.guildId).recoveredTrack = secondTrack;
 
         onIdle({ status: 'playing', resource: firstResource });
         assert.equal(queue.currentTrack, secondTrack, 'un ancien Idle reste ignoré après la nouvelle confirmation');
@@ -1590,5 +1594,47 @@ test('a track added late gets its crossfade retried until its source is ready', 
         manager.deleteQueue(queue.guildId, true);
         wrapper.createResource = originalCreateResource;
         crossfade.restore();
+    }
+});
+
+test('a direct stream that dies at start is replayed once through yt-dlp before the track is failed', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const originalMark = wrapper.markDirectStreamUnreliable;
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-direct-stream-fallback', player);
+    const longTrack = { ...track('long-mix'), duration: 3618 };
+    const deadResource = { ...resource(longTrack.id, 110), playbackDuration: 40 };
+    const fallbackResource = resource(longTrack.id, 111);
+    queue.tracks.push(longTrack);
+    const marked: string[] = [];
+    wrapper.markDirectStreamUnreliable = (_guildId: string, trackId: string) => { marked.push(trackId); };
+    let calls = 0;
+    wrapper.createResource = async () => (calls++ === 0 ? deadResource : fallbackResource) as never;
+    const failures: string[] = [];
+    const listener = (_queue: unknown, _track: Track, code: string) => { failures.push(code); };
+    manager.on('trackFailed', listener);
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        manager.handleTrackEnd(queue, deadResource); // le flux se ferme après 40 ms
+
+        await waitFor(() => manager.runtime(queue.guildId).activeResource === fallbackResource, 'la piste doit être relancée');
+        assert.deepEqual(marked, [longTrack.id], 'l’URL directe est écartée pour la reprise');
+        assert.equal(queue.currentTrack, longTrack);
+        assert.deepEqual(failures, [], 'aucun échec annoncé tant que la reprise fonctionne');
+
+        // Si la reprise lâche aussi tout de suite, la piste est déclarée en échec : pas de boucle.
+        await waitFor(() => player.state.status === 'playing', 'la reprise doit jouer');
+        manager.runtime(queue.guildId).lastTrackEnd = null;
+        manager.handleTrackEnd(queue, fallbackResource);
+        assert.deepEqual(failures, ['stream_ended_early']);
+        assert.equal(queue.currentTrack, null);
+    } finally {
+        manager.off('trackFailed', listener);
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        wrapper.markDirectStreamUnreliable = originalMark;
     }
 });

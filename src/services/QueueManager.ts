@@ -1445,14 +1445,13 @@ class QueueManager extends EventEmitter {
             return;
         }
 
+        const endedEarly = endedResource !== null && this.isEarlyResourceEnd(queue, endedResource);
         // Seule une fin de flux signalée par le lecteur peut être une source qui a lâché :
         // un skip ou une erreur passent par ici sans ressource et terminent bien la piste.
-        if (endedResource !== null && this.recoverCrossfadedTrack(queue)) {
+        if (endedResource !== null && this.recoverInterruptedTrack(queue, endedEarly)) {
             return;
         }
         this.runtime(queue.guildId).crossfadedTrack = null;
-
-        const endedEarly = endedResource !== null && this.isEarlyResourceEnd(queue, endedResource);
         this.teardownActiveResource(queue.guildId);
         this.clearBufferingWatchdog(queue.guildId);
         this.setPlayback(queue, 'idle');
@@ -2141,39 +2140,44 @@ class QueueManager extends EventEmitter {
     }
 
     /**
-     * Une piste arrivée par fondu dont le flux s'arrête bien avant sa fin n'est pas
-     * terminée : sa source a lâché. On la relance une fois à la position atteinte,
-     * par le chemin de lecture habituel, au lieu de passer à la suivante.
+     * Un flux qui s'arrête bien avant la fin de la piste n'est pas une piste terminée :
+     * sa source a lâché (URL directe coupée par le serveur, source de fondu tarie).
+     * On relance la piste une fois à la position atteinte, en écartant l'URL directe
+     * au profit de yt-dlp, au lieu de la déclarer en échec ou de passer à la suivante.
      */
-    private recoverCrossfadedTrack(queue: GuildQueue): boolean {
+    private recoverInterruptedTrack(queue: GuildQueue, endedEarly: boolean): boolean {
         const runtime = this.runtime(queue.guildId);
         const track = queue.currentTrack;
-        if (!track || runtime.crossfadedTrack !== track) {
-            runtime.crossfadedTrack = null;
+        const crossfaded = !!track && runtime.crossfadedTrack === track;
+        runtime.crossfadedTrack = null;
+        if (!track || (!crossfaded && !endedEarly) || runtime.recoveredTrack === track) {
             return false;
         }
-        runtime.crossfadedTrack = null;
 
         const position = this.getCurrentTime(queue.guildId);
         if (!Number.isFinite(track.duration) || track.duration <= 0 || position >= track.duration - 10) {
             return false;
         }
 
-        log.warn('Flux interrompu juste après un fondu, reprise de la piste', {
+        log.warn('Flux interrompu avant la fin de la piste, reprise via yt-dlp', {
             guildId: queue.guildId,
             trackId: track.id,
             position,
             duration: track.duration,
+            afterCrossfade: crossfaded,
         });
+        runtime.recoveredTrack = track;
         runtime.lastTrackEnd = null;
+        audioWrapper.markDirectStreamUnreliable(queue.guildId, track.id);
         const recovery = this.captureRecoveryContext(queue);
         void this.runWithTransitionLock(queue.guildId, async () => {
             const resumed = await this.resumeCurrentTrack(queue, position, recovery);
             if (!resumed && this.isRecoveryCurrent(queue, recovery)) {
+                this.emit('trackFailed', queue, track, 'stream_ended_early');
                 this.handleTrackEnd(queue);
             }
         }).catch((error) => {
-            log.warn('Reprise après fondu impossible', error);
+            log.warn('Reprise de la piste impossible', error);
         });
         return true;
     }
