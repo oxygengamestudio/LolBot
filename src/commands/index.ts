@@ -11,6 +11,7 @@ import * as lyrics from './lyrics.js';
 import * as clear from './clear.js';
 import * as stats from './stats.js';
 import * as seek from './seek.js';
+import * as invite from './invite.js';
 
 export const commands = [
     { data: play.data, execute: play.execute, autocomplete: play.autocomplete },
@@ -26,6 +27,7 @@ export const commands = [
     { data: clear.data, execute: clear.execute },
     { data: stats.data, execute: stats.execute },
     { data: seek.data, execute: seek.execute },
+    { data: invite.data, execute: invite.execute },
 ];
 
-export { play, stop, pause, resume, skip, queue, join, leave, settings, lyrics, clear, stats, seek };
+export { play, stop, pause, resume, skip, queue, join, leave, settings, lyrics, clear, stats, seek, invite };

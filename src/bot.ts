@@ -46,6 +46,7 @@ import { acquireProcessLock } from './utils/processLock.js';
 import { getDiscordErrorCode, isKnownInteractionResponseError } from './utils/discordApiErrors.js';
 import { loginDiscordWithRetry } from './utils/discordLogin.js';
 import { resolveLocale, t } from './utils/i18n.js';
+import { getInviteLink } from './utils/invite.js';
 import { safeContent } from './utils/text.js';
 import fs from 'fs';
 import { join } from 'path';
@@ -265,22 +266,6 @@ for (const command of commands) {
     log.trace(`Commande chargée: /${command.data.name}`);
 }
 log.info(`${commandsMap.size} commandes chargées`);
-
-// Générer le lien d'invitation
-function getInviteLink(): string {
-    // Permissions calculées:
-    // - View Channels (1024)
-    // - Send Messages (2048)
-    // - Embed Links (16384)
-    // - Connect (1048576)
-    // - Speak (2097152)
-    // - Use Voice Activity (33554432)
-    // - Use Application Commands (2147483648)
-    // Total: 2184271872
-    const permissionsBitfield = '2184271872';
-
-    return `https://discord.com/api/oauth2/authorize?client_id=${config.discord.clientId}&permissions=${permissionsBitfield}&scope=bot%20applications.commands`;
-}
 
 // Événement: Bot prêt
 client.once(Events.ClientReady, async (readyClient) => {
