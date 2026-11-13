@@ -1371,9 +1371,10 @@ export class AudioWrapper extends EventEmitter {
             const secondsDecoded = outputBytes / PCM_BYTES_PER_SECOND;
             const expectedSeconds = Number.isFinite(track.duration) ? track.duration - startSeconds : 0;
             // Une source qui se ferme bien avant la fin de la piste explique un fondu écourté.
-            const failed = code !== null && code !== 0;
-            const endedShort = reachedEnd && expectedSeconds > 0 && secondsDecoded < expectedSeconds - 10;
-            if (failed || endedShort) {
+            // Ne signaler que si FFmpeg a fermé sa sortie de lui-même : quand c'est nous qui
+            // l'arrêtons (seek, skip, stop), il sort aussi avec un code non nul.
+            const endedShort = expectedSeconds > 0 && secondsDecoded < expectedSeconds - 10;
+            if (reachedEnd && (code !== 0 || endedShort)) {
                 log.warn('Source du fondu fermée avant la fin de la piste', {
                     trackId: track.id,
                     code,

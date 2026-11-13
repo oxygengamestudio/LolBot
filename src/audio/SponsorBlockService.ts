@@ -88,6 +88,11 @@ export class SponsorBlockService {
 
                 return segments;
             } catch (error) {
+                // 404 est la réponse normale de SponsorBlock pour une vidéo sans passage signalé.
+                if (error instanceof Error && /^HTTP 404\b/.test(error.message)) {
+                    log.debug(`Aucun segment SponsorBlock pour ${videoId}`);
+                    return [];
+                }
                 log.warn(`SponsorBlock indisponible via ${endpoint} pour ${videoId}`, error);
             }
         }

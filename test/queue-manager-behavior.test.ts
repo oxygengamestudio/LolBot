@@ -1557,3 +1557,38 @@ test('skipping a crossfaded track really skips it', async () => {
         crossfade.restore();
     }
 });
+
+test('a track added late gets its crossfade retried until its source is ready', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const originalDelay = manager.crossfadeRetryDelayMs;
+    manager.crossfadeRetryDelayMs = 5;
+    const crossfade = installCrossfadeDoubles(5);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-late', player);
+    const firstTrack = track('late-first');
+    const lateTrack = track('late-added');
+    queue.tracks.push(firstTrack, lateTrack);
+    wrapper.createResource = async () => resource(firstTrack.id, 95) as never;
+    let attempts = 0;
+    const readyInto = wrapper.crossfadeInto;
+    wrapper.crossfadeInto = async (...args: unknown[]) => {
+        attempts += 1;
+        return attempts < 3 ? false : readyInto(...args); // source résolue à la troisième tentative
+    };
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await waitFor(() => crossfade.prepared.length === 1, 'le fondu doit finir par être préparé');
+        assert.equal(attempts, 3);
+        assert.equal(crossfade.prepared[0]!.track, lateTrack);
+    } finally {
+        manager.crossfadeRetryDelayMs = originalDelay;
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
+    }
+});
