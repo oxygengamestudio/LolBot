@@ -7,6 +7,8 @@ const BYTES_PER_FRAME = 4;
 const BLOCK_BYTES = PCM_BYTES_PER_SECOND / 50;
 /** En dessous de cette durée restante, un fondu n'est plus audible : on enchaîne sans mixer. */
 const MIN_FADE_BYTES = PCM_BYTES_PER_SECOND / 4;
+/** Avance exigée de la piste suivante, en plus de la durée du fondu, avant de basculer dessus. */
+const NEXT_READY_MARGIN_BYTES = PCM_BYTES_PER_SECOND * 2;
 
 function alignDown(bytes: number): number {
     return bytes - (bytes % BYTES_PER_FRAME);
@@ -270,6 +272,16 @@ export class CrossfadeMixer extends Readable {
         const current = this.current;
         const next = this.next;
         if (next && current.ended && current.length <= next.fadeBytes) {
+            if (!this.isNextReady(next)) {
+                // La suite n'a pas assez d'avance : la piste courante continue seule. Si elle
+                // se termine avant que la suite soit prête, on rend la main à la transition
+                // classique plutôt que de basculer sur une source fragile.
+                if (current.length > 0) {
+                    return current.read(Math.min(BLOCK_BYTES, current.length));
+                }
+                this.detachNext();
+                return null;
+            }
             if (!next.accept()) {
                 this.detachNext();
                 return this.nextBlock();
@@ -294,6 +306,16 @@ export class CrossfadeMixer extends Readable {
             return current.read(Math.min(BLOCK_BYTES, limit));
         }
         return current.ended ? null : Buffer.alloc(0);
+    }
+
+    /**
+     * Une suite est prête si elle a de quoi couvrir tout le fondu plus une marge,
+     * ou si elle est déjà entièrement décodée (piste courte).
+     */
+    private isNextReady(next: PendingNext): boolean {
+        return next.deck.ended
+            ? next.deck.length > 0
+            : next.deck.length >= next.fadeBytes + NEXT_READY_MARGIN_BYTES;
     }
 
     /** Mixe un bloc : la piste sortante descend, la nouvelle monte (courbe à puissance constante). */
