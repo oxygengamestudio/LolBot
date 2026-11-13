@@ -1476,3 +1476,84 @@ test('crossfade stays off when the setting is zero', async () => {
         crossfade.restore();
     }
 });
+
+test('a crossfaded track whose stream dies early is resumed once instead of being skipped', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const crossfade = installCrossfadeDoubles(5);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-recovery', player);
+    const firstTrack = track('recover-first');
+    const fadedTrack = track('recover-faded');
+    const afterTrack = track('recover-after');
+    const mixerResource = resource(firstTrack.id, 90);
+    const resumedResource = resource(fadedTrack.id, 91);
+    queue.tracks.push(firstTrack, fadedTrack, afterTrack);
+    const requests: Array<{ id: string; offset: number }> = [];
+    wrapper.createResource = async (_guildId: string, requested: Track, offset: number) => {
+        requests.push({ id: requested.id, offset });
+        return (requested.id === firstTrack.id ? mixerResource : resumedResource) as never;
+    };
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await waitFor(() => crossfade.prepared.length === 1, 'le fondu doit être préparé');
+        crossfade.windowOpen = false;
+        assert.equal(crossfade.prepared[0]!.accept(), true);
+        queue.startedAt = Date.now() - 7_000; // 7 s de la nouvelle piste ont été jouées
+
+        // La source lâche : le lecteur signale la fin du flux alors qu'il reste 173 s.
+        manager.handleTrackEnd(queue, mixerResource);
+
+        await waitFor(() => requests.length === 2, 'la piste doit être relancée');
+        assert.equal(requests[1]!.id, fadedTrack.id);
+        assert.ok(requests[1]!.offset >= 6 && requests[1]!.offset <= 8, `reprise à ${requests[1]!.offset}s`);
+        await waitFor(() => manager.runtime(queue.guildId).activeResource === resumedResource, 'la reprise doit être installée');
+        assert.equal(queue.currentTrack, fadedTrack, 'la piste n’est pas sautée');
+        assert.deepEqual(queue.tracks, [afterTrack]);
+
+        // Une seconde fin de flux est une vraie fin : pas de boucle de reprise.
+        await waitFor(() => player.state.status === 'playing', 'la reprise doit jouer');
+        manager.runtime(queue.guildId).lastTrackEnd = null;
+        wrapper.createResource = async (_guildId: string, requested: Track) => resource(requested.id, 92) as never;
+        manager.handleTrackEnd(queue, resumedResource);
+        await waitFor(() => queue.currentTrack === afterTrack, 'la fin suivante passe à la piste d’après');
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
+    }
+});
+
+test('skipping a crossfaded track really skips it', async () => {
+    const manager = modules.queueModule.queueManager as any;
+    const wrapper = modules.audioWrapper as any;
+    const originalCreateResource = wrapper.createResource;
+    const crossfade = installCrossfadeDoubles(5);
+    const player = new FakeAudioPlayer(true);
+    const queue = createQueue('guild-crossfade-skip', player);
+    const firstTrack = track('skipfade-first');
+    const fadedTrack = track('skipfade-faded');
+    const afterTrack = track('skipfade-after');
+    queue.tracks.push(firstTrack, fadedTrack, afterTrack);
+    wrapper.createResource = async (_guildId: string, requested: Track) => resource(requested.id, Date.now()) as never;
+
+    try {
+        assert.equal((await manager.playNext(queue.guildId)).status, 'started');
+        crossfade.windowOpen = true;
+        crossfade.onWindow!();
+        await waitFor(() => crossfade.prepared.length === 1, 'le fondu doit être préparé');
+        crossfade.windowOpen = false;
+        assert.equal(crossfade.prepared[0]!.accept(), true);
+
+        assert.equal(manager.skip(queue.guildId), true);
+        await waitFor(() => queue.currentTrack === afterTrack, 'le skip passe à la piste suivante');
+    } finally {
+        manager.deleteQueue(queue.guildId, true);
+        wrapper.createResource = originalCreateResource;
+        crossfade.restore();
+    }
+});

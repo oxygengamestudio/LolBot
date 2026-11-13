@@ -87,6 +87,8 @@ export interface GuildRuntime {
     warmedTrackId: string | null;
     /** Piste suivante dont le fondu est en préparation ou attaché au mixeur. */
     crossfadeNext: Track | null;
+    /** Piste arrivée par fondu : si son flux s'arrête trop tôt, elle est reprise une fois. */
+    crossfadedTrack: Track | null;
     lastTrackEnd: { trackId: string | null; at: number } | null;
 
     transitionNonce: number;
@@ -109,6 +111,7 @@ export function createGuildRuntime(): GuildRuntime {
         retiredResources: new Map(),
         warmedTrackId: null,
         crossfadeNext: null,
+        crossfadedTrack: null,
         lastTrackEnd: null,
         transitionNonce: 0,
         transitionLock: null,

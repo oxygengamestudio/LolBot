@@ -126,3 +126,19 @@ test('a deck paces its source and only hands out whole stereo frames', async () 
     deck.destroy();
     assert.equal(source.destroyed, true);
 });
+
+test('a next source without enough lead is never switched to: the current track ends alone', async () => {
+    const first = constantPcm(2, 500);
+    const starving = new PassThrough();
+    starving.write(constantPcm(0.5, 900)); // reste ouverte, mais bien moins que fondu + marge
+    const mixer = new CrossfadeMixer(sourceOf(first), 3);
+    let handovers = 0;
+    mixer.once('tail', () => {
+        mixer.attachNext(new PcmDeck(starving, PCM_BYTES_PER_SECOND), 1, () => { handovers += 1; return true; });
+    });
+
+    const output = await collect(mixer);
+    assert.ok(output.equals(first), 'la piste courante est jouée en entier, sans mixage');
+    assert.equal(handovers, 0, 'aucune bascule vers une source fragile');
+    assert.equal(starving.destroyed, true);
+});

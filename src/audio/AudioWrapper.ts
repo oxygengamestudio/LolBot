@@ -526,7 +526,12 @@ export class AudioWrapper extends EventEmitter {
                 this.shouldUseSponsorBlock(track, sponsorBlockEnabled)
             );
             this.applySponsorAdjustedDuration(track, sponsorSegments);
-            const effectiveStartSeconds = this.getSponsorAdjustedStart(startSeconds, sponsorSegments);
+            // `startSeconds` est une position affichée (sans les passages retirés) : la convertir
+            // en position dans le fichier source avant de demander le saut à FFmpeg.
+            const effectiveStartSeconds = this.getSponsorAdjustedStart(
+                this.toSourcePosition(startSeconds, sponsorSegments),
+                sponsorSegments
+            );
             if (effectiveStartSeconds > startSeconds + 0.25) {
                 log.info(`SponsorBlock: saut du debut non musical jusqu'a ${effectiveStartSeconds.toFixed(1)}s`);
             }
@@ -700,6 +705,25 @@ export class AudioWrapper extends EventEmitter {
 
         const warmed = this.cache.get(cacheKey);
         return warmed?.streamUrl && this.isLikelyDirectStreamUrl(warmed.streamUrl) ? warmed.streamUrl : null;
+    }
+
+    /**
+     * Convertit une position affichée à l'utilisateur en position dans la source.
+     * La durée et la progression affichées excluent les passages retirés par
+     * SponsorBlock : chaque passage situé avant la position la décale d'autant.
+     */
+    private toSourcePosition(displaySeconds: number, sponsorSegments: SponsorSegment[]): number {
+        let sourceSeconds = Math.max(0, displaySeconds);
+        if (sourceSeconds <= 0) {
+            return 0;
+        }
+        for (const segment of this.normalizeSponsorSegments(sponsorSegments)) {
+            if (segment.start > sourceSeconds) {
+                break;
+            }
+            sourceSeconds += Math.max(0, segment.end - segment.start);
+        }
+        return sourceSeconds;
     }
 
     private getSponsorAdjustedStart(startSeconds: number, sponsorSegments: SponsorSegment[]): number {
@@ -1335,15 +1359,43 @@ export class AudioWrapper extends EventEmitter {
             this.terminateProcess(ffmpeg);
             void this.cleanupRunDirectory(runDir);
         };
-        ffmpeg.stderr?.resume();
+        let ffmpegErrors = '';
+        let outputBytes = 0;
+        let reachedEnd = false;
+        const startedAt = Date.now();
+        ffmpeg.stderr?.on('data', (data) => {
+            ffmpegErrors = this.appendBoundedOutput(ffmpegErrors, data);
+        });
         ffmpeg.once('error', release);
-        ffmpeg.once('close', release);
+        ffmpeg.once('close', (code, signal) => {
+            const secondsDecoded = outputBytes / PCM_BYTES_PER_SECOND;
+            const expectedSeconds = Number.isFinite(track.duration) ? track.duration - startSeconds : 0;
+            // Une source qui se ferme bien avant la fin de la piste explique un fondu écourté.
+            const failed = code !== null && code !== 0;
+            const endedShort = reachedEnd && expectedSeconds > 0 && secondsDecoded < expectedSeconds - 10;
+            if (failed || endedShort) {
+                log.warn('Source du fondu fermée avant la fin de la piste', {
+                    trackId: track.id,
+                    code,
+                    signal,
+                    secondsDecoded: Math.round(secondsDecoded),
+                    expectedSeconds: Math.round(expectedSeconds),
+                    elapsedMs: Date.now() - startedAt,
+                    input: lease ? 'cache' : 'url',
+                    category: this.classifyMediaFailure(ffmpegErrors),
+                });
+            }
+            release();
+        });
 
         const stdout = ffmpeg.stdout as Readable | null;
         if (!stdout) {
             release();
             return null;
         }
+        stdout.on('data', (data: Buffer) => { outputBytes += data.length; });
+        // `end` n'arrive que si FFmpeg a fermé sa sortie de lui-même, pas quand on l'arrête.
+        stdout.once('end', () => { reachedEnd = true; });
         stdout.once('close', release);
         stdout.once('error', release);
 

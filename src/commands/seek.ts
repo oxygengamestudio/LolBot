@@ -48,7 +48,9 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     }
 
     const current = queueManager.getCurrentTime(guildId);
-    const target = current + seconds;
+    const duration = queue.currentTrack.duration;
+    // Même borne que QueueManager.seekTo : la réponse annonce la position réellement atteinte.
+    const target = Math.max(0, Math.min(current + seconds, duration - 1));
 
     await interaction.deferReply({ flags: 64 });
 

@@ -1443,6 +1443,13 @@ class QueueManager extends EventEmitter {
             return;
         }
 
+        // Seule une fin de flux signalée par le lecteur peut être une source qui a lâché :
+        // un skip ou une erreur passent par ici sans ressource et terminent bien la piste.
+        if (endedResource !== null && this.recoverCrossfadedTrack(queue)) {
+            return;
+        }
+        this.runtime(queue.guildId).crossfadedTrack = null;
+
         const endedEarly = endedResource !== null && this.isEarlyResourceEnd(queue, endedResource);
         this.teardownActiveResource(queue.guildId);
         this.clearBufferingWatchdog(queue.guildId);
@@ -2100,6 +2107,7 @@ class QueueManager extends EventEmitter {
         runtime.crossfadeNext = null;
         runtime.lastTrackEnd = null;
         this.clearBufferingWatchdog(queue.guildId);
+        runtime.crossfadedTrack = nextTrack;
         queue.currentTrack = nextTrack;
         queue.startedAt = Date.now();
         queue.pausedAt = queue.playback === 'paused' ? Date.now() : null;
@@ -2117,6 +2125,44 @@ class QueueManager extends EventEmitter {
             // Ce code s'exécute dans le chemin audio : une erreur d'affichage ne doit pas couper le son.
             log.warn('Erreur après le début du fondu enchaîné', error);
         }
+        return true;
+    }
+
+    /**
+     * Une piste arrivée par fondu dont le flux s'arrête bien avant sa fin n'est pas
+     * terminée : sa source a lâché. On la relance une fois à la position atteinte,
+     * par le chemin de lecture habituel, au lieu de passer à la suivante.
+     */
+    private recoverCrossfadedTrack(queue: GuildQueue): boolean {
+        const runtime = this.runtime(queue.guildId);
+        const track = queue.currentTrack;
+        if (!track || runtime.crossfadedTrack !== track) {
+            runtime.crossfadedTrack = null;
+            return false;
+        }
+        runtime.crossfadedTrack = null;
+
+        const position = this.getCurrentTime(queue.guildId);
+        if (!Number.isFinite(track.duration) || track.duration <= 0 || position >= track.duration - 10) {
+            return false;
+        }
+
+        log.warn('Flux interrompu juste après un fondu, reprise de la piste', {
+            guildId: queue.guildId,
+            trackId: track.id,
+            position,
+            duration: track.duration,
+        });
+        runtime.lastTrackEnd = null;
+        const recovery = this.captureRecoveryContext(queue);
+        void this.runWithTransitionLock(queue.guildId, async () => {
+            const resumed = await this.resumeCurrentTrack(queue, position, recovery);
+            if (!resumed && this.isRecoveryCurrent(queue, recovery)) {
+                this.handleTrackEnd(queue);
+            }
+        }).catch((error) => {
+            log.warn('Reprise après fondu impossible', error);
+        });
         return true;
     }
 
