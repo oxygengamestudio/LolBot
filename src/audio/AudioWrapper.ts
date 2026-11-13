@@ -288,6 +288,12 @@ export class AudioWrapper extends EventEmitter {
             }
         }
         this.lastSourceModeByGuild.delete(guildId);
+        this.crossfadeSecondsByGuild.delete(guildId);
+        for (const key of this.unreliableDirectStreams) {
+            if (key.startsWith(prefix)) {
+                this.unreliableDirectStreams.delete(key);
+            }
+        }
         const guildCacheDir = this.getGuildCacheDir(guildId);
         await rm(guildCacheDir, { recursive: true, force: true }).catch(() => undefined);
         await mkdir(guildCacheDir, { recursive: true }).catch(() => undefined);
